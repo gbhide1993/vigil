@@ -1,0 +1,15 @@
+{
+  "approved_agents": ["Cursor", "Claude Code", "GitHub Copilot"],
+  "blocked_agents": [],
+  "scope_directories": ["C:\\Users\\gbhid\\vlaw\\policy"],
+  "never_scope_directories": ["C:\\Windows", "C:\\Program Files"],
+  "credential_paths": [".env", "C:\\Users\\gbhid\\.ssh\\", "C:\\Users\\gbhid\\.aws\\", "*.pem", "*.key"],
+  "approved_mcp_servers": [],
+  "alert_on_unapproved_agent": true,
+  "alert_on_out_of_scope_access": true,
+  "alert_on_credential_access": true,
+  "alert_on_unapproved_mcp": true,
+  "command_execution_logging": true,
+  "baseline_days_required": 14,
+  "anomaly_sensitivity": "medium"
+}

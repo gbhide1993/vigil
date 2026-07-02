@@ -1,0 +1,7 @@
+services:
+  vlaw-frontend:
+    environment:
+      - VLAW_BACKEND_HOST=host.docker.internal
+      - VLAW_BACKEND_PORT=7422
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

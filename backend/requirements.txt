@@ -1,0 +1,9 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+aiosqlite==0.20.0
+watchdog==6.0.0
+psutil==6.1.1
+apscheduler==3.11.0
+pydantic==2.10.4
+reportlab==4.2.5
+cryptography==44.0.0

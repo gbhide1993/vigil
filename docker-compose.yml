@@ -1,0 +1,22 @@
+services:
+  vlaw:
+    build: ./backend
+    ports:
+      - "7422:7422"
+    volumes:
+      - ./data:/app/data          # SQLite DB
+      - ./policy:/app/policy      # policy file
+      - /:/host:ro                # host filesystem READ-ONLY
+      - /proc:/host/proc:ro       # process info
+    environment:
+      - VLAW_HOST_ROOT=/host
+      - VLAW_POLICY_FILE=/app/policy/vlaw-policy.json
+      - VLAW_DATA_DIR=/app/data
+    restart: unless-stopped
+
+  vlaw-frontend:
+    build: ./frontend
+    ports:
+      - "7423:80"
+    depends_on:
+      - vlaw
