@@ -87,7 +87,7 @@ class Attributor:
         agent_id = cur.lastrowid
 
         if not is_approved:
-            await self._fire_unapproved_agent_alert(db, agent_id, name)
+            await self._fire_unapproved_agent_alert(db, agent_id, name, pid)
 
         return agent_id
 
@@ -101,13 +101,20 @@ class Attributor:
         approved = json.loads(row["policy_value"])
         return name in approved
 
-    async def _fire_unapproved_agent_alert(self, db, agent_id: int, name: str) -> None:
+    async def _fire_unapproved_agent_alert(self, db, agent_id: int, name: str, pid: int | None = None) -> None:
+        cur = await db.execute(
+            "SELECT id FROM alerts WHERE agent_id = ? AND severity = 'critical' AND status = 'open'",
+            (agent_id,),
+        )
+        if await cur.fetchone() is not None:
+            return
+
         await self.alerter.fire_alert(
             agent_id,
             "critical",
             title=f"Unapproved agent detected: {name}",
-            description=f"Agent '{name}' was detected running on this machine but is "
-            "not in the approved_agents policy list.",
+            description=f"{name} (PID {pid}) is running and accessing your file system. "
+            "This agent is not on the approved list. Review and approve or block below.",
             reason="unapproved_agent",
             extra_detail={"name": name},
         )

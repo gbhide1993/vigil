@@ -19,6 +19,8 @@ export const api = {
   },
   getAgents: () => request('/agents'),
   getAgentSessions: (agentId) => request(`/agents/${agentId}/sessions`),
+  approveAgent: (agentId) => request(`/agents/${agentId}/approve`, { method: 'POST' }),
+  blockAgent: (agentId) => request(`/agents/${agentId}/block`, { method: 'POST' }),
   getAlerts: (params = {}) => {
     const qs = new URLSearchParams(params).toString()
     return request(`/alerts${qs ? `?${qs}` : ''}`)

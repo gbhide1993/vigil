@@ -12,6 +12,158 @@ function approvalLabel(approved) {
   return { text: 'Pending', className: 'medium' }
 }
 
+function statusDotColor(status) {
+  if (status === 'active') return 'green'
+  if (status === 'idle') return 'amber'
+  return 'red'
+}
+
+function AgentActions({ agent, onApprove, onBlock }) {
+  const [busy, setBusy] = useState(false)
+  const [errorMsg, setErrorMsg] = useState(null)
+
+  async function run(action) {
+    setBusy(true)
+    setErrorMsg(null)
+    try {
+      await action(agent.id)
+    } catch (err) {
+      setErrorMsg(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 8 }}>
+        {agent.approved !== 1 && (
+          <button className="btn primary" disabled={busy} onClick={() => run(onApprove)}>
+            Approve
+          </button>
+        )}
+        {agent.approved !== 2 && (
+          <button className="btn danger" disabled={busy} onClick={() => run(onBlock)}>
+            Block
+          </button>
+        )}
+      </div>
+      {errorMsg && <div style={{ color: 'var(--color-critical)', fontSize: 11, marginTop: 6 }}>{errorMsg}</div>}
+    </div>
+  )
+}
+
+function PendingAgentCard({ agent, onApprove, onBlock }) {
+  return (
+    <div className="panel" style={{ marginBottom: 12 }}>
+      <div className="panel-body" style={{ padding: 16 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 13 }}>{agent.name}</div>
+            <div className="alert-meta">{agent.process_name || 'unknown process'}</div>
+            <div className="alert-meta" style={{ marginTop: 6 }}>
+              First seen {formatTime(agent.first_seen)} · Last seen {formatTime(agent.last_seen)} · {agent.session_count} sessions
+            </div>
+          </div>
+          <AgentActions agent={agent} onApprove={onApprove} onBlock={onBlock} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function AgentsManagement({ agents, onApprove, onBlock }) {
+  const pending = agents.filter((a) => a.approved === 0)
+  const approved = agents.filter((a) => a.approved === 1)
+  const blocked = agents.filter((a) => a.approved === 2)
+
+  return (
+    <div style={{ marginBottom: 28 }}>
+      <div className="panel">
+        <div className="panel-header">
+          Pending Approval
+          {pending.length > 0 && <span className="badge critical">{pending.length}</span>}
+        </div>
+        <div className="panel-body" style={{ padding: pending.length ? 16 : 0 }}>
+          {pending.length === 0 ? (
+            <div className="empty-state">No agents pending approval.</div>
+          ) : (
+            pending.map((a) => (
+              <PendingAgentCard key={a.id} agent={a} onApprove={onApprove} onBlock={onBlock} />
+            ))
+          )}
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-header">Approved Agents</div>
+        <div className="panel-body">
+          {approved.length === 0 ? (
+            <div className="empty-state">No approved agents yet.</div>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Sessions</th>
+                  <th>Last Seen</th>
+                  <th>Status</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {approved.map((a) => (
+                  <tr key={a.id}>
+                    <td>{a.name}</td>
+                    <td>{a.session_count}</td>
+                    <td>{formatTime(a.last_seen)}</td>
+                    <td>
+                      <span className={`status-dot ${statusDotColor(a.current_status)}`} />
+                    </td>
+                    <td>
+                      <button className="btn danger" onClick={() => onBlock(a.id)}>Block</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-header">Blocked Agents</div>
+        <div className="panel-body">
+          {blocked.length === 0 ? (
+            <div className="empty-state">No blocked agents.</div>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Blocked Since</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {blocked.map((a) => (
+                  <tr key={a.id}>
+                    <td>{a.name}</td>
+                    <td>{formatTime(a.last_seen)}</td>
+                    <td>
+                      <button className="btn primary" onClick={() => onApprove(a.id)}>Approve</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function AgentDetail() {
   const [agents, setAgents] = useState([])
   const [selectedId, setSelectedId] = useState(null)
@@ -39,6 +191,18 @@ export default function AgentDetail() {
       clearInterval(id)
     }
   }, [selectedId])
+
+  async function handleApprove(agentId) {
+    await api.approveAgent(agentId)
+    const data = await api.getAgents()
+    setAgents(data.agents)
+  }
+
+  async function handleBlock(agentId) {
+    await api.blockAgent(agentId)
+    const data = await api.getAgents()
+    setAgents(data.agents)
+  }
 
   useEffect(() => {
     if (!selectedId) return
@@ -85,6 +249,8 @@ export default function AgentDetail() {
           <div className="page-subtitle">Per-agent activity, directories, and sessions</div>
         </div>
       </div>
+
+      <AgentsManagement agents={agents} onApprove={handleApprove} onBlock={handleBlock} />
 
       {agents.length === 0 ? (
         <div className="empty-state">No agents detected yet.</div>

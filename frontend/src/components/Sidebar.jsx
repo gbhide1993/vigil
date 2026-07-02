@@ -35,6 +35,8 @@ export default function Sidebar({ view, onNavigate, openAlertCount }) {
     }
   }, [])
 
+  const pendingCount = agents.filter((a) => a.approved === 0).length
+
   return (
     <aside className="sidebar">
       <div className="sidebar-brand">
@@ -49,7 +51,12 @@ export default function Sidebar({ view, onNavigate, openAlertCount }) {
             className={`sidebar-nav-item ${view === item.key ? 'active' : ''}`}
             onClick={() => onNavigate(item.key)}
           >
-            <span>{item.label}</span>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              {item.key === 'agents' && pendingCount > 0 && <span className="status-dot amber" />}
+              {item.key === 'agents' && pendingCount > 0
+                ? `${item.label} (${pendingCount} pending)`
+                : item.label}
+            </span>
             {item.key === 'alerts' && openAlertCount > 0 && (
               <span className="sidebar-badge">{openAlertCount}</span>
             )}
