@@ -1,0 +1,13 @@
+{
+  "name": "vlaw-tray",
+  "version": "0.1.0",
+  "description": "V-LAW system tray widget",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}

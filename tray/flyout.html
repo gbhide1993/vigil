@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="flyout.css" />
+  </head>
+  <body>
+    <div id="pill">
+      <div id="header">
+        <span id="dot" class="dot idle"></span>
+        <span id="label">VLAW</span>
+        <span id="queue-nav" class="hidden">
+          <button id="btn-prev" class="nav-arrow" title="Previous alert">&#8249;</button>
+          <span id="queue-badge"></span>
+          <button id="btn-next" class="nav-arrow" title="Next alert">&#8250;</button>
+        </span>
+      </div>
+      <div id="alert-body" class="hidden">
+        <div id="alert-title"></div>
+        <div class="field-row"><span class="field-label">Agent</span><span id="field-agent"></span></div>
+        <div class="field-row"><span class="field-label">Action</span><span id="field-action"></span></div>
+        <div class="field-row"><span class="field-label">Target</span><span id="field-target"></span></div>
+        <div id="buttons">
+          <button id="btn-allow" class="btn btn-allow">Allow</button>
+          <button id="btn-investigate" class="btn btn-investigate">Investigate</button>
+          <button id="btn-block" class="btn btn-block">BLOCK</button>
+        </div>
+      </div>
+    </div>
+    <script src="flyout.js"></script>
+  </body>
+</html>
