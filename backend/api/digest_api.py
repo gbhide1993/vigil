@@ -24,6 +24,15 @@ async def get_daily_digest():
 
     cur = await db.execute(
         """
+        SELECT COUNT(*) c FROM alerts
+        WHERE created_at > datetime('now', '-24 hours')
+          AND rule_type IN ('volumetric_threshold', 'time_anomaly', 'ratio_anomaly', 'unknown_destination')
+        """
+    )
+    anomaly_count = (await cur.fetchone())["c"]
+
+    cur = await db.execute(
+        """
         SELECT DISTINCT a.name FROM sessions s
         JOIN agents a ON a.id = s.agent_id
         WHERE s.started_at > datetime('now', '-24 hours')
@@ -46,6 +55,8 @@ async def get_daily_digest():
             summary += f" {red_line_count} RED LINE."
         if agent_names:
             summary += f" {', '.join(agent_names)} active."
+        if anomaly_count:
+            summary += f" {anomaly_count} behavioral anomaly detected."
         summary = summary[:100]
 
     return {

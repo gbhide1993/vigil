@@ -218,6 +218,24 @@ async def insights():
     return await get_insights()
 
 
+@app.get("/anomalies/recent")
+async def anomalies_recent():
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT al.*, a.name as agent_name
+        FROM alerts al
+        LEFT JOIN agents a ON a.id = al.agent_id
+        WHERE al.rule_type IN ('volumetric_threshold', 'time_anomaly', 'ratio_anomaly', 'unknown_destination')
+          AND al.created_at > datetime('now', '-7 days')
+        ORDER BY al.created_at DESC
+        LIMIT 20
+        """
+    )
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
 if __name__ == "__main__":
     import uvicorn
 
