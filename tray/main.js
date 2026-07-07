@@ -1,6 +1,7 @@
-const { app, Tray, Menu, BrowserWindow, ipcMain, screen, shell } = require('electron')
+const { app, Tray, Menu, BrowserWindow, ipcMain, screen, shell, Notification } = require('electron')
 const path = require('path')
 const http = require('http')
+const cron = require('node-cron')
 
 const BACKEND_URL = 'http://localhost:7422'
 const WEB_UI_URL = 'http://localhost:7423'
@@ -10,8 +11,11 @@ let tray = null
 let flyout = null
 let pollTimer = null
 let currentAlert = null
-let activeAlerts = []
-let activeIndex = 0
+let qualifyingCount = 0
+let consecutiveFailures = 0
+let lastNotifiedAlertId = undefined // undefined = not yet primed by first poll
+
+const FAILURE_THRESHOLD = 3
 
 function httpRequest(method, urlPath, body) {
   return new Promise((resolve, reject) => {
@@ -57,44 +61,135 @@ function isQualifyingAlert(alert) {
   return severity || redLine
 }
 
+function truncateAction(str) {
+  if (!str) return str
+  // Command paths (esp. Windows) often contain spaces themselves (e.g.
+  // "C:\Program Files\...\bash.exe -c ..."), so a naive split(' ')[0] would
+  // cut mid-path. Find the executable by matching the first path-like
+  // token that ends in a known executable/script extension instead.
+  const exeMatch = str.match(/[^\s"']*\.(exe|cmd|bat|sh|ps1|py|js)\b/i)
+  const firstSegment = exeMatch ? exeMatch[0] : str.split(' ')[0]
+  const filename = firstSegment.split(/[\\/]/).pop()
+  return filename || firstSegment
+}
+
+function parseDetail(alert) {
+  if (!alert || !alert.detail) return {}
+  try {
+    return JSON.parse(alert.detail)
+  } catch (e) {
+    return {}
+  }
+}
+
+function withTruncatedAction(alert) {
+  if (!alert) return alert
+  const detail = parseDetail(alert)
+  const rawAction = alert.event_type || detail.action || alert.description || ''
+  return { ...alert, action_display: truncateAction(rawAction) }
+}
+
 async function pollAlerts() {
   try {
     const { status, body } = await httpRequest('GET', '/alerts?status=open')
     if (status !== 200 || !body) {
-      setTrayState('idle')
-      return
+      throw new Error(`unexpected response status ${status}`)
     }
+    consecutiveFailures = 0
     const alerts = (body.alerts || []).filter(isQualifyingAlert)
     if (alerts.length === 0) {
       currentAlert = null
-      activeAlerts = []
-      activeIndex = 0
+      qualifyingCount = 0
+      if (lastNotifiedAlertId === undefined) lastNotifiedAlertId = null
       setTrayState('idle')
       applyFlyoutState('idle', null)
       return
     }
-    // oldest-first ordering — API returns rows by created_at DESC, so reverse
-    const oldestFirst = [...alerts].reverse()
-    // keep pointing at the same alert (by id) across polls if still present,
-    // otherwise reset to the oldest
-    const prevId = activeAlerts[activeIndex] ? activeAlerts[activeIndex].id : null
-    activeAlerts = oldestFirst
-    const keepIndex = prevId != null ? oldestFirst.findIndex((a) => a.id === prevId) : -1
-    activeIndex = keepIndex >= 0 ? keepIndex : 0
-    currentAlert = activeAlerts[activeIndex]
+    // API returns rows ordered by created_at DESC, so the first element is
+    // the most recent qualifying alert
+    qualifyingCount = alerts.length
+    currentAlert = alerts[0]
     setTrayState('alert')
     applyFlyoutState('alert', currentAlert)
+    maybeNotifyNewAlert(currentAlert)
   } catch (err) {
     console.error('poll failed:', err.message)
-    setTrayState('idle')
+    consecutiveFailures += 1
+    if (consecutiveFailures >= FAILURE_THRESHOLD) {
+      setTrayState('warning')
+    }
   }
 }
 
-function setTrayState(state) {
+function maybeNotifyNewAlert(alert) {
+  if (!alert) return
+  if (lastNotifiedAlertId === undefined) {
+    // first poll since launch — prime silently, don't toast for alerts
+    // that were already open before the app started
+    lastNotifiedAlertId = alert.id
+    return
+  }
+  if (alert.id === lastNotifiedAlertId) return
+  lastNotifiedAlertId = alert.id
+
+  const isRedLine = typeof alert.rule_type === 'string' && alert.rule_type.includes('red_line')
+  const title = isRedLine ? 'V-LAW — RED LINE' : 'V-LAW — CRITICAL'
+  const body = (alert.title || '').slice(0, 80)
+
+  const notification = new Notification({
+    title,
+    body,
+    icon: path.join(__dirname, 'assets', 'icon_red.png'),
+  })
+  notification.on('click', () => {
+    toggleFlyout()
+  })
+  notification.show()
+}
+
+async function triggerDigestNow() {
+  try {
+    const { status, body } = await httpRequest('GET', '/digest/daily')
+    if (status !== 200 || !body) {
+      console.error('digest fetch failed:', status)
+      return
+    }
+    const notification = new Notification({
+      title: 'V-LAW Morning Digest',
+      body: body.summary,
+      icon: path.join(__dirname, 'assets', body.clean ? 'icon_green.png' : 'icon_red.png'),
+    })
+    notification.on('click', () => {
+      shell.openExternal(WEB_UI_URL)
+    })
+    notification.show()
+  } catch (err) {
+    console.error('digest trigger failed:', err.message)
+  }
+}
+
+function setTrayIcon(iconName, tooltip) {
   if (!tray) return
-  const iconName = state === 'alert' ? 'icon_red.png' : 'icon_green.png'
   tray.setImage(path.join(__dirname, 'assets', iconName))
-  tray.setToolTip(state === 'alert' ? 'V-LAW: open critical alert' : 'V-LAW: idle')
+  tray.setToolTip(tooltip)
+}
+
+function setTrayIdle() {
+  setTrayIcon('icon_green.png', 'V-LAW: idle')
+}
+
+function setTrayAlert() {
+  setTrayIcon('icon_red.png', 'V-LAW: open critical alert')
+}
+
+function setTrayWarning() {
+  setTrayIcon('icon_amber.png', 'V-LAW — backend unreachable')
+}
+
+function setTrayState(state) {
+  if (state === 'alert') return setTrayAlert()
+  if (state === 'warning') return setTrayWarning()
+  return setTrayIdle()
 }
 
 const FLYOUT_WIDTH = 320
@@ -130,6 +225,12 @@ function createFlyout() {
 
 function positionFlyout(height) {
   const trayBounds = tray.getBounds()
+
+  // Some Windows configs briefly report (0,0) before the tray icon is fully
+  // rendered — skip repositioning rather than snapping the flyout to the
+  // top-left corner of the screen.
+  if (trayBounds.x === 0 && trayBounds.y === 0) return
+
   const display = screen.getDisplayNearestPoint({ x: trayBounds.x, y: trayBounds.y })
   const winWidth = FLYOUT_WIDTH
   const winHeight = height != null ? height : flyout.getBounds().height
@@ -137,9 +238,11 @@ function positionFlyout(height) {
   let x = Math.round(trayBounds.x + trayBounds.width / 2 - winWidth / 2)
   let y
 
-  // Windows taskbar tray is typically bottom-right -> flyout above the icon.
-  // Fall back to below the icon if the tray sits at the top of the screen.
-  if (trayBounds.y > display.workArea.y + display.workArea.height / 2) {
+  // Bottom taskbar (the common Windows layout): tray icon sits in the
+  // bottom quarter of the display -> flyout goes above it. Otherwise
+  // (top taskbar) the flyout goes below. Left/right taskbars aren't
+  // handled separately for now.
+  if (trayBounds.y + trayBounds.height > display.workArea.height * 0.75) {
     y = Math.round(trayBounds.y - winHeight - 8)
   } else {
     y = Math.round(trayBounds.y + trayBounds.height + 8)
@@ -154,9 +257,8 @@ function applyFlyoutState(state, alert) {
   if (!flyout || flyout.isDestroyed()) return
   flyout.webContents.send('alert-state', {
     state,
-    alert,
-    index: activeIndex,
-    total: activeAlerts.length,
+    alert: withTruncatedAction(alert),
+    total: qualifyingCount,
   })
   if (flyout.isVisible()) {
     positionFlyout(state === 'alert' ? FLYOUT_HEIGHT_ALERT : FLYOUT_HEIGHT_IDLE)
@@ -177,9 +279,8 @@ function toggleFlyout() {
   flyout.focus()
   flyout.webContents.send('alert-state', {
     state,
-    alert: currentAlert,
-    index: activeIndex,
-    total: activeAlerts.length,
+    alert: withTruncatedAction(currentAlert),
+    total: qualifyingCount,
   })
 }
 
@@ -192,7 +293,17 @@ function createTray() {
   })
 
   tray.on('right-click', () => {
-    app.quit()
+    const template = [
+      { label: 'Open V-LAW', click: () => shell.openExternal(WEB_UI_URL) },
+      { type: 'separator' },
+    ]
+    if (!app.isPackaged) {
+      template.push({ label: 'Test digest toast', click: () => triggerDigestNow() })
+      template.push({ type: 'separator' })
+    }
+    template.push({ label: 'Quit V-LAW', click: () => app.quit() })
+    const menu = Menu.buildFromTemplate(template)
+    tray.popUpContextMenu(menu)
   })
 }
 
@@ -232,19 +343,15 @@ ipcMain.on('hide-flyout', () => {
   if (flyout && !flyout.isDestroyed()) flyout.hide()
 })
 
-ipcMain.handle('step-alert', (_event, direction) => {
-  if (activeAlerts.length === 0) return { alert: null, index: 0, total: 0 }
-  activeIndex = (activeIndex + direction + activeAlerts.length) % activeAlerts.length
-  currentAlert = activeAlerts[activeIndex]
-  return { alert: currentAlert, index: activeIndex, total: activeAlerts.length }
-})
-
 app.whenReady().then(() => {
   app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true })
   createTray()
   createFlyout()
   pollAlerts()
   pollTimer = setInterval(pollAlerts, POLL_INTERVAL_MS)
+  cron.schedule('0 9 * * *', () => {
+    triggerDigestNow()
+  })
 })
 
 app.on('window-all-closed', (e) => {

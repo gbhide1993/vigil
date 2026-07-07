@@ -9,5 +9,8 @@
   },
   "devDependencies": {
     "electron": "^33.0.0"
+  },
+  "dependencies": {
+    "node-cron": "^4.6.0"
   }
 }

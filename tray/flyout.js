@@ -7,10 +7,7 @@ const fieldTarget = document.getElementById('field-target')
 const btnAllow = document.getElementById('btn-allow')
 const btnInvestigate = document.getElementById('btn-investigate')
 const btnBlock = document.getElementById('btn-block')
-const queueNav = document.getElementById('queue-nav')
-const queueBadge = document.getElementById('queue-badge')
-const btnPrev = document.getElementById('btn-prev')
-const btnNext = document.getElementById('btn-next')
+const moreBadge = document.getElementById('more-badge')
 
 let activeAlert = null
 
@@ -23,7 +20,7 @@ function parseDetail(alert) {
   }
 }
 
-function render(state, alert, index, total) {
+function render(state, alert, total) {
   activeAlert = alert
 
   if (state === 'alert' && alert) {
@@ -34,38 +31,28 @@ function render(state, alert, index, total) {
     const detail = parseDetail(alert)
     alertTitle.textContent = alert.title || 'Alert'
     fieldAgent.textContent = alert.agent_name || detail.agent || '—'
-    fieldAction.textContent = alert.event_type || detail.action || alert.description || '—'
+    fieldAction.textContent = alert.action_display || '—'
     fieldTarget.textContent = alert.path || detail.target || '—'
 
     const isRedLine = typeof alert.rule_type === 'string' && alert.rule_type.includes('red_line')
     btnAllow.disabled = isRedLine
 
     if (total > 1) {
-      queueNav.classList.remove('hidden')
-      queueBadge.textContent = `${index + 1} of ${total} alerts`
+      moreBadge.textContent = `+ ${total - 1} more`
+      moreBadge.classList.remove('hidden')
     } else {
-      queueNav.classList.add('hidden')
+      moreBadge.classList.add('hidden')
     }
   } else {
     dot.classList.remove('alert')
     dot.classList.add('idle')
     alertBody.classList.add('hidden')
-    queueNav.classList.add('hidden')
+    moreBadge.classList.add('hidden')
   }
 }
 
-window.vlaw.onAlertState(({ state, alert, index, total }) => {
-  render(state, alert, index || 0, total || 0)
-})
-
-btnPrev.addEventListener('click', async () => {
-  const result = await window.vlaw.stepAlert(-1)
-  if (result.alert) render('alert', result.alert, result.index, result.total)
-})
-
-btnNext.addEventListener('click', async () => {
-  const result = await window.vlaw.stepAlert(1)
-  if (result.alert) render('alert', result.alert, result.index, result.total)
+window.vlaw.onAlertState(({ state, alert, total }) => {
+  render(state, alert, total || 0)
 })
 
 btnAllow.addEventListener('click', async () => {
@@ -78,6 +65,11 @@ btnAllow.addEventListener('click', async () => {
 btnInvestigate.addEventListener('click', async () => {
   window.vlaw.hideFlyout()
   await window.vlaw.sendAction('investigate')
+})
+
+moreBadge.addEventListener('click', async () => {
+  window.vlaw.hideFlyout()
+  await window.vlaw.sendAction('investigate', null)
 })
 
 btnBlock.addEventListener('click', async () => {

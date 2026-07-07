@@ -35,38 +35,18 @@ body {
   color: #cfcfcf;
 }
 
-#queue-nav {
-  display: flex;
-  align-items: center;
-  gap: 4px;
+#more-badge {
   margin-left: auto;
-}
-
-#queue-badge {
   font-size: 11px;
-  color: #8e8e93;
+  color: #666;
   white-space: nowrap;
-}
-
-.nav-arrow {
-  background: transparent;
-  border: none;
-  color: #cfcfcf;
-  font-size: 14px;
-  line-height: 1;
   cursor: pointer;
-  padding: 2px 4px;
-  border-radius: 4px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
-.nav-arrow:hover {
-  background: rgba(255, 255, 255, 0.08);
-}
-
-#alert-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: #fff;
+#more-badge:hover {
+  color: #93c5fd;
 }
 
 .dot {
@@ -115,44 +95,80 @@ body {
 }
 
 #alert-body {
-  padding: 0 14px 14px;
+  padding: 12px;
+}
+
+#alert-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  margin-bottom: 8px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .field-row {
   display: flex;
   justify-content: space-between;
-  font-size: 12px;
-  padding: 3px 0;
-  color: #d0d0d0;
+  align-items: center;
+  gap: 8px;
+}
+
+.field-row + .field-row {
+  margin-top: 8px;
 }
 
 .field-label {
-  color: #8e8e93;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #666;
+  flex-shrink: 0;
+}
+
+.field-value {
+  font-size: 13px;
+  color: #eee;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  text-align: right;
 }
 
 #buttons {
   display: flex;
-  gap: 6px;
+  gap: 8px;
   margin-top: 12px;
 }
 
-.btn {
+.btn-col {
   flex: 1;
-  border: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.btn {
+  width: 100%;
+  height: 36px;
   border-radius: 8px;
-  padding: 7px 0;
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
 }
 
 .btn-allow {
-  background: #2a2a2a;
-  color: #cfcfcf;
+  background: #1e1e1e;
+  color: #999;
+  border: 1px solid #333;
 }
 
 .btn-allow:hover {
-  background: #343434;
+  background: #262626;
 }
 
 .btn-allow:disabled {
@@ -162,18 +178,25 @@ body {
 
 .btn-investigate {
   background: transparent;
-  color: #eaeaea;
-  border: 1px solid #5a5a5a;
+  color: #60a5fa;
+  border: 1px solid #3b82f6;
 }
 
 .btn-investigate:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(59, 130, 246, 0.1);
+}
+
+.btn-subtitle {
+  font-size: 10px;
+  color: #666;
+  text-align: center;
 }
 
 .btn-block {
   background: #dc2626;
   color: #ffffff;
-  font-weight: 700;
+  border: none;
+  font-weight: 600;
 }
 
 .btn-block:hover {

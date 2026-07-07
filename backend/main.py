@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
-from api import agents, alerts, events, export
+from api import agents, alerts, digest_api, events, export
 from config.policy import load_policy
 from core.aggregator import Aggregator
 from core.attributor import Attributor
@@ -132,6 +132,7 @@ app.include_router(events.router)
 app.include_router(agents.router)
 app.include_router(alerts.router)
 app.include_router(export.router)
+app.include_router(digest_api.router)
 
 
 @app.get("/stats")

@@ -7,5 +7,4 @@ contextBridge.exposeInMainWorld('vlaw', {
     ipcRenderer.on('alert-state', (_event, data) => callback(data))
   },
   hideFlyout: () => ipcRenderer.send('hide-flyout'),
-  stepAlert: (direction) => ipcRenderer.invoke('step-alert', direction),
 })
