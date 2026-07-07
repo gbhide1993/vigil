@@ -14,19 +14,23 @@ export default function LiveFeed() {
   const [stats, setStats] = useState(null)
   const [events, setEvents] = useState([])
   const [error, setError] = useState(null)
+  const [baselineActive, setBaselineActive] = useState(true)
+  const [insights, setInsights] = useState([])
 
   useEffect(() => {
     let cancelled = false
 
     async function load() {
       try {
-        const [statsData, eventsData] = await Promise.all([
+        const [statsData, eventsData, healthData] = await Promise.all([
           api.getStats(),
           api.getEvents({ limit: 50 }),
+          api.getHealth(),
         ])
         if (cancelled) return
         setStats(statsData)
         setEvents(eventsData.events)
+        setBaselineActive(healthData.baseline_active)
         setError(null)
       } catch (err) {
         if (!cancelled) setError(err.message)
@@ -41,6 +45,26 @@ export default function LiveFeed() {
     }
   }, [])
 
+  useEffect(() => {
+    if (baselineActive) return
+    let cancelled = false
+
+    async function loadInsights() {
+      try {
+        const data = await api.getInsights()
+        if (!cancelled) setInsights(data.cards)
+      } catch {
+        // insight poll failures are non-fatal, silently retry next tick
+      }
+    }
+    loadInsights()
+    const id = setInterval(loadInsights, 10000)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [baselineActive])
+
   const netEvents = events.filter((e) => e.event_type === 'net_connect')
   const credEvents = events.filter((e) => e.event_type === 'cred_access')
 
@@ -54,6 +78,22 @@ export default function LiveFeed() {
       </div>
 
       {error && <div className="empty-state">Could not reach V-LAW backend: {error}</div>}
+
+      {!baselineActive && insights.length > 0 && (
+        <div className="panel">
+          <div className="panel-header">
+            <span>Today's Insights</span>
+            <span style={{ fontWeight: 400, color: 'var(--color-navy-muted)' }}>
+              baseline still compiling — statistical anomaly scoring isn't active yet
+            </span>
+          </div>
+          <div className="panel-body" style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {insights.map((card) => (
+              <div key={card.kind} style={{ fontSize: 12.5 }}>{card.text}</div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="stat-grid">
         <div className="stat-card">
@@ -78,6 +118,16 @@ export default function LiveFeed() {
           <div className="stat-card-label">Credential Accesses</div>
           <div className="stat-card-value" style={{ color: stats?.cred_accesses_today ? 'var(--color-high)' : undefined }}>
             {stats?.cred_accesses_today ?? '—'}
+          </div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-card-label">Sessions Today</div>
+          <div className="stat-card-value">{stats?.sessions_today ?? '—'}</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-card-label">Signal / Noise</div>
+          <div className="stat-card-value accent">
+            {stats ? `${stats.alerts_today} / ${stats.events_today}` : '—'}
           </div>
         </div>
       </div>

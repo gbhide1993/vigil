@@ -20,6 +20,7 @@ from config.policy import load_policy
 from core.aggregator import Aggregator
 from core.attributor import Attributor
 from core.baseline import Baseline
+from core.insights import get_insights
 from db.database import close_db, get_db, init_db
 from license.license_service import LicenseService
 from watchers.file_watcher import start_file_watcher
@@ -156,12 +157,29 @@ async def get_stats():
     )
     cred_accesses_today = (await cur.fetchone())["c"]
 
+    cur = await db.execute(
+        "SELECT COUNT(*) c FROM sessions WHERE date(started_at) = date('now')"
+    )
+    sessions_today = (await cur.fetchone())["c"]
+
+    cur = await db.execute(
+        "SELECT COUNT(*) c FROM alerts WHERE date(created_at) = date('now')"
+    )
+    alerts_today = (await cur.fetchone())["c"]
+
+    # Signal-over-noise: how much raw activity got compressed down to
+    # alerts actually worth a human's attention today.
+    noise_reduction_ratio = round(alerts_today / events_today, 4) if events_today else 0.0
+
     return {
         "active_agents": active_agents,
         "events_today": events_today,
         "alerts_open": alerts_open,
         "net_egress_mb_today": round(net_bytes_today / (1024 * 1024), 3),
         "cred_accesses_today": cred_accesses_today,
+        "sessions_today": sessions_today,
+        "alerts_today": alerts_today,
+        "noise_reduction_ratio": noise_reduction_ratio,
     }
 
 
@@ -192,6 +210,11 @@ async def health():
         "agents_watching": agents_watching,
         "file_watcher_alive": observer.is_alive() if observer else False,
     }
+
+
+@app.get("/insights")
+async def insights():
+    return await get_insights()
 
 
 if __name__ == "__main__":

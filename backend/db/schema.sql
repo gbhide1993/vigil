@@ -93,7 +93,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     cred_accesses INTEGER DEFAULT 0,
     mcp_connects INTEGER DEFAULT 0,
     alert_count INTEGER DEFAULT 0,
-    anomaly_score REAL DEFAULT 0
+    anomaly_score REAL DEFAULT 0,
+    summary TEXT                  -- plain-English digest, set when the
+                                   -- session closes (core/digest.py)
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_id);

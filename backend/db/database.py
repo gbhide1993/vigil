@@ -46,6 +46,12 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         await db.execute("ALTER TABLE alerts ADD COLUMN rule_type TEXT DEFAULT 'policy'")
         await db.commit()
 
+    cur = await db.execute("PRAGMA table_info(sessions)")
+    columns = {row["name"] for row in await cur.fetchall()}
+    if "summary" not in columns:
+        await db.execute("ALTER TABLE sessions ADD COLUMN summary TEXT")
+        await db.commit()
+
 
 async def _seed_policy(db: aiosqlite.Connection) -> None:
     if not POLICY_FILE.exists():

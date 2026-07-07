@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { api } from '../api'
 
 function formatTime(ts) {
@@ -169,6 +169,7 @@ export default function AgentDetail() {
   const [selectedId, setSelectedId] = useState(null)
   const [sessions, setSessions] = useState([])
   const [events, setEvents] = useState([])
+  const [expandedSessionId, setExpandedSessionId] = useState(null)
 
   useEffect(() => {
     let cancelled = false
@@ -206,6 +207,7 @@ export default function AgentDetail() {
 
   useEffect(() => {
     if (!selectedId) return
+    setExpandedSessionId(null)
     let cancelled = false
 
     async function load() {
@@ -359,22 +361,65 @@ export default function AgentDetail() {
                           <th>Cred</th>
                           <th>Alerts</th>
                           <th>Anomaly</th>
+                          <th>Summary</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {sessions.map((s) => (
-                          <tr key={s.id}>
-                            <td>{formatTime(s.started_at)}</td>
-                            <td>{s.ended_at ? formatTime(s.ended_at) : 'active'}</td>
-                            <td>{s.file_reads}</td>
-                            <td>{s.file_writes}</td>
-                            <td>{(s.net_egress_bytes / (1024 * 1024)).toFixed(2)}</td>
-                            <td>{s.proc_spawns}</td>
-                            <td>{s.cred_accesses}</td>
-                            <td>{s.alert_count}</td>
-                            <td>{s.anomaly_score.toFixed(2)}</td>
-                          </tr>
-                        ))}
+                        {sessions.map((s) => {
+                          const isExpanded = expandedSessionId === s.id
+                          const sessionEvents = events.filter((e) => e.session_id === s.id)
+                          return (
+                            <Fragment key={s.id}>
+                              <tr
+                                onClick={() => setExpandedSessionId(isExpanded ? null : s.id)}
+                                style={{ cursor: 'pointer' }}
+                              >
+                                <td>{formatTime(s.started_at)}</td>
+                                <td>{s.ended_at ? formatTime(s.ended_at) : 'active'}</td>
+                                <td>{s.file_reads}</td>
+                                <td>{s.file_writes}</td>
+                                <td>{(s.net_egress_bytes / (1024 * 1024)).toFixed(2)}</td>
+                                <td>{s.proc_spawns}</td>
+                                <td>{s.cred_accesses}</td>
+                                <td>{s.alert_count}</td>
+                                <td>{s.anomaly_score.toFixed(2)}</td>
+                                <td className="mono-truncate" title={s.summary || ''}>{s.summary || '—'}</td>
+                              </tr>
+                              {isExpanded && (
+                                <tr>
+                                  <td colSpan={10} style={{ background: 'var(--color-bg-subtle)' }}>
+                                    {sessionEvents.length === 0 ? (
+                                      <div className="empty-state" style={{ padding: '12px 0' }}>
+                                        No events for this session in the last 100 fetched — try the Live Feed for older activity.
+                                      </div>
+                                    ) : (
+                                      <table>
+                                        <thead>
+                                          <tr>
+                                            <th>Time</th>
+                                            <th>Type</th>
+                                            <th>Path / Destination</th>
+                                            <th>Severity</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {sessionEvents.map((e) => (
+                                            <tr key={e.id}>
+                                              <td>{formatTime(e.created_at)}</td>
+                                              <td><span className="badge outline">{e.event_type}</span></td>
+                                              <td className="mono-truncate" title={e.path}>{e.path}</td>
+                                              <td><span className={`badge ${e.severity}`}>{e.severity}</span></td>
+                                            </tr>
+                                          ))}
+                                        </tbody>
+                                      </table>
+                                    )}
+                                  </td>
+                                </tr>
+                              )}
+                            </Fragment>
+                          )
+                        })}
                       </tbody>
                     </table>
                   )}

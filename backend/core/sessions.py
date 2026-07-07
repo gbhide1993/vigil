@@ -6,6 +6,7 @@ table when a session closes, then handed to baseline.update_from_session()."""
 import uuid
 from datetime import datetime, timezone
 
+from core.digest import generate_summary
 from db.database import get_db
 
 SESSION_IDLE_TIMEOUT_SECONDS = 300  # close a session after 5 minutes of no activity
@@ -68,6 +69,7 @@ class SessionManager:
             await db.commit()
 
             await baseline.update_from_session(session_id)
+            await self._write_summary(db, session_id, agent_id)
             closed.append(session_id)
 
         return closed
@@ -108,3 +110,15 @@ class SessionManager:
                 alert_count, session_id,
             ),
         )
+
+    async def _write_summary(self, db, session_id: str, agent_id: int) -> None:
+        cur = await db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
+        session = await cur.fetchone()
+
+        cur = await db.execute("SELECT name FROM agents WHERE id = ?", (agent_id,))
+        agent = await cur.fetchone()
+        agent_name = agent["name"] if agent else "unknown agent"
+
+        summary = generate_summary(agent_name, dict(session))
+        await db.execute("UPDATE sessions SET summary = ? WHERE id = ?", (summary, session_id))
+        await db.commit()

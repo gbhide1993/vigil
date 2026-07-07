@@ -29,6 +29,7 @@ export const api = {
     request(`/alerts/${alertId}/resolve`, { method: 'POST', body: JSON.stringify(body) }),
   getStats: () => request('/stats'),
   getHealth: () => request('/health'),
+  getInsights: () => request('/insights'),
   exportJsonUrl: (date) => `${BASE}/export/json?date=${date}`,
   exportPdfUrl: (date) => `${BASE}/export/pdf?date=${date}`,
 }
