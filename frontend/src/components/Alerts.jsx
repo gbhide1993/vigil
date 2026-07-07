@@ -15,6 +15,7 @@ function AlertCard({ alert, onResolve }) {
   const [errorMsg, setErrorMsg] = useState(null)
 
   const isOpen = alert.status === 'open' || alert.status === 'investigating'
+  const isRedLine = alert.rule_type === 'red_line'
 
   async function submit(action) {
     if (NOTE_REQUIRED.has(action) && !note.trim()) {
@@ -43,7 +44,10 @@ function AlertCard({ alert, onResolve }) {
             {alert.agent_name || 'unknown agent'} · {formatTime(alert.created_at)}
           </div>
         </div>
-        <span className={`badge ${alert.severity}`}>{alert.severity}</span>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          {isRedLine && <span className="badge red-line">Red Line</span>}
+          <span className={`badge ${alert.severity}`}>{alert.severity}</span>
+        </div>
       </div>
       <div className="alert-description">{alert.description}</div>
 
@@ -55,7 +59,13 @@ function AlertCard({ alert, onResolve }) {
         </div>
       )}
 
-      {isOpen && (
+      {isRedLine && (
+        <div className="alert-meta" style={{ marginTop: 6 }}>
+          This is a Red Line safety-floor alert and cannot be dismissed or resolved.
+        </div>
+      )}
+
+      {isOpen && !isRedLine && (
         <>
           <div className="alert-actions">
             <button className="btn" disabled={submitting} onClick={() => submit('dismiss')}>

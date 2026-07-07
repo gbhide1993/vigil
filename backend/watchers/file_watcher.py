@@ -10,6 +10,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver
 
 from core.attributor import Attributor
+from core.red_lines import RedLines
 
 POLL_INTERVAL_SECONDS = 1
 
@@ -52,6 +53,7 @@ class VlawFileHandler(FileSystemEventHandler):
         self.attributor = attributor
         self.aggregator = aggregator
         self.loop = loop
+        self.red_lines = RedLines()
 
     def on_any_event(self, event):
         if event.is_directory:
@@ -74,6 +76,8 @@ class VlawFileHandler(FileSystemEventHandler):
         agent_id = await self.attributor.get_or_create_agent(agent_name, pid)
         session_id = await self.attributor.sessions.touch(agent_id)
 
+        await self._check_red_lines(agent_id, agent_name, path, event_type)
+
         await self.aggregator.ingest_file_event({
             "agent_id": agent_id,
             "session_id": session_id,
@@ -81,6 +85,20 @@ class VlawFileHandler(FileSystemEventHandler):
             "event_type": event_type,
             "attribution_confidence": confidence,
         })
+
+    async def _check_red_lines(self, agent_id: int, agent_name: str, path: str, event_type: str) -> None:
+        """Red Line rules run before any policy-based check for the same
+        event (the aggregator's check_out_of_scope_access/
+        check_credential_access run later, either immediately or on
+        flush)."""
+        is_write = event_type in ("file_write", "file_delete")
+
+        await self.red_lines.check_ssh_access(agent_id, agent_name, path)
+        if is_write:
+            await self.red_lines.check_claude_cache_write(agent_id, agent_name, path)
+        else:
+            await self.red_lines.check_env_outside_workspace(agent_id, agent_name, path)
+            await self.red_lines.check_cross_project_read(agent_id, agent_name, path)
 
 
 def start_file_watcher(attributor: Attributor, aggregator, watch_paths: list[str]) -> PollingObserver:

@@ -32,6 +32,7 @@ class Alerter:
         reason: str,
         event_id: int | None = None,
         extra_detail: dict | None = None,
+        rule_type: str = "policy",
     ) -> int:
         """Create an alert row and its corresponding audit_log entry.
         Returns the new alert's id."""
@@ -42,14 +43,14 @@ class Alerter:
 
         cur = await db.execute(
             """
-            INSERT INTO alerts (event_id, agent_id, severity, title, description)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO alerts (event_id, agent_id, severity, title, description, rule_type)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (event_id, agent_id, severity, title, description),
+            (event_id, agent_id, severity, title, description, rule_type),
         )
         alert_id = cur.lastrowid
 
-        detail = {"reason": reason, "alert_id": alert_id}
+        detail = {"reason": reason, "alert_id": alert_id, "rule_type": rule_type}
         if extra_detail:
             detail.update(extra_detail)
 

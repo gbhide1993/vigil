@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id INTEGER REFERENCES events(id),
     agent_id INTEGER REFERENCES agents(id),
-    severity TEXT NOT NULL,       -- medium, high, critical
+    severity TEXT NOT NULL,       -- low, medium, high, critical
     title TEXT NOT NULL,
     description TEXT NOT NULL,
     status TEXT DEFAULT 'open',   -- open, investigating, dismissed,
@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS alerts (
     resolved_by TEXT,             -- username who resolved
     resolved_at TIMESTAMP,
     resolution_note TEXT,         -- required for exception/risk_accepted
+    rule_type TEXT DEFAULT 'policy', -- 'policy' or 'red_line' — red_line
+                                      -- alerts are the non-disableable floor
+                                      -- and cannot be resolved from the UI
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

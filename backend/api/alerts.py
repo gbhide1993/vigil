@@ -62,9 +62,13 @@ async def resolve_alert(alert_id: int, body: ResolveAlertRequest):
         raise HTTPException(status_code=400, detail=f"resolution_note is required for action '{body.action}'")
 
     db = await get_db()
-    cur = await db.execute("SELECT id FROM alerts WHERE id = ?", (alert_id,))
-    if await cur.fetchone() is None:
+    cur = await db.execute("SELECT id, rule_type FROM alerts WHERE id = ?", (alert_id,))
+    alert = await cur.fetchone()
+    if alert is None:
         raise HTTPException(status_code=404, detail="alert not found")
+
+    if alert["rule_type"] == "red_line":
+        raise HTTPException(status_code=403, detail="Red Line alerts are a non-disableable safety floor and cannot be resolved from the UI")
 
     new_status = VALID_ACTIONS[body.action]
 

@@ -8,6 +8,7 @@ import psutil
 
 from core.alerter import Alerter
 from core.attributor import Attributor
+from core.red_lines import RedLines
 from db.database import get_db
 
 POLL_INTERVAL_SECONDS = 3
@@ -24,6 +25,7 @@ class ProcessWatcher:
     def __init__(self, attributor: Attributor):
         self.attributor = attributor
         self.alerter = Alerter()
+        self.red_lines = RedLines()
         self._known_pids: set[int] = set()
 
     async def poll(self) -> None:
@@ -54,6 +56,8 @@ class ProcessWatcher:
 
             agent_id = await self.attributor.get_or_create_agent(agent_name, pid)
             session_id = await self.attributor.sessions.touch(agent_id)
+
+            await self.red_lines.check_dangerous_command(agent_id, agent_name, cmdline)
 
             suspicious = _is_suspicious(cmdline)
             severity = "medium" if suspicious else "low"

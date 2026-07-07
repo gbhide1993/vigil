@@ -15,6 +15,7 @@ import psutil
 from core.aggregator import Aggregator
 from core.alerter import Alerter
 from core.attributor import KNOWN_DESTINATIONS, Attributor
+from core.red_lines import RedLines
 from db.database import get_db
 
 POLL_INTERVAL_SECONDS = 5
@@ -40,6 +41,7 @@ class NetworkWatcher:
         self.attributor = attributor
         self.aggregator = aggregator
         self.alerter = Alerter()
+        self.red_lines = RedLines()
         self._seen_connections: set[tuple] = set()
         self._known_ips = _resolve_known_destination_ips()
 
@@ -79,6 +81,9 @@ class NetworkWatcher:
             session_id = await self.attributor.sessions.touch(agent_id)
 
             dest_label = known_hostname or ip
+
+            await self.red_lines.check_unknown_destination(agent_id, agent_name, dest_label)
+
             is_approved = await self._is_approved_destination(db, dest_label, ip)
 
             if known_hostname is None and not is_approved:

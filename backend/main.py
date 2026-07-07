@@ -75,7 +75,12 @@ async def lifespan(app: FastAPI):
         p for p in credential_paths
         if p.endswith("/") or p.endswith("\\") or p.startswith("~")
     ]
-    watch_paths = scope_dirs + [host_root + p for p in credential_dirs]
+    # Red Line rules 1 and 3 (SSH directory access, Claude hidden cache
+    # writes) must fire regardless of policy configuration, so their
+    # directories are always watched — independent of whatever the user
+    # has set in credential_paths/scope_directories.
+    red_line_dirs = [host_root + os.path.expanduser("~/.ssh/"), host_root + os.path.expanduser("~/.claude/file-history/")]
+    watch_paths = scope_dirs + [host_root + p for p in credential_dirs] + red_line_dirs
     observer = start_file_watcher(attributor, aggregator, watch_paths)
     _state["observer"] = observer
     logger.info("file watcher started, watching %d paths", len(watch_paths))

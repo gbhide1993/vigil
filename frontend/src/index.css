@@ -308,6 +308,11 @@ tbody tr:hover {
   color: var(--color-navy-muted);
 }
 
+.badge.red-line {
+  background: var(--color-critical);
+  border: 1px solid var(--color-critical);
+}
+
 /* ---- Alerts ---- */
 
 .alert-card {
