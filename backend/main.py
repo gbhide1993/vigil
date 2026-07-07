@@ -226,7 +226,7 @@ async def anomalies_recent():
         SELECT al.*, a.name as agent_name
         FROM alerts al
         LEFT JOIN agents a ON a.id = al.agent_id
-        WHERE al.rule_type IN ('volumetric_threshold', 'time_anomaly', 'ratio_anomaly', 'unknown_destination')
+        WHERE al.rule_type IN ('volumetric_threshold', 'time_anomaly', 'ratio_anomaly', 'unknown_destination', 'rolling_anomaly')
           AND al.created_at > datetime('now', '-7 days')
         ORDER BY al.created_at DESC
         LIMIT 20

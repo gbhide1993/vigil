@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from core.digest import generate_summary
 from core.layer2a import score_session_2a
+from core.layer2b import score_session_2b
 from db.database import get_db
 
 SESSION_IDLE_TIMEOUT_SECONDS = 300  # close a session after 5 minutes of no activity
@@ -72,6 +73,7 @@ class SessionManager:
             await baseline.update_from_session(session_id)
             await self._write_summary(db, session_id, agent_id)
             await self._score_layer2a(db, session_id, agent_id)
+            await self._score_layer2b(db, session_id, agent_id)
             closed.append(session_id)
 
         return closed
@@ -139,3 +141,15 @@ class SessionManager:
             await score_session_2a(session_id, agent_id, agent_name, session["started_at"], db)
         except Exception as e:
             print(f"Layer2a scoring failed for session {session_id}: {e}")
+
+    async def _score_layer2b(self, db, session_id: str, agent_id: int) -> None:
+        """Layer 2b: rolling-window MAD anomaly checks. Session close
+        must never fail due to scoring, so any error here is swallowed."""
+        try:
+            cur = await db.execute("SELECT name FROM agents WHERE id = ?", (agent_id,))
+            agent = await cur.fetchone()
+            agent_name = agent["name"] if agent else "unknown agent"
+
+            await score_session_2b(session_id, agent_id, agent_name, db)
+        except Exception as e:
+            print(f"Layer2b scoring failed: {e}")

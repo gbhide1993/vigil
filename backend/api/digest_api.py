@@ -26,7 +26,7 @@ async def get_daily_digest():
         """
         SELECT COUNT(*) c FROM alerts
         WHERE created_at > datetime('now', '-24 hours')
-          AND rule_type IN ('volumetric_threshold', 'time_anomaly', 'ratio_anomaly', 'unknown_destination')
+          AND rule_type IN ('volumetric_threshold', 'time_anomaly', 'ratio_anomaly', 'unknown_destination', 'rolling_anomaly')
         """
     )
     anomaly_count = (await cur.fetchone())["c"]
