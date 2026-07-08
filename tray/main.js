@@ -15,7 +15,7 @@ if (!gotSingleInstanceLock) {
 }
 
 const BACKEND_URL = 'http://localhost:7422'
-const WEB_UI_URL = 'http://localhost:7423'
+const WEB_UI_URL = 'http://localhost:7422'
 const POLL_INTERVAL_MS = 4000
 
 let tray = null

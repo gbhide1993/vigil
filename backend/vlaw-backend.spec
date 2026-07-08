@@ -25,6 +25,9 @@ hiddenimports += [
     'watchdog.observers',
     'watchdog.observers.polling',
     'psutil._pswindows',
+    'fastapi.staticfiles',
+    'fastapi.responses',
+    'aiofiles',
 ]
 
 # Data files to bundle (read-only assets). The default policy JSON is

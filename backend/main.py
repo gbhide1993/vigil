@@ -54,7 +54,9 @@ import logging
 from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from api import agents, alerts, digest_api, events, export, sessions
 from config.policy import load_policy
@@ -214,8 +216,19 @@ app.include_router(export.router)
 app.include_router(digest_api.router)
 app.include_router(sessions.router)
 
+# The built frontend calls /api/* (see frontend/src/api.js). In dev, Vite's
+# proxy strips that prefix before forwarding to the backend; in production
+# there's no dev server, so the same routers are mounted again under /api.
+app.include_router(events.router, prefix="/api")
+app.include_router(agents.router, prefix="/api")
+app.include_router(alerts.router, prefix="/api")
+app.include_router(export.router, prefix="/api")
+app.include_router(digest_api.router, prefix="/api")
+app.include_router(sessions.router, prefix="/api")
+
 
 @app.get("/stats")
+@app.get("/api/stats")
 async def get_stats():
     db = await get_db()
 
@@ -270,6 +283,7 @@ async def get_stats():
 
 
 @app.get("/health")
+@app.get("/api/health")
 async def health():
     license_status = _state.get("license_status")
     observer = _state.get("observer")
@@ -299,6 +313,7 @@ async def health():
 
 
 @app.get("/insights")
+@app.get("/api/insights")
 async def insights():
     return await get_insights()
 
@@ -319,6 +334,27 @@ async def anomalies_recent():
     )
     rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+# Frontend (built React app) — installer places it as a sibling of the
+# backend exe: {app}\frontend\index.html, {app}\frontend\assets\*. Frozen
+# BASE_DIR is the per-user data dir (%LOCALAPPDATA%\V-LAW), not the install
+# dir, so the frozen case resolves from sys.executable's directory instead.
+# Mounted last so it never shadows the API routes registered above.
+if getattr(sys, "frozen", False):
+    FRONTEND_DIR = os.path.normpath(os.path.join(os.path.dirname(sys.executable), "..", "frontend"))
+else:
+    FRONTEND_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend", "dist"))
+
+if os.path.isdir(FRONTEND_DIR):
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIR, "assets")), name="frontend-assets")
+
+    @app.get("/{full_path:path}")
+    async def spa_fallback(full_path: str):
+        index = os.path.join(FRONTEND_DIR, "index.html")
+        return FileResponse(index)
+else:
+    logger.warning("frontend not found at %s — web UI will not be served", FRONTEND_DIR)
 
 
 if __name__ == "__main__":

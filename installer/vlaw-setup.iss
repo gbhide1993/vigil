@@ -44,6 +44,9 @@ Source: "build\tray\*"; DestDir: "{app}\tray"; Flags: ignoreversion recursesubdi
 ; Backend exe
 Source: "build\backend\{#BackendExeName}"; DestDir: "{app}\backend"; Flags: ignoreversion
 
+; Frontend (React app, served by backend)
+Source: "build\frontend\*"; DestDir: "{app}\frontend"; Flags: ignoreversion recursesubdirs createallsubdirs
+
 ; Default policy
 Source: "build\policy\vlaw-policy.json"; DestDir: "{app}\policy"; Flags: ignoreversion onlyifdoesntexist
 
