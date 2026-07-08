@@ -1,10 +1,42 @@
 {
-  "approved_agents": ["Cursor", "Claude Code", "GitHub Copilot"],
+  "approved_agents": [
+    "Cursor",
+    "Claude Code",
+    "GitHub Copilot",
+    "copilot",
+    "claude_code"
+  ],
   "blocked_agents": [],
-  "scope_directories": ["/src", "/docs", "/tests"],
-  "never_scope_directories": ["~/.ssh", "~/.aws", "/etc", "/secrets"],
-  "credential_paths": [".env", "~/.ssh/", "~/.aws/", "*.pem", "*.key"],
+  "scope_directories": [
+    "/src",
+    "/docs",
+    "/tests"
+  ],
+  "never_scope_directories": [
+    "~/.ssh",
+    "~/.aws",
+    "/etc",
+    "/secrets"
+  ],
+  "credential_paths": [
+    ".env",
+    "~/.ssh/",
+    "~/.aws/",
+    "*.pem",
+    "*.key"
+  ],
   "approved_mcp_servers": [],
+  "approved_network_destinations": [
+    "api.anthropic.com", "statsig.anthropic.com", "sentry.io",
+    "update.googleapis.com", "clients2.google.com",
+    "github.com", "api.github.com", "raw.githubusercontent.com",
+    "objects.githubusercontent.com", "registry.npmjs.org", "pypi.org",
+    "api2.cursor.sh", "marketplace.cursorapi.com", "cursor.sh",
+    "api.openai.com", "extensions.vscode.dev",
+    "copilot-proxy.githubusercontent.com", "api.githubcopilot.com",
+    "githubcopilot.com", "copilot.microsoft.com",
+    "vscode.blob.core.windows.net"
+  ],
   "alert_on_unapproved_agent": true,
   "alert_on_out_of_scope_access": true,
   "alert_on_credential_access": true,

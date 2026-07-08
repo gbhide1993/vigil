@@ -98,8 +98,27 @@ CREATE TABLE IF NOT EXISTS sessions (
                                    -- session closes (core/digest.py)
 );
 
+-- User-defined suppressions for recurring false positives, e.g. a specific
+-- agent + rule + destination/path pattern that's known-safe on this machine.
+CREATE TABLE IF NOT EXISTS noise_suppressions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_name TEXT,
+    rule_type TEXT,
+    target_pattern TEXT,
+    reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Small generic key/value counters, e.g. suppressed_alerts. Not for
+-- anything that needs querying/aggregation — that belongs in a real table.
+CREATE TABLE IF NOT EXISTS stats_kv (
+    key TEXT PRIMARY KEY,
+    value INTEGER DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_id);
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id);
+CREATE INDEX IF NOT EXISTS idx_suppressions_lookup ON noise_suppressions(agent_name, rule_type);

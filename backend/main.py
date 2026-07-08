@@ -168,6 +168,10 @@ async def get_stats():
     )
     alerts_today = (await cur.fetchone())["c"]
 
+    cur = await db.execute("SELECT value FROM stats_kv WHERE key = 'suppressed_alerts'")
+    row = await cur.fetchone()
+    suppressed_alerts = row["value"] if row else 0
+
     # Signal-over-noise: how much raw activity got compressed down to
     # alerts actually worth a human's attention today.
     noise_reduction_ratio = round(alerts_today / events_today, 4) if events_today else 0.0
@@ -181,6 +185,7 @@ async def get_stats():
         "sessions_today": sessions_today,
         "alerts_today": alerts_today,
         "noise_reduction_ratio": noise_reduction_ratio,
+        "suppressed_alerts": suppressed_alerts,
     }
 
 

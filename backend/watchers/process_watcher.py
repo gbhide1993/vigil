@@ -93,6 +93,7 @@ class ProcessWatcher:
                     reason="suspicious_command",
                     event_id=event_id,
                     extra_detail={"pid": pid, "cmdline": cmdline},
+                    target=cmdline,
                 )
 
         await db.commit()

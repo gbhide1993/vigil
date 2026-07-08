@@ -13,7 +13,10 @@ AGENT_PRIORS = {
         "normal_hours":               [6, 22],
         "known_network_destinations": [
             "api.anthropic.com", "statsig.anthropic.com",
-            "sentry.io", "localhost",
+            "sentry.io", "localhost", "127.0.0.1",
+            "update.googleapis.com", "clients2.google.com",
+            "github.com", "raw.githubusercontent.com",
+            "registry.npmjs.org", "pypi.org",
         ],
     },
     "cursor": {
@@ -24,7 +27,9 @@ AGENT_PRIORS = {
         "normal_hours":               [6, 22],
         "known_network_destinations": [
             "api2.cursor.sh", "marketplace.cursorapi.com",
-            "api.openai.com", "sentry.io", "localhost",
+            "api.openai.com", "sentry.io", "localhost", "127.0.0.1",
+            "update.googleapis.com", "github.com",
+            "registry.npmjs.org", "pypi.org", "extensions.vscode.dev",
         ],
     },
     "copilot": {
@@ -36,7 +41,8 @@ AGENT_PRIORS = {
         "known_network_destinations": [
             "copilot-proxy.githubusercontent.com",
             "api.githubcopilot.com", "githubcopilot.com",
-            "vscode.blob.core.windows.net", "localhost",
+            "vscode.blob.core.windows.net", "localhost", "127.0.0.1",
+            "github.com", "api.github.com", "update.googleapis.com",
         ],
     },
     "_default": {

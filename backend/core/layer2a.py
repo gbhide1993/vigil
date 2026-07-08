@@ -75,6 +75,7 @@ async def check_hard_thresholds(session_id: str, agent_id: int, agent_name: str,
             reason="volumetric_threshold",
             extra_detail={"metric": metric_name, "value": value, "session_id": session_id},
             rule_type="volumetric_threshold",
+            target=metric_name,
         )
         alert_ids.append(alert_id)
 
@@ -121,6 +122,7 @@ async def check_time_anomaly(session_id: str, agent_id: int, agent_name: str, se
         reason="time_anomaly",
         extra_detail={"session_id": session_id, "hour": hour},
         rule_type="time_anomaly",
+        target=session_id,
     )
     return [alert_id]
 
@@ -154,6 +156,7 @@ async def check_ratio_anomaly(session_id: str, agent_id: int, agent_name: str, p
             reason="ratio_anomaly",
             extra_detail={"session_id": session_id, "reads": reads, "writes": writes, "ratio": round(ratio, 2)},
             rule_type="ratio_anomaly",
+            target=session_id,
         )
         alert_ids.append(alert_id)
 
@@ -165,6 +168,7 @@ async def check_ratio_anomaly(session_id: str, agent_id: int, agent_name: str, p
             reason="ratio_anomaly",
             extra_detail={"session_id": session_id, "reads": reads, "writes": writes},
             rule_type="ratio_anomaly",
+            target=session_id,
         )
         alert_ids.append(alert_id)
 
@@ -207,6 +211,7 @@ async def check_network_destinations(session_id: str, agent_id: int, agent_name:
             reason="unknown_destination",
             extra_detail={"session_id": session_id, "destination": dest},
             rule_type="unknown_destination",
+            target=dest,
         )
         alert_ids.append(alert_id)
 

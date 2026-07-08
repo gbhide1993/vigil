@@ -21,6 +21,13 @@ class ResolveAlertRequest(BaseModel):
     actor: str = "admin"
 
 
+class CreateSuppressionRequest(BaseModel):
+    agent_name: str | None = None
+    rule_type: str | None = None
+    target_pattern: str | None = None
+    reason: str | None = None
+
+
 @router.get("/alerts")
 async def get_alerts(
     status: str | None = Query(default=None),
@@ -95,3 +102,37 @@ async def resolve_alert(alert_id: int, body: ResolveAlertRequest):
     await db.commit()
 
     return {"id": alert_id, "status": new_status}
+
+
+@router.get("/suppressions")
+async def get_suppressions():
+    db = await get_db()
+    cur = await db.execute("SELECT * FROM noise_suppressions ORDER BY created_at DESC")
+    rows = await cur.fetchall()
+    return {"suppressions": [dict(r) for r in rows]}
+
+
+@router.post("/suppressions")
+async def create_suppression(body: CreateSuppressionRequest):
+    db = await get_db()
+    cur = await db.execute(
+        """
+        INSERT INTO noise_suppressions (agent_name, rule_type, target_pattern, reason)
+        VALUES (?, ?, ?, ?)
+        """,
+        (body.agent_name, body.rule_type, body.target_pattern, body.reason),
+    )
+    await db.commit()
+    return {"id": cur.lastrowid}
+
+
+@router.delete("/suppressions/{suppression_id}")
+async def delete_suppression(suppression_id: int):
+    db = await get_db()
+    cur = await db.execute("SELECT id FROM noise_suppressions WHERE id = ?", (suppression_id,))
+    if await cur.fetchone() is None:
+        raise HTTPException(status_code=404, detail="suppression not found")
+
+    await db.execute("DELETE FROM noise_suppressions WHERE id = ?", (suppression_id,))
+    await db.commit()
+    return {"id": suppression_id, "deleted": True}

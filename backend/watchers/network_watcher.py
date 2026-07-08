@@ -101,13 +101,15 @@ class NetworkWatcher:
 
     async def _is_approved_destination(self, db, dest_label: str, ip: str) -> bool:
         cur = await db.execute(
-            "SELECT policy_value FROM policy WHERE policy_key = 'approved_mcp_servers'"
+            "SELECT policy_value FROM policy WHERE policy_key = 'approved_network_destinations'"
         )
         row = await cur.fetchone()
         if row is None:
             return False
         approved = json.loads(row["policy_value"])
-        return dest_label in approved or ip in approved
+        if dest_label in approved or ip in approved:
+            return True
+        return any(dest_label.endswith(suffix) for suffix in approved)
 
     async def _fire_unapproved_destination_alert(self, db, agent_id: int, dest_label: str, port: int) -> None:
         await self.alerter.fire_alert(
@@ -117,4 +119,5 @@ class NetworkWatcher:
             description=f"Agent connected to {dest_label}:{port}, which is not a known or approved destination.",
             reason="unapproved_destination",
             extra_detail={"host": dest_label, "port": port},
+            target=dest_label,
         )

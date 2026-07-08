@@ -128,4 +128,5 @@ class McpWatcher:
             reason="unapproved_mcp",
             event_id=event_id,
             extra_detail={"endpoint": endpoint},
+            target=endpoint,
         )

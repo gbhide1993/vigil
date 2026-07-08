@@ -21,7 +21,16 @@ from pathlib import Path
 
 from core.alerter import Alerter
 
-RED_LINE_WINDOW_SECONDS = 60
+RED_LINE_WINDOW_SECONDS = 60  # default, overridden per-rule in RED_LINE_WINDOWS
+
+RED_LINE_WINDOWS = {
+    "ssh_access":            300,   # 5 min — SSH access is rare, keep tight
+    "env_outside_workspace": 300,
+    "claude_cache_write":    300,
+    "unknown_destination":   600,   # network polling can fire constantly
+    "dangerous_command":     600,   # curl/wget in loops
+    "cross_project_read":    300,
+}
 
 SSH_DIR_PATTERN = re.compile(r"[\\/]\.ssh[\\/]", re.IGNORECASE)
 
@@ -31,11 +40,26 @@ CLAUDE_CACHE_PATTERN = re.compile(
 
 APPROVED_NETWORK_DESTINATIONS = {
     "api.anthropic.com",
+    "statsig.anthropic.com",
+    "sentry.io",
     "api.openai.com",
     "api.github.com",
+    "github.com",
+    "raw.githubusercontent.com",
+    "registry.npmjs.org",
+    "pypi.org",
+    "update.googleapis.com",
+    "clients2.google.com",
     "marketplace.cursor.sh",
+    "marketplace.cursorapi.com",
+    "api2.cursor.sh",
     "cursor.sh",
+    "extensions.vscode.dev",
     "copilot.microsoft.com",
+    "copilot-proxy.githubusercontent.com",
+    "api.githubcopilot.com",
+    "githubcopilot.com",
+    "vscode.blob.core.windows.net",
     "objects.githubusercontent.com",
     "127.0.0.1",
     "localhost",
@@ -121,21 +145,23 @@ class RedLines:
 
     def __init__(self):
         self.alerter = Alerter()
-        # (agent_id, rule_key) -> {"last_fired": float, "batched": int}
+        # (agent_id, rule_key, target) -> {"last_fired": float, "batched": int}
         self._state: dict[tuple, dict] = {}
 
-    async def _fire(self, agent_id: int, rule_key: str, severity: str, title: str, description: str, extra_detail: dict) -> None:
+    async def _fire(self, agent_id: int, rule_key: str, severity: str, title: str, description: str, extra_detail: dict, target: str) -> None:
         now = time.time()
-        state = self._state.get((agent_id, rule_key))
+        window = RED_LINE_WINDOWS.get(rule_key, RED_LINE_WINDOW_SECONDS)
+        state_key = (agent_id, rule_key, target)
+        state = self._state.get(state_key)
 
-        if state is not None and now - state["last_fired"] < RED_LINE_WINDOW_SECONDS:
+        if state is not None and now - state["last_fired"] < window:
             state["batched"] += 1
             return
 
         if state is not None and state["batched"] > 0:
-            description = f"{description} ({state['batched']} more {rule_key.replace('_', ' ')} events in the last minute)"
+            description = f"{description} ({state['batched']} more {rule_key.replace('_', ' ')} events in the last {window // 60} min)"
 
-        self._state[(agent_id, rule_key)] = {"last_fired": now, "batched": 0}
+        self._state[state_key] = {"last_fired": now, "batched": 0}
 
         await self.alerter.fire_alert(
             agent_id,
@@ -145,6 +171,7 @@ class RedLines:
             reason=f"red_line_{rule_key}",
             extra_detail=extra_detail,
             rule_type="red_line",
+            target=target,
         )
 
     async def check_ssh_access(self, agent_id: int, agent_name: str, path: str) -> None:
@@ -155,6 +182,7 @@ class RedLines:
             title=f"RED LINE: SSH directory accessed by {agent_name}",
             description=f"{agent_name} accessed your SSH directory. This is unusual and worth reviewing.",
             extra_detail={"path": path},
+            target=path,
         )
 
     async def check_env_outside_workspace(self, agent_id: int, agent_name: str, path: str) -> None:
@@ -165,6 +193,7 @@ class RedLines:
             title=f"RED LINE: environment file read outside workspace by {agent_name}",
             description=f"{agent_name} read an environment file outside your active project.",
             extra_detail={"path": path},
+            target=path,
         )
 
     async def check_claude_cache_write(self, agent_id: int, agent_name: str, path: str) -> None:
@@ -175,6 +204,7 @@ class RedLines:
             title=f"RED LINE: hidden cache write by {agent_name}",
             description=f"{agent_name} wrote to Claude's hidden cache directory. This may include credential file copies.",
             extra_detail={"path": path},
+            target=path,
         )
 
     async def check_unknown_destination(self, agent_id: int, agent_name: str, destination: str) -> None:
@@ -185,6 +215,7 @@ class RedLines:
             title=f"RED LINE: unrecognised network destination for {agent_name}",
             description=f"{agent_name} connected to an unrecognised destination: {destination}",
             extra_detail={"destination": destination},
+            target=destination,
         )
 
     async def check_dangerous_command(self, agent_id: int, agent_name: str, cmdline: str) -> None:
@@ -196,6 +227,7 @@ class RedLines:
             title=f"RED LINE: sensitive command spawned by {agent_name}",
             description=f"{agent_name} spawned a potentially sensitive command: {cmdline}",
             extra_detail={"command": cmdline, "matched_pattern": matched},
+            target=cmdline,
         )
 
     async def check_cross_project_read(self, agent_id: int, agent_name: str, path: str) -> None:
@@ -206,4 +238,5 @@ class RedLines:
             title=f"RED LINE: cross-project file read by {agent_name}",
             description=f"{agent_name} read files from a different project directory than the active workspace.",
             extra_detail={"path": path},
+            target=path,
         )
