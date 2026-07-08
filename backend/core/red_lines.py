@@ -204,12 +204,17 @@ class RedLines:
     async def check_claude_cache_write(self, agent_id: int, agent_name: str, path: str) -> None:
         if not is_claude_cache_write(path):
             return
+        # Dedup on the containing directory, not the individual snapshot
+        # filename — Claude Code's file-history mechanism writes many
+        # distinct per-turn snapshot files in a single burst under one
+        # session directory, which is one logical event, not N.
+        directory = str(Path(path.replace("\\", "/")).parent)
         await self._fire(
             agent_id, "claude_cache_write", "high",
             title=f"RED LINE: hidden cache write by {agent_name}",
             description=f"{agent_name} wrote to Claude's hidden cache directory. This may include credential file copies.",
             extra_detail={"path": path},
-            target=path,
+            target=directory,
         )
 
     async def check_unknown_destination(self, agent_id: int, agent_name: str, destination: str) -> None:
