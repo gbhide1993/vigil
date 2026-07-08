@@ -14,6 +14,7 @@ let currentAlert = null
 let qualifyingCount = 0
 let consecutiveFailures = 0
 let lastNotifiedAlertId = undefined // undefined = not yet primed by first poll
+let activeSessionCount = 0
 
 const FAILURE_THRESHOLD = 3
 
@@ -89,6 +90,17 @@ function withTruncatedAction(alert) {
   return { ...alert, action_display: truncateAction(rawAction) }
 }
 
+async function pollActiveSessionCount() {
+  try {
+    const { status, body } = await httpRequest('GET', '/sessions?status=open')
+    if (status === 200 && body) {
+      activeSessionCount = (body.sessions || []).length
+    }
+  } catch (err) {
+    // non-fatal — tooltip just keeps the last known count until this succeeds again
+  }
+}
+
 async function pollAlerts() {
   try {
     const { status, body } = await httpRequest('GET', '/alerts?status=open')
@@ -96,6 +108,7 @@ async function pollAlerts() {
       throw new Error(`unexpected response status ${status}`)
     }
     consecutiveFailures = 0
+    await pollActiveSessionCount()
     const alerts = (body.alerts || []).filter(isQualifyingAlert)
     if (alerts.length === 0) {
       currentAlert = null
@@ -175,7 +188,10 @@ function setTrayIcon(iconName, tooltip) {
 }
 
 function setTrayIdle() {
-  setTrayIcon('icon_green.png', 'V-LAW: idle')
+  const tooltip = activeSessionCount > 0
+    ? `V-LAW — Watching ${activeSessionCount} agent${activeSessionCount !== 1 ? 's' : ''}. All clear.`
+    : 'V-LAW — No active agents. Waiting.'
+  setTrayIcon('icon_green.png', tooltip)
 }
 
 function setTrayAlert() {
@@ -183,7 +199,7 @@ function setTrayAlert() {
 }
 
 function setTrayWarning() {
-  setTrayIcon('icon_amber.png', 'V-LAW — backend unreachable')
+  setTrayIcon('icon_amber.png', 'V-LAW — Backend offline. Restart V-LAW.')
 }
 
 function setTrayState(state) {

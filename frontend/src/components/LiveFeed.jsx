@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 
 function formatTime(ts) {
@@ -10,27 +10,97 @@ function EventTypeBadge({ type }) {
   return <span className="badge outline">{type}</span>
 }
 
+function WelcomeState() {
+  return (
+    <div className="panel">
+      <div className="panel-body" style={{ padding: '56px 24px', textAlign: 'center' }}>
+        <div style={{ fontSize: 32, fontWeight: 700, color: 'var(--color-teal)', marginBottom: 12 }}>V</div>
+        <div style={{ fontSize: 18, fontWeight: 600, color: 'var(--color-navy)', marginBottom: 16 }}>
+          V-LAW is active and watching.
+        </div>
+        <div style={{ fontSize: 13, color: 'var(--color-navy-muted)', marginBottom: 24 }}>
+          Start your AI agent (Claude Code, Cursor, or Copilot)
+          <br />
+          and return here. Your first session will appear automatically.
+        </div>
+        <div style={{ fontSize: 12.5, color: 'var(--color-navy-muted)', lineHeight: 2 }}>
+          <div>● File activity</div>
+          <div>● Network connections</div>
+          <div>● Process spawns</div>
+          <div>● MCP tool calls</div>
+        </div>
+        <div style={{ fontSize: 12, color: 'var(--color-navy-muted)', marginTop: 24 }}>
+          All monitored. Zero data leaves this machine.
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function FirstSessionCard({ session, topFinding, onDismiss }) {
+  const alert = topFinding?.alert
+  const kind = topFinding?.kind
+
+  let borderColor = 'var(--color-green)'
+  let text
+  if (kind === 'red_line') {
+    borderColor = 'var(--color-red)'
+    text = `First session complete. ${session.agent_name} accessed ${session.file_reads + session.file_writes} files and made ${session.net_connect_count} network connections. 1 RED LINE alert caught.`
+  } else if (kind === 'anomaly') {
+    borderColor = 'var(--color-amber)'
+    text = `First session complete. ${session.agent_name} accessed ${session.file_reads + session.file_writes} files. ${alert.title}`
+  } else if (session.alert_count > 0) {
+    borderColor = 'var(--color-amber)'
+    text = `First session complete. ${session.agent_name} accessed ${session.file_reads + session.file_writes} files. ${session.alert_count} alert${session.alert_count !== 1 ? 's' : ''} raised.`
+  } else {
+    text = `First session complete. ${session.agent_name} ran clean — no alerts, ${session.file_reads + session.file_writes} files accessed. V-LAW is working.`
+  }
+
+  return (
+    <div
+      className="panel"
+      style={{ borderLeft: `4px solid ${borderColor}` }}
+    >
+      <div className="panel-body" style={{ padding: '14px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16 }}>
+        <div style={{ fontSize: 14, color: 'var(--color-navy)' }}>{text}</div>
+        <button
+          onClick={onDismiss}
+          style={{ background: 'none', border: 'none', color: 'var(--color-navy-muted)', cursor: 'pointer', fontSize: 16, lineHeight: 1, padding: 0 }}
+          aria-label="Dismiss"
+        >
+          ×
+        </button>
+      </div>
+    </div>
+  )
+}
+
 export default function LiveFeed() {
   const [stats, setStats] = useState(null)
   const [events, setEvents] = useState([])
   const [error, setError] = useState(null)
   const [baselineActive, setBaselineActive] = useState(true)
   const [insights, setInsights] = useState([])
+  const [sessions, setSessions] = useState(null)
+  const [firstSessionCard, setFirstSessionCard] = useState(null)
+  const prevSessionCountRef = useRef(null)
 
   useEffect(() => {
     let cancelled = false
 
     async function load() {
       try {
-        const [statsData, eventsData, healthData] = await Promise.all([
+        const [statsData, eventsData, healthData, sessionsData] = await Promise.all([
           api.getStats(),
           api.getEvents({ limit: 50 }),
           api.getHealth(),
+          api.getSessions(),
         ])
         if (cancelled) return
         setStats(statsData)
         setEvents(eventsData.events)
         setBaselineActive(healthData.baseline_active)
+        setSessions(sessionsData.sessions)
         setError(null)
       } catch (err) {
         if (!cancelled) setError(err.message)
@@ -44,6 +114,35 @@ export default function LiveFeed() {
       clearInterval(id)
     }
   }, [])
+
+  useEffect(() => {
+    if (sessions === null) return
+    const prevCount = prevSessionCountRef.current
+    prevSessionCountRef.current = sessions.length
+
+    if (prevCount === 0 && sessions.length === 1) {
+      const firstSession = sessions[0]
+      let cancelled = false
+      async function loadTopFinding() {
+        try {
+          const topFinding = await api.getSessionTopFinding(firstSession.id)
+          if (!cancelled) setFirstSessionCard({ session: firstSession, topFinding })
+        } catch {
+          if (!cancelled) setFirstSessionCard({ session: firstSession, topFinding: { kind: null, alert: null } })
+        }
+      }
+      loadTopFinding()
+      return () => {
+        cancelled = true
+      }
+    }
+  }, [sessions])
+
+  useEffect(() => {
+    if (!firstSessionCard) return
+    const timer = setTimeout(() => setFirstSessionCard(null), 60000)
+    return () => clearTimeout(timer)
+  }, [firstSessionCard])
 
   useEffect(() => {
     if (baselineActive) return
@@ -78,6 +177,14 @@ export default function LiveFeed() {
       </div>
 
       {error && <div className="empty-state">Could not reach V-LAW backend: {error}</div>}
+
+      {firstSessionCard && (
+        <FirstSessionCard
+          session={firstSessionCard.session}
+          topFinding={firstSessionCard.topFinding}
+          onDismiss={() => setFirstSessionCard(null)}
+        />
+      )}
 
       {!baselineActive && insights.length > 0 && (
         <div className="panel">
@@ -132,6 +239,9 @@ export default function LiveFeed() {
         </div>
       </div>
 
+      {sessions !== null && sessions.length === 0 ? (
+        <WelcomeState />
+      ) : (
       <div className="panel">
         <div className="panel-header">
           <span>Event Stream</span>
@@ -166,6 +276,7 @@ export default function LiveFeed() {
           )}
         </div>
       </div>
+      )}
 
       <div className="export-grid">
         <div className="panel" style={{ marginBottom: 0 }}>

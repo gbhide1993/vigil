@@ -19,6 +19,11 @@ export const api = {
   },
   getAgents: () => request('/agents'),
   getAgentSessions: (agentId) => request(`/agents/${agentId}/sessions`),
+  getSessions: (params = {}) => {
+    const qs = new URLSearchParams(params).toString()
+    return request(`/sessions${qs ? `?${qs}` : ''}`)
+  },
+  getSessionTopFinding: (sessionId) => request(`/sessions/${sessionId}/top-finding`),
   approveAgent: (agentId) => request(`/agents/${agentId}/approve`, { method: 'POST' }),
   blockAgent: (agentId) => request(`/agents/${agentId}/block`, { method: 'POST' }),
   getAlerts: (params = {}) => {
