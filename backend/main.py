@@ -8,8 +8,44 @@
 6. Serve on port 7422
 """
 
-import logging
+import json
+import sys
 import os
+
+
+def get_base_path() -> str:
+    """Directory for user-writable files (db, policy, logs, license).
+
+    Frozen (PyInstaller .exe): next to the .exe, so data survives
+    reinstalls/rebuilds and isn't touched by antivirus quarantine of the
+    temp extraction dir. Script mode: this file's directory.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def bundled_path(relative: str) -> str:
+    """Path to a read-only asset bundled into the .exe (e.g. schema.sql).
+
+    Frozen: PyInstaller unpacks bundled data into sys._MEIPASS at
+    runtime. Script mode: resolves relative to this file's directory.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.join(sys._MEIPASS, relative)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative)
+
+
+BASE_DIR = get_base_path()
+
+# Other modules (db.database, config.policy, license.license_service) read
+# these env vars at import time to build their path defaults, so they must
+# be set before those modules are imported.
+os.environ.setdefault("VLAW_DATA_DIR", os.path.join(BASE_DIR, "data"))
+os.environ.setdefault("VLAW_POLICY_FILE", os.path.join(BASE_DIR, "policy", "vlaw-policy.json"))
+os.environ.setdefault("VLAW_LICENSE_FILE", os.path.join(BASE_DIR, ".vlaw-license"))
+
+import logging
 from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -28,13 +64,50 @@ from watchers.mcp_watcher import McpWatcher
 from watchers.network_watcher import NetworkWatcher
 from watchers.process_watcher import ProcessWatcher
 
-logging.basicConfig(level=os.environ.get("VLAW_LOG_LEVEL", "INFO"))
+LOG_PATH = os.path.join(BASE_DIR, "vlaw-backend.log")
+logging.basicConfig(
+    level=os.environ.get("VLAW_LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
+)
 logger = logging.getLogger("vlaw")
+logger.info("V-LAW backend starting. BASE_DIR=%s", BASE_DIR)
 
 VERSION = "0.1.0"
 PORT = int(os.environ.get("VLAW_PORT", 7422))
 
 _state: dict = {}
+
+
+DEFAULT_POLICY = {
+    "approved_agents": [],
+    "approved_network_destinations": [
+        "localhost", "127.0.0.1",
+        "api.anthropic.com", "statsig.anthropic.com",
+        "api2.cursor.sh", "api.openai.com",
+        "copilot-proxy.githubusercontent.com",
+        "github.com", "pypi.org", "registry.npmjs.org",
+    ],
+    "scope_directories": [],
+    "never_scope_directories": [],
+    "credential_paths": [".ssh", ".aws"],
+    "mcp_connections": [],
+    "command_execution": {
+        "dangerous_commands": ["curl", "wget", "nc", "ssh", "netcat"]
+    },
+    "exceptions": [],
+    "risk_acceptance": [],
+}
+
+
+def _ensure_default_policy() -> None:
+    policy_path = os.environ["VLAW_POLICY_FILE"]
+    if os.path.exists(policy_path):
+        return
+    os.makedirs(os.path.dirname(policy_path), exist_ok=True)
+    with open(policy_path, "w") as f:
+        json.dump(DEFAULT_POLICY, f, indent=2)
+    logger.info("created default policy at %s", policy_path)
 
 
 @asynccontextmanager
@@ -44,6 +117,7 @@ async def lifespan(app: FastAPI):
     logger.info("database initialized")
 
     # 2. Policy
+    _ensure_default_policy()
     policy = load_policy()
     logger.info("policy loaded: %d keys", len(policy))
 
@@ -245,4 +319,7 @@ async def anomalies_recent():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
+    # Pass the app object directly rather than the "main:app" string form:
+    # the string form makes uvicorn re-import "main" by module name, which
+    # doesn't resolve inside a frozen PyInstaller executable.
+    uvicorn.run(app, host="0.0.0.0", port=PORT, reload=False)

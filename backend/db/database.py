@@ -3,13 +3,16 @@ rest of the backend — no other module should open its own connection."""
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import aiosqlite
 
 DATA_DIR = Path(os.environ.get("VLAW_DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "vlaw.db"
-SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+# schema.sql is a read-only bundled asset: PyInstaller unpacks it under
+# sys._MEIPASS at runtime, not next to this file.
+SCHEMA_PATH = Path(sys._MEIPASS) / "db" / "schema.sql" if getattr(sys, "frozen", False) else Path(__file__).parent / "schema.sql"
 POLICY_FILE = Path(os.environ.get("VLAW_POLICY_FILE", "./policy/vlaw-policy.json"))
 
 _db: aiosqlite.Connection | None = None
