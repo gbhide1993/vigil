@@ -65,10 +65,12 @@ APPROVED_NETWORK_DESTINATIONS = {
     "localhost",
 }
 
-DANGEROUS_COMMAND_PATTERNS = [
-    "curl", "wget", "nc", "ncat", "ssh", "scp",
-    "python -c", "python3 -c", "powershell -enc", "powershell -command",
-]
+# Matched against the executable's basename, never the full argv blob — a
+# bare substring check against the whole cmdline false-positives constantly
+# (e.g. "nc" inside "sync", "function", "--renderer-client-id", which every
+# Electron subprocess spawn includes as ordinary flag text).
+DANGEROUS_EXE_PATTERNS = {"curl", "wget", "nc", "ncat", "ssh", "scp"}
+DANGEROUS_INLINE_PATTERNS = ["python -c", "python3 -c", "powershell -enc", "powershell -command"]
 
 # Session launch directory: the working directory V-LAW itself was
 # started from. Used as the reference point for "outside the active
@@ -109,10 +111,13 @@ def is_unknown_destination(dest: str) -> bool:
     return dest not in APPROVED_NETWORK_DESTINATIONS
 
 
-def is_dangerous_command(cmdline: str) -> str | None:
+def is_dangerous_command(cmdline: str, exe_basename: str = "") -> str | None:
     """Returns the matched pattern, or None if the command is clean."""
+    exe = re.sub(r"\.(exe|bin)$", "", exe_basename.lower())
+    if exe in DANGEROUS_EXE_PATTERNS:
+        return exe
     lowered = cmdline.lower()
-    for pattern in DANGEROUS_COMMAND_PATTERNS:
+    for pattern in DANGEROUS_INLINE_PATTERNS:
         if pattern in lowered:
             return pattern
     return None
@@ -218,8 +223,8 @@ class RedLines:
             target=destination,
         )
 
-    async def check_dangerous_command(self, agent_id: int, agent_name: str, cmdline: str) -> None:
-        matched = is_dangerous_command(cmdline)
+    async def check_dangerous_command(self, agent_id: int, agent_name: str, cmdline: str, exe_basename: str = "") -> None:
+        matched = is_dangerous_command(cmdline, exe_basename)
         if matched is None:
             return
         await self._fire(
@@ -227,7 +232,7 @@ class RedLines:
             title=f"RED LINE: sensitive command spawned by {agent_name}",
             description=f"{agent_name} spawned a potentially sensitive command: {cmdline}",
             extra_detail={"command": cmdline, "matched_pattern": matched},
-            target=cmdline,
+            target=exe_basename or cmdline,
         )
 
     async def check_cross_project_read(self, agent_id: int, agent_name: str, path: str) -> None:

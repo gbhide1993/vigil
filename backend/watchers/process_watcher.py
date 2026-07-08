@@ -3,6 +3,7 @@ spawned under a known agent. Process spawns are never aggregated —
 each is logged individually and immediately."""
 
 import json
+import re
 
 import psutil
 
@@ -13,12 +14,21 @@ from db.database import get_db
 
 POLL_INTERVAL_SECONDS = 3
 
-SUSPICIOUS_PATTERNS = ["curl", "wget", "ssh", "scp", "nc", "python -c"]
+# Matched against the executable's basename (argv[0]) or the "python -c"/
+# "python3 -c" two-token form, never the full argv blob — a substring check
+# against the whole cmdline false-positives constantly (e.g. "nc" inside
+# "sync", "function", "--renderer-client-id", which every Electron
+# subprocess spawn includes as flag text).
+SUSPICIOUS_EXE_PATTERNS = {"curl", "wget", "ssh", "scp", "nc", "ncat"}
+SUSPICIOUS_INLINE_PATTERNS = ["python -c", "python3 -c", "powershell -enc", "powershell -command"]
 
 
-def _is_suspicious(cmdline: str) -> bool:
+def _is_suspicious(cmdline: str, exe_basename: str) -> bool:
+    exe = re.sub(r"\.(exe|bin)$", "", exe_basename.lower())
+    if exe in SUSPICIOUS_EXE_PATTERNS:
+        return True
     lowered = cmdline.lower()
-    return any(pattern in lowered for pattern in SUSPICIOUS_PATTERNS)
+    return any(pattern in lowered for pattern in SUSPICIOUS_INLINE_PATTERNS)
 
 
 class ProcessWatcher:
@@ -50,6 +60,11 @@ class ProcessWatcher:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
+            try:
+                exe_path = proc.exe()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                exe_path = proc.name()
+
             agent_name = self.attributor.get_agent_for_pid(pid)
             if agent_name is None:
                 continue  # not under a known agent — not our concern
@@ -57,9 +72,10 @@ class ProcessWatcher:
             agent_id = await self.attributor.get_or_create_agent(agent_name, pid)
             session_id = await self.attributor.sessions.touch(agent_id)
 
-            await self.red_lines.check_dangerous_command(agent_id, agent_name, cmdline)
+            exe_name = proc.name()
+            await self.red_lines.check_dangerous_command(agent_id, agent_name, cmdline, exe_name)
 
-            suspicious = _is_suspicious(cmdline)
+            suspicious = _is_suspicious(cmdline, exe_name)
             severity = "medium" if suspicious else "low"
 
             cur = await db.execute(
@@ -93,7 +109,7 @@ class ProcessWatcher:
                     reason="suspicious_command",
                     event_id=event_id,
                     extra_detail={"pid": pid, "cmdline": cmdline},
-                    target=cmdline,
+                    target=exe_path,
                 )
 
         await db.commit()
