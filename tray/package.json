@@ -5,12 +5,32 @@
   "private": true,
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "build": "electron-builder"
   },
   "devDependencies": {
-    "electron": "^33.0.0"
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
   },
   "dependencies": {
     "node-cron": "^4.6.0"
+  },
+  "build": {
+    "appId": "com.getvvault.vlaw",
+    "productName": "V-LAW",
+    "win": {
+      "target": "dir",
+      "icon": "assets/app_icon.png"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "flyout.html",
+      "flyout.css",
+      "flyout.js",
+      "assets/**"
+    ],
+    "extraResources": [],
+    "asar": true
   }
 }

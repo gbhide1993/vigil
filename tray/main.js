@@ -5,6 +5,15 @@ const http = require('http')
 const cron = require('node-cron')
 const { spawn, execFile } = require('child_process')
 
+// Only one tray instance may run at a time — otherwise a second launch
+// (e.g. auto-launch at boot plus a manual double-click of the shortcut)
+// spawns a second backend that fails to bind the already-taken port,
+// showing a false "Backend crashed" state next to the real, working one.
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!gotSingleInstanceLock) {
+  app.quit()
+}
+
 const BACKEND_URL = 'http://localhost:7422'
 const WEB_UI_URL = 'http://localhost:7423'
 const POLL_INTERVAL_MS = 4000
@@ -29,8 +38,10 @@ const BACKEND_STABLE_MS = 10000
 
 function getBackendPath() {
   if (app.isPackaged) {
-    // In packaged .exe: backend sits next to tray exe
-    return path.join(path.dirname(process.execPath), 'vlaw-backend.exe')
+    // Installer layout: app\tray\V-LAW.exe and app\backend\vlaw-backend.exe
+    // are siblings under the install root, one level up from the tray exe.
+    const appDir = path.dirname(path.dirname(process.execPath))
+    return path.join(appDir, 'backend', 'vlaw-backend.exe')
   }
   // Dev mode — backend started manually
   return null

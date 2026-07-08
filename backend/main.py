@@ -16,12 +16,16 @@ import os
 def get_base_path() -> str:
     """Directory for user-writable files (db, policy, logs, license).
 
-    Frozen (PyInstaller .exe): next to the .exe, so data survives
-    reinstalls/rebuilds and isn't touched by antivirus quarantine of the
-    temp extraction dir. Script mode: this file's directory.
+    Frozen (PyInstaller .exe): %LOCALAPPDATA%\\V-LAW. The installer places
+    the exe under Program Files, which a non-elevated process (the tray
+    spawns the backend unelevated) cannot write to, so data must live
+    somewhere else — the standard per-user writable location survives
+    reinstalls/rebuilds the same way a next-to-exe folder would. Script
+    mode: this file's directory.
     """
     if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
+        local_app_data = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(local_app_data, "V-LAW")
     return os.path.dirname(os.path.abspath(__file__))
 
 
@@ -37,6 +41,7 @@ def bundled_path(relative: str) -> str:
 
 
 BASE_DIR = get_base_path()
+os.makedirs(BASE_DIR, exist_ok=True)
 
 # Other modules (db.database, config.policy, license.license_service) read
 # these env vars at import time to build their path defaults, so they must
