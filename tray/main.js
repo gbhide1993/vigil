@@ -1,7 +1,9 @@
 const { app, Tray, Menu, BrowserWindow, ipcMain, screen, shell, Notification } = require('electron')
 const path = require('path')
+const fs = require('fs')
 const http = require('http')
 const cron = require('node-cron')
+const { spawn, execFile } = require('child_process')
 
 const BACKEND_URL = 'http://localhost:7422'
 const WEB_UI_URL = 'http://localhost:7423'
@@ -17,6 +19,128 @@ let lastNotifiedAlertId = undefined // undefined = not yet primed by first poll
 let activeSessionCount = 0
 
 const FAILURE_THRESHOLD = 3
+
+let backendProcess = null
+let backendReady = false
+let backendFailCount = 0
+let backendStableTimer = null
+const MAX_BACKEND_FAILURES = 3
+const BACKEND_STABLE_MS = 10000
+
+function getBackendPath() {
+  if (app.isPackaged) {
+    // In packaged .exe: backend sits next to tray exe
+    return path.join(path.dirname(process.execPath), 'vlaw-backend.exe')
+  }
+  // Dev mode — backend started manually
+  return null
+}
+
+function spawnBackend() {
+  const backendPath = getBackendPath()
+
+  if (!backendPath) {
+    console.log('Dev mode: backend not spawned by tray')
+    backendReady = true
+    return
+  }
+
+  if (!fs.existsSync(backendPath)) {
+    console.error(`Backend exe not found at: ${backendPath}`)
+    setTrayWarning()
+    tray.setToolTip('V-LAW — Backend not found. Reinstall V-LAW.')
+    return
+  }
+
+  console.log(`Spawning backend: ${backendPath}`)
+
+  backendProcess = spawn(backendPath, [], {
+    detached: false,
+    stdio: 'ignore',
+    windowsHide: true,
+  })
+
+  backendProcess.on('error', (err) => {
+    console.error('Backend spawn error:', err)
+    handleBackendCrash()
+  })
+
+  backendProcess.on('exit', (code) => {
+    console.log(`Backend exited with code ${code}`)
+    backendProcess = null
+    if (code !== 0 && code !== null) {
+      handleBackendCrash()
+    }
+  })
+}
+
+function killBackendProcess() {
+  if (!backendProcess) return
+  const pid = backendProcess.pid
+  // Plain ChildProcess.kill() is unreliable against the packaged
+  // console-mode PyInstaller exe on Windows — it can leave the process
+  // running. taskkill /F /T forcibly kills it and its child tree.
+  if (process.platform === 'win32' && pid) {
+    execFile('taskkill', ['/pid', String(pid), '/T', '/F'], () => {})
+  } else {
+    backendProcess.kill()
+  }
+  backendProcess = null
+}
+
+function handleBackendCrash() {
+  backendReady = false
+  if (backendStableTimer) {
+    clearTimeout(backendStableTimer)
+    backendStableTimer = null
+  }
+  backendFailCount++
+
+  if (backendFailCount >= MAX_BACKEND_FAILURES) {
+    setTrayWarning()
+    tray.setToolTip('V-LAW — Backend crashed. Right-click → Restart Backend.')
+    return
+  }
+
+  setTimeout(() => {
+    console.log('Retrying backend spawn...')
+    spawnBackend()
+    waitForBackend()
+  }, 3000)
+}
+
+async function waitForBackend(maxAttempts = 30, intervalMs = 1000) {
+  console.log('Waiting for backend to be ready...')
+
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const res = await fetch(`${BACKEND_URL}/health`, { signal: AbortSignal.timeout(1000) })
+      if (res.ok) {
+        console.log(`Backend ready after ${i + 1}s`)
+        backendReady = true
+        setTrayIdle()
+        pollAlerts()
+        pollTimer = setInterval(pollAlerts, POLL_INTERVAL_MS)
+        // Only clear the failure count once the backend has stayed up for a
+        // while — a backend that passes the health check and then crashes a
+        // second later is still crash-looping, not recovered.
+        if (backendStableTimer) clearTimeout(backendStableTimer)
+        backendStableTimer = setTimeout(() => {
+          backendFailCount = 0
+          backendStableTimer = null
+        }, BACKEND_STABLE_MS)
+        return
+      }
+    } catch {
+      // Not ready yet — keep waiting
+    }
+    await new Promise((r) => setTimeout(r, intervalMs))
+  }
+
+  console.error('Backend failed to start within 30 seconds')
+  setTrayWarning()
+  tray.setToolTip('V-LAW — Backend failed to start. Right-click → Restart Backend.')
+}
 
 function httpRequest(method, urlPath, body) {
   return new Promise((resolve, reject) => {
@@ -102,6 +226,7 @@ async function pollActiveSessionCount() {
 }
 
 async function pollAlerts() {
+  if (!backendReady) return
   try {
     const { status, body } = await httpRequest('GET', '/alerts?status=open')
     if (status !== 200 || !body) {
@@ -312,6 +437,26 @@ function createTray() {
     const template = [
       { label: 'Open V-LAW', click: () => shell.openExternal(WEB_UI_URL) },
       { type: 'separator' },
+      {
+        label: 'Restart Backend',
+        click: () => {
+          killBackendProcess()
+          if (pollTimer) clearInterval(pollTimer)
+          if (backendStableTimer) {
+            clearTimeout(backendStableTimer)
+            backendStableTimer = null
+          }
+          backendReady = false
+          backendFailCount = 0
+          setTrayWarning()
+          tray.setToolTip('V-LAW — Restarting backend...')
+          setTimeout(() => {
+            spawnBackend()
+            waitForBackend()
+          }, 1000)
+        },
+      },
+      { type: 'separator' },
     ]
     if (!app.isPackaged) {
       template.push({ label: 'Test digest toast', click: () => triggerDigestNow() })
@@ -361,10 +506,19 @@ ipcMain.on('hide-flyout', () => {
 
 app.whenReady().then(() => {
   app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true })
+  if (app.dock) app.dock.hide()
+
   createTray()
   createFlyout()
-  pollAlerts()
-  pollTimer = setInterval(pollAlerts, POLL_INTERVAL_MS)
+
+  // Set amber immediately — backend not ready yet
+  setTrayWarning()
+  tray.setToolTip('V-LAW — Starting...')
+
+  // Spawn backend, then wait for health, then start polling
+  spawnBackend()
+  waitForBackend() // starts pollAlerts() internally once healthy
+
   cron.schedule('0 9 * * *', () => {
     triggerDigestNow()
   })
@@ -377,4 +531,8 @@ app.on('window-all-closed', (e) => {
 
 app.on('before-quit', () => {
   if (pollTimer) clearInterval(pollTimer)
+  if (backendProcess) {
+    console.log('Killing backend process before quit...')
+    killBackendProcess()
+  }
 })
