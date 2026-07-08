@@ -1,113 +1,58 @@
-# V-LAW — Vvault Local AI Watchdog
+# V-LAW — Local AI Agent Watchdog
 
-Locally deployed watchdog service that monitors cloud AI agents (Cursor,
-Claude Code, GitHub Copilot, Salesforce Agentforce) operating inside a
-company's local perimeter. Watches file system access, network
-connections, process activity, and credential file access per agent.
-Attributes every action to the correct agent. Logs everything locally
-in SQLite. Zero data leaves the machine.
+Monitors what AI coding agents actually do on your machine.
+Claude Code, Cursor, Copilot — file access, network connections,
+process spawns, credential access. Real-time alerts. One-click install.
 
-## Quick start
+Zero cloud. Zero Docker. Everything stays on your machine.
 
-```bash
-cp .env.example .env
-docker compose up --build
-```
+---
 
-- Backend API: http://localhost:7422
-- Frontend: http://localhost:7423
+## Download
 
-## Local development (without Docker)
+[VLaw-Setup.exe — v1.0.0 Beta](https://github.com/gbhide1993/vlaw/releases/tag/v1.0.0-beta)
 
-Backend:
+Windows 10/11 only.
 
-```bash
-cd backend
-python -m venv .venv
-.venv/Scripts/activate  # or source .venv/bin/activate on macOS/Linux
-pip install -r requirements.txt
-VLAW_DATA_DIR=../data VLAW_POLICY_FILE=../policy/vlaw-policy.json uvicorn main:app --port 7422
-```
+> SmartScreen will show "Windows protected your PC" — click **More info** → **Run anyway**.  
+> This appears because V-LAW is not yet code-signed.
 
-Frontend:
+SHA256: `EC1FA292B206641F7FAEF0808F827274A7CF7E9A1FEE3CC90F29C166006A2003`
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
+---
 
-## Native Windows mode (backend only)
+## What It Watches
 
-If Docker Desktop's host filesystem mount isn't visible inside the
-container on your machine (see "Platform notes" below), run the
-backend directly on Windows instead — no container, no `/host` mount,
-watchers operate on real Windows paths:
+- File reads and writes per agent
+- Network connections — flags unknown destinations
+- Process and command spawns — flags curl, wget, ssh
+- Credential file access — .ssh, .env, .aws
+- MCP tool calls
 
-```bat
-start_native.bat
-```
+---
 
-This installs backend dependencies and runs
-[backend/run_native.py](backend/run_native.py), which uses
-[policy/vlaw-policy.native.json](policy/vlaw-policy.native.json) — a
-policy file with real Windows paths (`C:\Users\...`) instead of the
-container-oriented defaults in `vlaw-policy.json`. Customize
-`scope_directories` and `credential_paths` in that file for your setup.
-Out of the box it watches `C:\Users\<you>\vlaw\policy` as a test
-directory, plus `.ssh`/`.aws` under your user profile for credentials
-— **avoid pointing `scope_directories` at your whole home directory**;
-`PollingObserver` walks the entire tree on every poll, so a directory
-with hundreds of thousands of files (AppData, node_modules, browser
-caches, etc.) will peg a CPU core and never finish starting. Point it
-at specific project or credential folders instead.
+## How It Works
 
-Keep the frontend in Docker, pointed at the native backend via
-`host.docker.internal`:
+One-click install. Tray icon sits quietly in green when all is clear.
+Goes red when something needs your attention.
+Click the tray to see what happened and block if needed.
 
-```bash
-docker compose -f docker-compose.yml -f docker-compose.native.yml up vlaw-frontend
-```
+No Docker. No terminal. No config files to edit.
 
-(Compose still creates the `vlaw` backend container due to
-`depends_on` — stop it with `docker compose stop vlaw` since the
-native process is serving port 7422 instead.)
+---
 
-## Architecture
+## Requirements
 
-- **backend/watchers/** — file, process, network, and MCP watchers.
-  File watching uses `watchdog.PollingObserver` (not native OS events)
-  so it works reliably under Docker Desktop on Windows.
-- **backend/core/** — aggregation (windowed event collapsing),
-  attribution (mapping OS signals to agents), alerting, and the Layer 1
-  statistical baseline.
-- **backend/db/** — SQLite schema and connection management.
-- **backend/license/** — offline RSA-2048 signed license validation,
-  14-day trial fallback.
-- **policy/vlaw-policy.json** — the Frank Besadesky control model:
-  approved agents, scope directories, credential paths, MCP servers.
+- Windows 10 or 11 (64-bit)
+- At least one AI coding agent (Claude Code, Cursor, or Copilot)
+- 200MB disk space
 
-## Platform notes
+---
 
-- **Docker Desktop on Windows (WSL2 backend):** the `/:/host:ro` mount in
-  `docker-compose.yml` exposes the WSL2 VM's root filesystem, not the
-  Windows `C:` drive directly. If `scope_directories` in
-  `vlaw-policy.json` don't show up under the container's `/host`, open
-  Docker Desktop → Settings → Resources → File sharing and confirm the
-  drives containing your `scope_directories` are shared, then verify
-  with `docker compose exec vlaw ls /host/host_mnt`. This is a Docker
-  Desktop/WSL2 configuration detail, independent of V-LAW's watcher
-  logic (which uses `PollingObserver` specifically so it keeps working
-  once the mount is visible).
-- `scope_directories` and `credential_paths` in the policy file are
-  defined from the host's perspective; V-LAW automatically prefixes
-  them with `VLAW_HOST_ROOT` (set to `/host` in `docker-compose.yml`)
-  before watching.
+## License
 
-## Constraints
+Proprietary. See [LICENSE](LICENSE) for details.
 
-- Zero data leaves the machine — no telemetry, no license phone-home.
-- SQLite only, single file, zero external server dependency.
-- Host filesystem mount is read-only.
-- Trial mode works without any license file: 14 days, 1 agent, 24h
-  retention window.
+## Contact
+
+girish@getvvault.com
