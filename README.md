@@ -13,7 +13,7 @@ Tray icon goes red when agents access files, network, credentials, or spawn susp
 
 ## Download
 
-### [https://github.com/gbhide1993/vlaw/releases/download/v0.1.1-beta/VLaw-Setup.exe]
+### [⬇ Download VLaw-Setup.exe — v0.1.1-beta](https://github.com/gbhide1993/vlaw/releases/download/v0.1.1-beta/VLaw-Setup.exe)
 
 Windows 10/11 · 101MB · One-click install
 
