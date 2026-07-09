@@ -323,10 +323,12 @@ function setTrayIcon(iconName, tooltip) {
   tray.setToolTip(tooltip)
 }
 
+const APP_VERSION = '0.1.1-beta'
+
 function setTrayIdle() {
   const tooltip = activeSessionCount > 0
-    ? `V-LAW — Watching ${activeSessionCount} agent${activeSessionCount !== 1 ? 's' : ''}. All clear.`
-    : 'V-LAW — No active agents. Waiting.'
+    ? `V-LAW v${APP_VERSION} — Watching ${activeSessionCount} agent${activeSessionCount !== 1 ? 's' : ''}. All clear.`
+    : `V-LAW v${APP_VERSION} — All clear`
   setTrayIcon('icon_green.png', tooltip)
 }
 
@@ -446,6 +448,8 @@ function createTray() {
 
   tray.on('right-click', () => {
     const template = [
+      { label: `V-LAW v${APP_VERSION}`, enabled: false },
+      { type: 'separator' },
       { label: 'Open V-LAW', click: () => shell.openExternal(WEB_UI_URL) },
       { type: 'separator' },
       {

@@ -34,7 +34,7 @@ export default function App() {
       <main className="main-content">
         {view === 'live' && <LiveFeed />}
         {view === 'agents' && <AgentDetail />}
-        {view === 'alerts' && <Alerts />}
+        {view === 'alerts' && <Alerts onNavigate={setView} />}
         {view === 'export' && <Export />}
       </main>
     </div>

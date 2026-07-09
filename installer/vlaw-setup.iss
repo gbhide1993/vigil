@@ -2,7 +2,7 @@
 ; Inno Setup 6.x
 
 #define AppName "V-LAW"
-#define AppVersion "1.0.0"
+#define AppVersion "0.1.1-beta"
 #define AppPublisher "Vvault Technologies"
 #define AppURL "https://getvvault.com"
 #define AppExeName "V-LAW.exe"

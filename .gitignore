@@ -55,5 +55,17 @@ docker-compose.override.yml
 # Build artifacts
 *.pyc
 *.pyo
+installer/build/
+installer/output/
+tray/dist/
+backend/dist/
+backend/build/
+backend/frontend/
 
+# Dev / test residue
 policy/vlaw-policy.native.json
+policy/test*.txt
+tray/vlaw-backend.exe
+
+# Runtime policy (generated, not source)
+backend/policy/

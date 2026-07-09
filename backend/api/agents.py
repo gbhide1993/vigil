@@ -2,11 +2,16 @@ import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 from config.policy import POLICY_FILE
 from db.database import get_db
 
 router = APIRouter()
+
+
+class BlockRequest(BaseModel):
+    reason: str | None = None
 
 
 def _now_iso() -> str:
@@ -70,15 +75,50 @@ def _current_status(last_seen: str | None) -> str:
     return "inactive"
 
 
+async def _latest_agent_audit_entries(db) -> dict[int, dict]:
+    """Returns {agent_id: {actor, created_at, detail}} for each agent's most
+    recent agent_approved/agent_blocked audit_log row, used to show
+    'Approved by X on Y' / block reason without a schema change."""
+    cur = await db.execute(
+        """
+        SELECT entity_id, actor, detail, created_at FROM audit_log
+        WHERE entity_type = 'agent' AND action IN ('agent_approved', 'agent_blocked')
+        AND id IN (
+            SELECT MAX(id) FROM audit_log
+            WHERE entity_type = 'agent' AND action IN ('agent_approved', 'agent_blocked')
+            GROUP BY entity_id
+        )
+        """
+    )
+    rows = await cur.fetchall()
+    result = {}
+    for r in rows:
+        detail = json.loads(r["detail"]) if r["detail"] else {}
+        result[r["entity_id"]] = {
+            "actor": r["actor"],
+            "created_at": r["created_at"],
+            "reason": detail.get("reason"),
+        }
+    return result
+
+
 @router.get("/agents")
 async def get_agents():
     db = await get_db()
     cur = await db.execute("SELECT * FROM agents ORDER BY last_seen DESC")
     rows = await cur.fetchall()
+    audit_by_agent = await _latest_agent_audit_entries(db)
     agents = []
     for r in rows:
         agent = dict(r)
         agent["current_status"] = _current_status(agent.get("last_seen"))
+        audit = audit_by_agent.get(agent["id"])
+        if audit and agent["approved"] == 1:
+            agent["approved_by"] = audit["actor"]
+            agent["approved_at"] = audit["created_at"]
+        elif audit and agent["approved"] == 2:
+            agent["blocked_reason"] = audit["reason"]
+            agent["blocked_at"] = audit["created_at"]
         agents.append(agent)
     return {"agents": agents}
 
@@ -124,7 +164,7 @@ async def approve_agent(agent_id: int):
 
 
 @router.post("/agents/{agent_id}/block")
-async def block_agent(agent_id: int):
+async def block_agent(agent_id: int, body: BlockRequest | None = None):
     db = await get_db()
 
     cur = await db.execute("SELECT * FROM agents WHERE id = ?", (agent_id,))
@@ -146,6 +186,8 @@ async def block_agent(agent_id: int):
     await _remove_from_policy_list(db, "approved_agents", agent["name"])
     await _add_to_policy_list(db, "blocked_agents", agent["name"])
 
+    reason = body.reason.strip() if body and body.reason and body.reason.strip() else None
+
     await db.execute(
         """
         INSERT INTO audit_log (action, entity_type, entity_id, detail)
@@ -153,7 +195,7 @@ async def block_agent(agent_id: int):
         """,
         (
             agent_id,
-            json.dumps({"agent_name": agent["name"], "blocked_at": _now_iso()}),
+            json.dumps({"agent_name": agent["name"], "blocked_at": _now_iso(), "reason": reason}),
         ),
     )
     await db.commit()

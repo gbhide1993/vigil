@@ -25,13 +25,16 @@ export const api = {
   },
   getSessionTopFinding: (sessionId) => request(`/sessions/${sessionId}/top-finding`),
   approveAgent: (agentId) => request(`/agents/${agentId}/approve`, { method: 'POST' }),
-  blockAgent: (agentId) => request(`/agents/${agentId}/block`, { method: 'POST' }),
+  blockAgent: (agentId, reason) =>
+    request(`/agents/${agentId}/block`, { method: 'POST', body: JSON.stringify({ reason }) }),
   getAlerts: (params = {}) => {
     const qs = new URLSearchParams(params).toString()
     return request(`/alerts${qs ? `?${qs}` : ''}`)
   },
   resolveAlert: (alertId, body) =>
     request(`/alerts/${alertId}/resolve`, { method: 'POST', body: JSON.stringify(body) }),
+  bulkDismissAlerts: (severity) =>
+    request(`/alerts/bulk-dismiss?severity=${severity}`, { method: 'POST' }),
   getStats: () => request('/stats'),
   getHealth: () => request('/health'),
   getInsights: () => request('/insights'),

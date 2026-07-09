@@ -80,6 +80,8 @@ export default function Sidebar({ view, onNavigate, openAlertCount }) {
           ))}
         </div>
       </div>
+
+      <div className="sidebar-version">v1.0.0</div>
     </aside>
   )
 }

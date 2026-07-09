@@ -32,25 +32,32 @@ class CreateSuppressionRequest(BaseModel):
 async def get_alerts(
     status: str | None = Query(default=None),
     severity: str | None = Query(default=None),
+    agent: int | None = Query(default=None),
 ):
     db = await get_db()
 
     clauses = []
     params: list = []
     if status is not None:
-        clauses.append("status = ?")
+        clauses.append("al.status = ?")
         params.append(status)
     if severity is not None:
-        clauses.append("severity = ?")
+        clauses.append("al.severity = ?")
         params.append(severity)
+    if agent is not None:
+        clauses.append("al.agent_id = ?")
+        params.append(agent)
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
     cur = await db.execute(
         f"""
-        SELECT al.*, a.name as agent_name
+        SELECT al.*, a.name as agent_name, e.session_id as session_id, e.path as event_path,
+            s.summary as session_summary
         FROM alerts al
         LEFT JOIN agents a ON a.id = al.agent_id
+        LEFT JOIN events e ON e.id = al.event_id
+        LEFT JOIN sessions s ON s.id = e.session_id
         {where}
         ORDER BY al.created_at DESC
         """,
@@ -58,6 +65,47 @@ async def get_alerts(
     )
     rows = await cur.fetchall()
     return {"alerts": [dict(r) for r in rows]}
+
+
+@router.post("/alerts/bulk-dismiss")
+async def bulk_dismiss(severity: str = Query(...), actor: str = Query(default="admin")):
+    """Dismiss every open/investigating alert at the given severity in one
+    action — used by the Alerts screen's 'Dismiss all LOW' button, since
+    low-severity noise is the bulk of alert volume and dismissing one at a
+    time doesn't scale. Red Line alerts are never included (rule_type check
+    mirrors the single-alert resolve endpoint)."""
+    if severity not in ("low", "medium", "high", "critical"):
+        raise HTTPException(status_code=400, detail="invalid severity")
+
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT id FROM alerts WHERE severity = ? AND status IN ('open', 'investigating') AND rule_type != 'red_line'",
+        (severity,),
+    )
+    ids = [r["id"] for r in await cur.fetchall()]
+    if not ids:
+        return {"dismissed": 0}
+
+    placeholders = ", ".join("?" for _ in ids)
+    await db.execute(
+        f"""
+        UPDATE alerts
+        SET status = 'dismissed', resolved_by = ?, resolved_at = CURRENT_TIMESTAMP,
+            resolution_note = 'bulk dismissed from UI'
+        WHERE id IN ({placeholders})
+        """,
+        (actor, *ids),
+    )
+    for alert_id in ids:
+        await db.execute(
+            """
+            INSERT INTO audit_log (action, entity_type, entity_id, actor, detail)
+            VALUES ('dismiss', 'alert', ?, ?, ?)
+            """,
+            (alert_id, actor, json.dumps({"note": "bulk dismissed from UI", "severity": severity})),
+        )
+    await db.commit()
+    return {"dismissed": len(ids)}
 
 
 @router.post("/alerts/{alert_id}/resolve")

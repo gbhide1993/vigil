@@ -80,7 +80,7 @@ logging.basicConfig(
 logger = logging.getLogger("vlaw")
 logger.info("V-LAW backend starting. BASE_DIR=%s", BASE_DIR)
 
-VERSION = "0.1.0"
+VERSION = "0.1.1-beta"
 PORT = int(os.environ.get("VLAW_PORT", 7422))
 
 _state: dict = {}
@@ -238,8 +238,16 @@ async def get_stats():
     cur = await db.execute("SELECT COUNT(*) c FROM events WHERE date(created_at) = date('now')")
     events_today = (await cur.fetchone())["c"]
 
+    cur = await db.execute("SELECT COUNT(*) c FROM events WHERE date(created_at) = date('now', '-1 day')")
+    events_yesterday = (await cur.fetchone())["c"]
+
     cur = await db.execute("SELECT COUNT(*) c FROM alerts WHERE status = 'open'")
     alerts_open = (await cur.fetchone())["c"]
+
+    cur = await db.execute(
+        "SELECT COUNT(*) c FROM alerts WHERE status = 'open' AND date(created_at) = date('now', '-1 day')"
+    )
+    alerts_open_yesterday = (await cur.fetchone())["c"]
 
     cur = await db.execute(
         "SELECT COALESCE(SUM(data_volume_bytes), 0) v FROM events WHERE event_type = 'net_connect' AND date(created_at) = date('now')"
@@ -247,9 +255,19 @@ async def get_stats():
     net_bytes_today = (await cur.fetchone())["v"]
 
     cur = await db.execute(
+        "SELECT COALESCE(SUM(data_volume_bytes), 0) v FROM events WHERE event_type = 'net_connect' AND date(created_at) = date('now', '-1 day')"
+    )
+    net_bytes_yesterday = (await cur.fetchone())["v"]
+
+    cur = await db.execute(
         "SELECT COUNT(*) c FROM events WHERE event_type = 'cred_access' AND date(created_at) = date('now')"
     )
     cred_accesses_today = (await cur.fetchone())["c"]
+
+    cur = await db.execute(
+        "SELECT COUNT(*) c FROM events WHERE event_type = 'cred_access' AND date(created_at) = date('now', '-1 day')"
+    )
+    cred_accesses_yesterday = (await cur.fetchone())["c"]
 
     cur = await db.execute(
         "SELECT COUNT(*) c FROM sessions WHERE date(started_at) = date('now')"
@@ -272,9 +290,13 @@ async def get_stats():
     return {
         "active_agents": active_agents,
         "events_today": events_today,
+        "events_yesterday": events_yesterday,
         "alerts_open": alerts_open,
+        "alerts_open_yesterday": alerts_open_yesterday,
         "net_egress_mb_today": round(net_bytes_today / (1024 * 1024), 3),
+        "net_egress_mb_yesterday": round(net_bytes_yesterday / (1024 * 1024), 3),
         "cred_accesses_today": cred_accesses_today,
+        "cred_accesses_yesterday": cred_accesses_yesterday,
         "sessions_today": sessions_today,
         "alerts_today": alerts_today,
         "noise_reduction_ratio": noise_reduction_ratio,

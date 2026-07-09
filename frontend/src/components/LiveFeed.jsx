@@ -1,13 +1,63 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 
+const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/
+
+function isRawIp(value) {
+  if (!value) return false
+  const host = value.split(':')[0]
+  return IPV4_RE.test(host)
+}
+
+function GlobeIcon() {
+  return (
+    <svg className="globe-icon" width="12" height="12" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.2" />
+      <path d="M1.5 8h13M8 1.5c1.8 1.6 2.8 4 2.8 6.5s-1 4.9-2.8 6.5c-1.8-1.6-2.8-4-2.8-6.5S6.2 3.1 8 1.5z" stroke="currentColor" strokeWidth="1.2" />
+    </svg>
+  )
+}
+
 function formatTime(ts) {
   if (!ts) return ''
   return new Date(ts.replace(' ', 'T') + 'Z').toLocaleTimeString()
 }
 
-function EventTypeBadge({ type }) {
-  return <span className="badge outline">{type}</span>
+function TypeBadge({ type }) {
+  const map = {
+    net_connect: { label: 'NET_CONNECT', className: 'net-connect' },
+    cred_access: { label: 'CRED_ACCESS', className: 'cred-access' },
+    proc_spawn: { label: 'PROC_SPAWN', className: 'proc-spawn' },
+    file_read: { label: 'FILE_READ', className: 'file-io' },
+    file_write: { label: 'FILE_WRITE', className: 'file-io' },
+  }
+  const cfg = map[type] || { label: type.toUpperCase(), className: 'file-io' }
+  return <span className={`type-badge ${cfg.className}`}>{cfg.label}</span>
+}
+
+function SeverityBadge({ severity }) {
+  return <span className={`feed-severity-badge ${severity}`}>{severity}</span>
+}
+
+function FeedRow({ event }) {
+  const path = event.path || ''
+  const showGlobe = event.event_type === 'net_connect' && isRawIp(path)
+  const severityClass = event.severity === 'high' || event.severity === 'critical' ? `severity-${event.severity}` : ''
+
+  return (
+    <div className={`feed-row ${severityClass}`}>
+      <span className="feed-time">{formatTime(event.created_at)}</span>
+      <span className="agent-pill">{event.agent_name || '—'}</span>
+      <TypeBadge type={event.event_type} />
+      <span className="feed-path" title={path}>
+        {showGlobe && <GlobeIcon />}
+        {path}
+      </span>
+      <span className="feed-severity">
+        <SeverityBadge severity={event.severity} />
+      </span>
+    </div>
+  )
 }
 
 function WelcomeState() {
@@ -71,6 +121,31 @@ function FirstSessionCard({ session, topFinding, onDismiss }) {
           ×
         </button>
       </div>
+    </div>
+  )
+}
+
+function trendArrow(delta) {
+  if (delta > 0) return { symbol: '▲', className: 'trend-up' }
+  if (delta < 0) return { symbol: '▼', className: 'trend-down' }
+  return { symbol: '–', className: '' }
+}
+
+function StatCard({ label, value, valueClassName, today, yesterday, formatDelta }) {
+  const hasYesterday = typeof yesterday === 'number'
+  const delta = hasYesterday ? today - yesterday : null
+  const arrow = hasYesterday ? trendArrow(delta) : null
+
+  return (
+    <div className="stat-card">
+      <div className="stat-card-label">{label}</div>
+      <div className={`stat-card-value ${valueClassName || ''}`}>{value}</div>
+      {hasYesterday && (
+        <div className="stat-card-trend">
+          <span className={arrow.className}>{arrow.symbol}</span>
+          <span>{formatDelta ? formatDelta(delta) : Math.abs(delta)} vs yesterday</span>
+        </div>
+      )}
     </div>
   )
 }
@@ -203,40 +278,39 @@ export default function LiveFeed() {
       )}
 
       <div className="stat-grid">
-        <div className="stat-card">
-          <div className="stat-card-label">Active Agents</div>
-          <div className="stat-card-value accent">{stats?.active_agents ?? '—'}</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-card-label">Events Today</div>
-          <div className="stat-card-value">{stats?.events_today ?? '—'}</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-card-label">Open Alerts</div>
-          <div className="stat-card-value" style={{ color: stats?.alerts_open ? 'var(--color-critical)' : undefined }}>
-            {stats?.alerts_open ?? '—'}
-          </div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-card-label">Net Egress (MB)</div>
-          <div className="stat-card-value">{stats?.net_egress_mb_today ?? '—'}</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-card-label">Credential Accesses</div>
-          <div className="stat-card-value" style={{ color: stats?.cred_accesses_today ? 'var(--color-high)' : undefined }}>
-            {stats?.cred_accesses_today ?? '—'}
-          </div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-card-label">Sessions Today</div>
-          <div className="stat-card-value">{stats?.sessions_today ?? '—'}</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-card-label">Signal / Noise</div>
-          <div className="stat-card-value accent">
-            {stats ? `${stats.alerts_today} / ${stats.events_today}` : '—'}
-          </div>
-        </div>
+        <StatCard
+          label="Active Agents"
+          value={stats?.active_agents ?? '—'}
+          valueClassName={stats ? (stats.active_agents > 0 ? 'good' : 'neutral') : ''}
+        />
+        <StatCard
+          label="Events Today"
+          value={stats?.events_today ?? '—'}
+          today={stats?.events_today}
+          yesterday={stats?.events_yesterday}
+        />
+        <StatCard
+          label="Open Alerts"
+          value={stats?.alerts_open ?? '—'}
+          valueClassName={stats ? (stats.alerts_open > 0 ? 'bad-critical' : 'good') : ''}
+          today={stats?.alerts_open}
+          yesterday={stats?.alerts_open_yesterday}
+        />
+        <StatCard
+          label="Net Egress (MB)"
+          value={stats?.net_egress_mb_today ?? '—'}
+          valueClassName={stats ? (stats.net_egress_mb_today > 0 ? 'bad-high' : 'good') : ''}
+          today={stats?.net_egress_mb_today}
+          yesterday={stats?.net_egress_mb_yesterday}
+          formatDelta={(d) => `${Math.abs(d).toFixed(2)} MB`}
+        />
+        <StatCard
+          label="Credential Accesses"
+          value={stats?.cred_accesses_today ?? '—'}
+          valueClassName={stats ? (stats.cred_accesses_today > 0 ? 'bad-critical' : 'good') : ''}
+          today={stats?.cred_accesses_today}
+          yesterday={stats?.cred_accesses_yesterday}
+        />
       </div>
 
       {sessions !== null && sessions.length === 0 ? (
@@ -251,28 +325,7 @@ export default function LiveFeed() {
           {events.length === 0 ? (
             <div className="empty-state">No events yet — waiting for agent activity.</div>
           ) : (
-            <table>
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Agent</th>
-                  <th>Type</th>
-                  <th>Path / Destination</th>
-                  <th>Severity</th>
-                </tr>
-              </thead>
-              <tbody>
-                {events.map((e) => (
-                  <tr key={e.id}>
-                    <td>{formatTime(e.created_at)}</td>
-                    <td>{e.agent_name || '—'}</td>
-                    <td><EventTypeBadge type={e.event_type} /></td>
-                    <td className="mono-truncate" title={e.path}>{e.path}</td>
-                    <td><span className={`badge ${e.severity}`}>{e.severity}</span></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            events.map((e) => <FeedRow key={e.id} event={e} />)
           )}
         </div>
       </div>
@@ -298,7 +351,9 @@ export default function LiveFeed() {
                     <tr key={e.id}>
                       <td>{formatTime(e.created_at)}</td>
                       <td>{e.agent_name}</td>
-                      <td className="mono-truncate" title={e.path}>{e.path}</td>
+                      <td className="mono-truncate" title={e.path}>
+                        {isRawIp(e.path) && <GlobeIcon />} {e.path}
+                      </td>
                     </tr>
                   ))}
                 </tbody>

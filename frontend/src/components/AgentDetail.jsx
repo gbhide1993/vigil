@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api } from '../api'
 
 function formatTime(ts) {
@@ -6,27 +6,114 @@ function formatTime(ts) {
   return new Date(ts.replace(' ', 'T') + 'Z').toLocaleString()
 }
 
-function approvalLabel(approved) {
-  if (approved === 1) return { text: 'Approved', className: 'low' }
-  if (approved === 2) return { text: 'Blocked', className: 'critical' }
-  return { text: 'Pending', className: 'medium' }
+function formatRelative(ts) {
+  if (!ts) return '—'
+  const then = new Date(ts.replace(' ', 'T') + 'Z').getTime()
+  const diffMs = Date.now() - then
+  const mins = Math.floor(diffMs / 60000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  return `${days}d ago`
 }
 
-function statusDotColor(status) {
-  if (status === 'active') return 'green'
-  if (status === 'idle') return 'amber'
-  return 'red'
+function formatDate(ts) {
+  if (!ts) return '—'
+  return new Date(ts.replace(' ', 'T') + 'Z').toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+  })
 }
 
-function AgentActions({ agent, onApprove, onBlock }) {
+function sessionMiniStats(sessions) {
+  return sessions.reduce(
+    (acc, s) => {
+      acc.files += (s.file_reads || 0) + (s.file_writes || 0)
+      acc.network += s.mcp_connects || 0
+      acc.commands += s.proc_spawns || 0
+      return acc
+    },
+    { files: 0, network: 0, commands: 0 }
+  )
+}
+
+function sparklineBars(sessions) {
+  const days = []
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date()
+    d.setDate(d.getDate() - i)
+    days.push(d.toISOString().slice(0, 10))
+  }
+  const totals = Object.fromEntries(days.map((d) => [d, 0]))
+  for (const s of sessions) {
+    if (!s.started_at) continue
+    const day = s.started_at.slice(0, 10)
+    if (day in totals) {
+      totals[day] += (s.file_reads || 0) + (s.file_writes || 0) + (s.proc_spawns || 0)
+    }
+  }
+  const max = Math.max(1, ...Object.values(totals))
+  return days.map((d) => ({ day: d, height: Math.max(4, Math.round((totals[d] / max) * 28)) }))
+}
+
+function Sparkline({ sessions }) {
+  const bars = sparklineBars(sessions)
+  return (
+    <div className="agent-sparkline" title="Activity, last 7 days">
+      {bars.map((b) => (
+        <div key={b.day} className="agent-sparkline-bar" style={{ height: `${b.height}px` }} title={b.day} />
+      ))}
+    </div>
+  )
+}
+
+function MiniStats({ sessions }) {
+  const stats = sessionMiniStats(sessions)
+  return (
+    <div className="agent-card-ministats">
+      <div>
+        <div className="agent-ministat-label">Files accessed</div>
+        <div className="agent-ministat-value">{stats.files.toLocaleString()}</div>
+      </div>
+      <div>
+        <div className="agent-ministat-label">Network calls</div>
+        <div className="agent-ministat-value">{stats.network.toLocaleString()}</div>
+      </div>
+      <div>
+        <div className="agent-ministat-label">Commands run</div>
+        <div className="agent-ministat-value">{stats.commands.toLocaleString()}</div>
+      </div>
+    </div>
+  )
+}
+
+function PendingAgentCard({ agent, sessions, onApprove, onBlock }) {
   const [busy, setBusy] = useState(false)
+  const [blocking, setBlocking] = useState(false)
+  const [reason, setReason] = useState('')
   const [errorMsg, setErrorMsg] = useState(null)
 
-  async function run(action) {
+  async function handleApprove() {
     setBusy(true)
     setErrorMsg(null)
     try {
-      await action(agent.id)
+      await onApprove(agent.id)
+    } catch (err) {
+      setErrorMsg(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function handleBlock() {
+    setBusy(true)
+    setErrorMsg(null)
+    try {
+      await onBlock(agent.id, reason.trim() || undefined)
+      setBlocking(false)
+      setReason('')
     } catch (err) {
       setErrorMsg(err.message)
     } finally {
@@ -35,141 +122,153 @@ function AgentActions({ agent, onApprove, onBlock }) {
   }
 
   return (
-    <div>
-      <div style={{ display: 'flex', gap: 8 }}>
-        {agent.approved !== 1 && (
-          <button className="btn primary" disabled={busy} onClick={() => run(onApprove)}>
-            Approve
+    <div className="agent-card pending">
+      <div className="agent-card-top">
+        <div className="agent-card-identity">
+          <span className="status-dot amber" />
+          <span className="agent-card-name">{agent.name}</span>
+        </div>
+        <span className="agent-card-sessions">{agent.session_count} sessions</span>
+      </div>
+      <div className="agent-card-meta">
+        First seen {formatDate(agent.first_seen)} · Last seen {formatRelative(agent.last_seen)}
+      </div>
+
+      <MiniStats sessions={sessions} />
+
+      {!blocking ? (
+        <div className="agent-card-actions">
+          <button className="btn approve-btn" disabled={busy} onClick={handleApprove}>
+            Approve →
           </button>
-        )}
-        {agent.approved !== 2 && (
-          <button className="btn danger" disabled={busy} onClick={() => run(onBlock)}>
+          <button className="btn block-btn" disabled={busy} onClick={() => setBlocking(true)}>
             Block
           </button>
-        )}
-      </div>
-      {errorMsg && <div style={{ color: 'var(--color-critical)', fontSize: 11, marginTop: 6 }}>{errorMsg}</div>}
-    </div>
-  )
-}
-
-function PendingAgentCard({ agent, onApprove, onBlock }) {
-  return (
-    <div className="panel" style={{ marginBottom: 12 }}>
-      <div className="panel-body" style={{ padding: 16 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
-          <div>
-            <div style={{ fontWeight: 700, fontSize: 13 }}>{agent.name}</div>
-            <div className="alert-meta">{agent.process_name || 'unknown process'}</div>
-            <div className="alert-meta" style={{ marginTop: 6 }}>
-              First seen {formatTime(agent.first_seen)} · Last seen {formatTime(agent.last_seen)} · {agent.session_count} sessions
-            </div>
+        </div>
+      ) : (
+        <div className="field" style={{ marginTop: 10, marginBottom: 0 }}>
+          <label>Reason for blocking (optional)</label>
+          <textarea
+            rows={2}
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="Why is this agent being blocked?"
+          />
+          <div className="agent-card-actions">
+            <button className="btn block-btn" disabled={busy} onClick={handleBlock}>
+              Confirm Block
+            </button>
+            <button className="btn" disabled={busy} onClick={() => { setBlocking(false); setReason('') }}>
+              Cancel
+            </button>
           </div>
-          <AgentActions agent={agent} onApprove={onApprove} onBlock={onBlock} />
         </div>
-      </div>
+      )}
+
+      {errorMsg && <div style={{ color: 'var(--color-critical)', fontSize: 11, marginTop: 8 }}>{errorMsg}</div>}
     </div>
   )
 }
 
-function AgentsManagement({ agents, onApprove, onBlock }) {
-  const pending = agents.filter((a) => a.approved === 0)
-  const approved = agents.filter((a) => a.approved === 1)
-  const blocked = agents.filter((a) => a.approved === 2)
+function ApprovedAgentCard({ agent, sessions, onBlock }) {
+  const [busy, setBusy] = useState(false)
+  const [errorMsg, setErrorMsg] = useState(null)
+
+  async function handleBlock() {
+    setBusy(true)
+    setErrorMsg(null)
+    try {
+      await onBlock(agent.id)
+    } catch (err) {
+      setErrorMsg(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
 
   return (
-    <div style={{ marginBottom: 28 }}>
-      <div className="panel">
-        <div className="panel-header">
-          Pending Approval
-          {pending.length > 0 && <span className="badge critical">{pending.length}</span>}
+    <div className="agent-card approved">
+      <div className="agent-card-top">
+        <div className="agent-card-identity">
+          <span className="status-dot green" />
+          <span className="agent-card-name">{agent.name}</span>
         </div>
-        <div className="panel-body" style={{ padding: pending.length ? 16 : 0 }}>
-          {pending.length === 0 ? (
-            <div className="empty-state">No agents pending approval.</div>
-          ) : (
-            pending.map((a) => (
-              <PendingAgentCard key={a.id} agent={a} onApprove={onApprove} onBlock={onBlock} />
-            ))
-          )}
-        </div>
+        <span className="agent-card-sessions">{agent.session_count} sessions</span>
+      </div>
+      <div className="agent-card-meta">
+        First seen {formatDate(agent.first_seen)} · Last seen {formatRelative(agent.last_seen)}
       </div>
 
-      <div className="panel">
-        <div className="panel-header">Approved Agents</div>
-        <div className="panel-body">
-          {approved.length === 0 ? (
-            <div className="empty-state">No approved agents yet.</div>
-          ) : (
-            <table>
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th>Sessions</th>
-                  <th>Last Seen</th>
-                  <th>Status</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {approved.map((a) => (
-                  <tr key={a.id}>
-                    <td>{a.name}</td>
-                    <td>{a.session_count}</td>
-                    <td>{formatTime(a.last_seen)}</td>
-                    <td>
-                      <span className={`status-dot ${statusDotColor(a.current_status)}`} />
-                    </td>
-                    <td>
-                      <button className="btn danger" onClick={() => onBlock(a.id)}>Block</button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
+      <MiniStats sessions={sessions} />
+
+      <Sparkline sessions={sessions} />
+
+      <div className="agent-card-resolution">
+        Approved by {agent.approved_by || 'admin'}
+        {agent.approved_at ? ` on ${formatDate(agent.approved_at)}` : ''}
       </div>
 
-      <div className="panel">
-        <div className="panel-header">Blocked Agents</div>
-        <div className="panel-body">
-          {blocked.length === 0 ? (
-            <div className="empty-state">No blocked agents.</div>
-          ) : (
-            <table>
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th>Blocked Since</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {blocked.map((a) => (
-                  <tr key={a.id}>
-                    <td>{a.name}</td>
-                    <td>{formatTime(a.last_seen)}</td>
-                    <td>
-                      <button className="btn primary" onClick={() => onApprove(a.id)}>Approve</button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
+      <div className="agent-card-actions">
+        <button className="btn block-btn" disabled={busy} onClick={handleBlock}>
+          Block
+        </button>
       </div>
+
+      {errorMsg && <div style={{ color: 'var(--color-critical)', fontSize: 11, marginTop: 8 }}>{errorMsg}</div>}
+    </div>
+  )
+}
+
+function BlockedAgentCard({ agent, sessions, onApprove }) {
+  const [busy, setBusy] = useState(false)
+  const [errorMsg, setErrorMsg] = useState(null)
+
+  async function handleUnblock() {
+    setBusy(true)
+    setErrorMsg(null)
+    try {
+      await onApprove(agent.id)
+    } catch (err) {
+      setErrorMsg(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="agent-card blocked">
+      <div className="agent-card-top">
+        <div className="agent-card-identity">
+          <span className="status-dot red" />
+          <span className="agent-card-name">{agent.name}</span>
+        </div>
+        <span className="agent-card-sessions">{agent.session_count} sessions</span>
+      </div>
+      <div className="agent-card-meta">
+        First seen {formatDate(agent.first_seen)} · Last seen {formatRelative(agent.last_seen)}
+      </div>
+
+      <MiniStats sessions={sessions} />
+
+      <div className="agent-card-resolution">
+        {agent.blocked_reason ? `Reason: ${agent.blocked_reason}` : 'No reason given'}
+        {agent.blocked_at ? ` — blocked ${formatDate(agent.blocked_at)}` : ''}
+      </div>
+
+      <div className="agent-card-actions">
+        <button className="btn unblock-btn" disabled={busy} onClick={handleUnblock}>
+          Unblock
+        </button>
+      </div>
+
+      {errorMsg && <div style={{ color: 'var(--color-critical)', fontSize: 11, marginTop: 8 }}>{errorMsg}</div>}
     </div>
   )
 }
 
 export default function AgentDetail() {
   const [agents, setAgents] = useState([])
-  const [selectedId, setSelectedId] = useState(null)
-  const [sessions, setSessions] = useState([])
-  const [events, setEvents] = useState([])
-  const [expandedSessionId, setExpandedSessionId] = useState(null)
+  const [sessionsByAgent, setSessionsByAgent] = useState({})
 
   useEffect(() => {
     let cancelled = false
@@ -178,9 +277,6 @@ export default function AgentDetail() {
         const data = await api.getAgents()
         if (cancelled) return
         setAgents(data.agents)
-        if (!selectedId && data.agents.length > 0) {
-          setSelectedId(data.agents[0].id)
-        }
       } catch {
         // ignore poll failures
       }
@@ -191,7 +287,32 @@ export default function AgentDetail() {
       cancelled = true
       clearInterval(id)
     }
-  }, [selectedId])
+  }, [])
+
+  useEffect(() => {
+    if (agents.length === 0) return
+    let cancelled = false
+
+    async function loadSessions() {
+      try {
+        const entries = await Promise.all(
+          agents.map(async (a) => {
+            const data = await api.getAgentSessions(a.id)
+            return [a.id, data.sessions]
+          })
+        )
+        if (!cancelled) setSessionsByAgent(Object.fromEntries(entries))
+      } catch {
+        // ignore poll failures
+      }
+    }
+    loadSessions()
+    const id = setInterval(loadSessions, 5000)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [agents])
 
   async function handleApprove(agentId) {
     await api.approveAgent(agentId)
@@ -199,49 +320,15 @@ export default function AgentDetail() {
     setAgents(data.agents)
   }
 
-  async function handleBlock(agentId) {
-    await api.blockAgent(agentId)
+  async function handleBlock(agentId, reason) {
+    await api.blockAgent(agentId, reason)
     const data = await api.getAgents()
     setAgents(data.agents)
   }
 
-  useEffect(() => {
-    if (!selectedId) return
-    setExpandedSessionId(null)
-    let cancelled = false
-
-    async function load() {
-      try {
-        const [sessionData, eventData] = await Promise.all([
-          api.getAgentSessions(selectedId),
-          api.getEvents({ agent: selectedId, limit: 100 }),
-        ])
-        if (cancelled) return
-        setSessions(sessionData.sessions)
-        setEvents(eventData.events)
-      } catch {
-        // ignore poll failures
-      }
-    }
-    load()
-    const id = setInterval(load, 3000)
-    return () => {
-      cancelled = true
-      clearInterval(id)
-    }
-  }, [selectedId])
-
-  const selectedAgent = agents.find((a) => a.id === selectedId)
-
-  const dirCounts = {}
-  for (const e of events) {
-    if (e.event_type === 'file_read' || e.event_type === 'file_write') {
-      dirCounts[e.path] = (dirCounts[e.path] || 0) + (e.file_count || 1)
-    }
-  }
-  const topDirs = Object.entries(dirCounts).sort((a, b) => b[1] - a[1]).slice(0, 10)
-
-  const netConnections = events.filter((e) => e.event_type === 'net_connect')
+  const pending = agents.filter((a) => a.approved === 0)
+  const approved = agents.filter((a) => a.approved === 1)
+  const blocked = agents.filter((a) => a.approved === 2)
 
   return (
     <div>
@@ -252,180 +339,58 @@ export default function AgentDetail() {
         </div>
       </div>
 
-      <AgentsManagement agents={agents} onApprove={handleApprove} onBlock={handleBlock} />
-
       {agents.length === 0 ? (
         <div className="empty-state">No agents detected yet.</div>
       ) : (
         <>
-          <div style={{ display: 'flex', gap: 8, marginBottom: 20, flexWrap: 'wrap' }}>
-            {agents.map((a) => (
-              <button
-                key={a.id}
-                className={`btn ${selectedId === a.id ? 'primary' : ''}`}
-                onClick={() => setSelectedId(a.id)}
-              >
-                {a.name}
-              </button>
-            ))}
+          <div className="panel-header" style={{ border: 'none', padding: '4px 4px 8px' }}>
+            Pending Approval
+            {pending.length > 0 && <span className="badge critical">{pending.length}</span>}
           </div>
+          {pending.length === 0 ? (
+            <div className="empty-state">No agents pending approval.</div>
+          ) : (
+            pending.map((a) => (
+              <PendingAgentCard
+                key={a.id}
+                agent={a}
+                sessions={sessionsByAgent[a.id] || []}
+                onApprove={handleApprove}
+                onBlock={handleBlock}
+              />
+            ))
+          )}
 
-          {selectedAgent && (
-            <>
-              <div className="stat-grid">
-                <div className="stat-card">
-                  <div className="stat-card-label">Status</div>
-                  <div className="stat-card-value">
-                    <span className={`badge ${approvalLabel(selectedAgent.approved).className}`}>
-                      {approvalLabel(selectedAgent.approved).text}
-                    </span>
-                  </div>
-                </div>
-                <div className="stat-card">
-                  <div className="stat-card-label">Sessions</div>
-                  <div className="stat-card-value">{selectedAgent.session_count}</div>
-                </div>
-                <div className="stat-card">
-                  <div className="stat-card-label">First Seen</div>
-                  <div className="stat-card-value" style={{ fontSize: 13 }}>{formatTime(selectedAgent.first_seen)}</div>
-                </div>
-                <div className="stat-card">
-                  <div className="stat-card-label">Last Seen</div>
-                  <div className="stat-card-value" style={{ fontSize: 13 }}>{formatTime(selectedAgent.last_seen)}</div>
-                </div>
-              </div>
+          <div className="panel-header" style={{ border: 'none', padding: '20px 4px 8px' }}>
+            Approved Agents
+          </div>
+          {approved.length === 0 ? (
+            <div className="empty-state">No approved agents yet.</div>
+          ) : (
+            approved.map((a) => (
+              <ApprovedAgentCard
+                key={a.id}
+                agent={a}
+                sessions={sessionsByAgent[a.id] || []}
+                onBlock={handleBlock}
+              />
+            ))
+          )}
 
-              <div className="export-grid">
-                <div className="panel" style={{ marginBottom: 0 }}>
-                  <div className="panel-header">Top Directories</div>
-                  <div className="panel-body">
-                    {topDirs.length === 0 ? (
-                      <div className="empty-state">No file activity yet.</div>
-                    ) : (
-                      <table>
-                        <thead>
-                          <tr><th>Directory</th><th>Accesses</th></tr>
-                        </thead>
-                        <tbody>
-                          {topDirs.map(([path, count]) => (
-                            <tr key={path}>
-                              <td className="mono-truncate" title={path}>{path}</td>
-                              <td>{count}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    )}
-                  </div>
-                </div>
-
-                <div className="panel" style={{ marginBottom: 0 }}>
-                  <div className="panel-header">Network Connections</div>
-                  <div className="panel-body">
-                    {netConnections.length === 0 ? (
-                      <div className="empty-state">No network activity yet.</div>
-                    ) : (
-                      <table>
-                        <thead>
-                          <tr><th>Time</th><th>Destination</th></tr>
-                        </thead>
-                        <tbody>
-                          {netConnections.map((e) => (
-                            <tr key={e.id}>
-                              <td>{formatTime(e.created_at)}</td>
-                              <td className="mono-truncate" title={e.path}>{e.path}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              <div className="panel">
-                <div className="panel-header">Session History</div>
-                <div className="panel-body">
-                  {sessions.length === 0 ? (
-                    <div className="empty-state">No completed sessions yet.</div>
-                  ) : (
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Started</th>
-                          <th>Ended</th>
-                          <th>Reads</th>
-                          <th>Writes</th>
-                          <th>Net (MB)</th>
-                          <th>Procs</th>
-                          <th>Cred</th>
-                          <th>Alerts</th>
-                          <th>Anomaly</th>
-                          <th>Summary</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {sessions.map((s) => {
-                          const isExpanded = expandedSessionId === s.id
-                          const sessionEvents = events.filter((e) => e.session_id === s.id)
-                          return (
-                            <Fragment key={s.id}>
-                              <tr
-                                onClick={() => setExpandedSessionId(isExpanded ? null : s.id)}
-                                style={{ cursor: 'pointer' }}
-                              >
-                                <td>{formatTime(s.started_at)}</td>
-                                <td>{s.ended_at ? formatTime(s.ended_at) : 'active'}</td>
-                                <td>{s.file_reads}</td>
-                                <td>{s.file_writes}</td>
-                                <td>{(s.net_egress_bytes / (1024 * 1024)).toFixed(2)}</td>
-                                <td>{s.proc_spawns}</td>
-                                <td>{s.cred_accesses}</td>
-                                <td>{s.alert_count}</td>
-                                <td>{s.anomaly_score.toFixed(2)}</td>
-                                <td className="mono-truncate" title={s.summary || ''}>{s.summary || '—'}</td>
-                              </tr>
-                              {isExpanded && (
-                                <tr>
-                                  <td colSpan={10} style={{ background: 'var(--color-bg-subtle)' }}>
-                                    {sessionEvents.length === 0 ? (
-                                      <div className="empty-state" style={{ padding: '12px 0' }}>
-                                        No events for this session in the last 100 fetched — try the Live Feed for older activity.
-                                      </div>
-                                    ) : (
-                                      <table>
-                                        <thead>
-                                          <tr>
-                                            <th>Time</th>
-                                            <th>Type</th>
-                                            <th>Path / Destination</th>
-                                            <th>Severity</th>
-                                          </tr>
-                                        </thead>
-                                        <tbody>
-                                          {sessionEvents.map((e) => (
-                                            <tr key={e.id}>
-                                              <td>{formatTime(e.created_at)}</td>
-                                              <td><span className="badge outline">{e.event_type}</span></td>
-                                              <td className="mono-truncate" title={e.path}>{e.path}</td>
-                                              <td><span className={`badge ${e.severity}`}>{e.severity}</span></td>
-                                            </tr>
-                                          ))}
-                                        </tbody>
-                                      </table>
-                                    )}
-                                  </td>
-                                </tr>
-                              )}
-                            </Fragment>
-                          )
-                        })}
-                      </tbody>
-                    </table>
-                  )}
-                </div>
-              </div>
-            </>
+          <div className="panel-header" style={{ border: 'none', padding: '20px 4px 8px' }}>
+            Blocked Agents
+          </div>
+          {blocked.length === 0 ? (
+            <div className="empty-state">No blocked agents.</div>
+          ) : (
+            blocked.map((a) => (
+              <BlockedAgentCard
+                key={a.id}
+                agent={a}
+                sessions={sessionsByAgent[a.id] || []}
+                onApprove={handleApprove}
+              />
+            ))
           )}
         </>
       )}
