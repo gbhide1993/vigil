@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/badge/license-Proprietary-red)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
-![Version](https://img.shields.io/badge/version-1.0.0--beta-orange)
+![Version](https://img.shields.io/badge/version-0.1.1--beta-orange)
 ![Downloads](https://img.shields.io/github/downloads/gbhide1993/vlaw/total)
 
 Local OS-level monitor for Claude Code, Cursor, and Copilot.  
