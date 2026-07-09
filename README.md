@@ -1,58 +1,87 @@
 # V-LAW — Local AI Agent Watchdog
 
-Monitors what AI coding agents actually do on your machine.
-Claude Code, Cursor, Copilot — file access, network connections,
-process spawns, credential access. Real-time alerts. One-click install.
+![License](https://img.shields.io/badge/license-Proprietary-red)
+![Platform](https://img.shields.io/badge/platform-Windows-blue)
+![Version](https://img.shields.io/badge/version-1.0.0--beta-orange)
+![Downloads](https://img.shields.io/github/downloads/gbhide1993/vlaw/total)
 
-Zero cloud. Zero Docker. Everything stays on your machine.
+Local OS-level monitor for Claude Code, Cursor, and Copilot.  
+Tray icon goes red when agents access files, network, credentials, or spawn suspicious processes.  
+**Zero cloud. Zero Docker. One-click Windows installer.**
 
 ---
 
 ## Download
 
-[VLaw-Setup.exe — v1.0.0 Beta](https://github.com/gbhide1993/vlaw/releases/tag/v1.0.0-beta)
+### [⬇ Download VLaw-Setup.exe — v1.0.0 Beta](https://github.com/gbhide1993/vlaw/releases/tag/v1.0.0-beta)
 
-Windows 10/11 only.
+Windows 10/11 · 101MB · One-click install
 
-> SmartScreen will show "Windows protected your PC" — click **More info** → **Run anyway**.  
-> This appears because V-LAW is not yet code-signed.
+> Windows will show "Windows protected your PC" → click **More info** → **Run anyway**  
+> (Unsigned beta — SHA256 in release notes to verify)
 
-SHA256: `EC1FA292B206641F7FAEF0808F827274A7CF7E9A1FEE3CC90F29C166006A2003`
+---
+
+## Quick check (no install needed)
+
+See what Claude Code has been storing on your machine:
+
+```bash
+npx check-claude-history
+```
 
 ---
 
 ## What It Watches
 
-- File reads and writes per agent
-- Network connections — flags unknown destinations
-- Process and command spawns — flags curl, wget, ssh
-- Credential file access — .ssh, .env, .aws
-- MCP tool calls
+| Activity | What V-LAW catches |
+|---|---|
+| File access | Every read and write per agent, per session |
+| Network connections | Flags unknown destinations |
+| Process spawns | Flags curl, wget, ssh, and dangerous commands |
+| Credential access | .env, .ssh, .aws — instant HIGH alert |
+| Hidden cache writes | Claude Code's ~/.claude/file-history/ backup |
 
 ---
 
 ## How It Works
 
-One-click install. Tray icon sits quietly in green when all is clear.
-Goes red when something needs your attention.
-Click the tray to see what happened and block if needed.
+1. Install → tray icon appears within 10 seconds
+2. Start your AI agent (Claude Code, Cursor, Copilot)
+3. V-LAW detects it automatically
+4. Tray goes **red** if something needs attention
+5. Click tray → see what happened → Allow / Investigate / BLOCK
 
-No Docker. No terminal. No config files to edit.
+---
+
+## Pricing
+
+| Plan | Price | What's included |
+|---|---|---|
+| Individual | $9/month | 1 machine, all features, all agents |
+| Annual | $99/year | Same, 2 months free |
+
+**Beta is free.** Pricing activates after beta period.  
+Early testers locked in at beta price permanently.
 
 ---
 
 ## Requirements
 
 - Windows 10 or 11 (64-bit)
-- At least one AI coding agent (Claude Code, Cursor, or Copilot)
+- At least one AI coding agent installed
 - 200MB disk space
+
+---
+
+## Feedback
+
+Found a bug? [Open an issue](https://github.com/gbhide1993/vlaw/issues)  
+Have a question? [Start a discussion](https://github.com/gbhide1993/vlaw/discussions)  
+Security issue? Email girish@getvvault.com
 
 ---
 
 ## License
 
 Proprietary. See [LICENSE](LICENSE) for details.
-
-## Contact
-
-girish@getvvault.com
