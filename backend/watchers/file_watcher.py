@@ -99,7 +99,8 @@ class VlawFileHandler(FileSystemEventHandler):
 
         await self.red_lines.check_ssh_access(agent_id, agent_name, path)
         if is_write:
-            await self.red_lines.check_claude_cache_write(agent_id, agent_name, path)
+            db = await get_db()
+            await self.red_lines.check_claude_cache_write(agent_id, agent_name, path, db)
         else:
             await self.red_lines.check_env_outside_workspace(agent_id, agent_name, path)
             await self.red_lines.check_cross_project_read(agent_id, agent_name, path)

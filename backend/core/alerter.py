@@ -36,7 +36,8 @@ DEDUP_WINDOWS = {
     "anomaly_score":             3600,
     "red_line_ssh_access":       300,
     "red_line_env_outside_workspace": 300,
-    "red_line_claude_cache_write":    300,
+    "red_line_claude_cache_write":    300,   # RL3, anomalous tier — no active session
+    "checkpoint_activity":       300,   # RL3, normal /rewind tier — dismissible, not a Red Line
     "red_line_unknown_destination":   1800,
     "red_line_dangerous_command":     600,
     "red_line_cross_project_read":    300,

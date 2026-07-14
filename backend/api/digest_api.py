@@ -14,6 +14,18 @@ async def get_daily_digest():
     )
     alerts_24h = (await cur.fetchone())["c"]
 
+    # checkpoint_activity (RL3's normal-/rewind tier — see core/red_lines.py)
+    # is expected, frequent, benign background noise, not a "meaningful
+    # alert" — excluded here so the digest summary and "clean" flag reflect
+    # what's actually worth a human's attention, not raw checkpoint volume.
+    cur = await db.execute(
+        """
+        SELECT COUNT(*) c FROM alerts
+        WHERE created_at > datetime('now', '-24 hours') AND rule_type != 'checkpoint_activity'
+        """
+    )
+    meaningful_alerts_24h = (await cur.fetchone())["c"]
+
     cur = await db.execute(
         """
         SELECT COUNT(*) c FROM alerts
@@ -45,12 +57,12 @@ async def get_daily_digest():
     agent_names = [row["name"] for row in agent_rows]
     agents_active = len(agent_names)
 
-    clean = alerts_24h == 0
+    clean = meaningful_alerts_24h == 0
 
     if clean:
         summary = "All clear. No alerts in the last 24 hours."
     else:
-        summary = f"{alerts_24h} alert{'s' if alerts_24h != 1 else ''} in the last 24h."
+        summary = f"{meaningful_alerts_24h} alert{'s' if meaningful_alerts_24h != 1 else ''} in the last 24h."
         if red_line_count:
             summary += f" {red_line_count} RED LINE."
         if agent_names:
@@ -61,6 +73,7 @@ async def get_daily_digest():
 
     return {
         "alerts_24h": alerts_24h,
+        "meaningful_alerts_24h": meaningful_alerts_24h,
         "red_line_count": red_line_count,
         "agents_active": agents_active,
         "clean": clean,

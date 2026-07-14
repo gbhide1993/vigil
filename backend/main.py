@@ -294,13 +294,23 @@ async def get_stats():
     )
     alerts_today = (await cur.fetchone())["c"]
 
+    # checkpoint_activity (RL3's normal-/rewind tier — see core/red_lines.py)
+    # is expected, frequent, benign background noise, not a "meaningful
+    # alert" in Sprint A's sense — excluded from the noise-reduction
+    # numerator below so it doesn't inflate the count of alerts that
+    # actually warrant a human's attention.
+    cur = await db.execute(
+        "SELECT COUNT(*) c FROM alerts WHERE date(created_at) = date('now') AND rule_type != 'checkpoint_activity'"
+    )
+    meaningful_alerts_today = (await cur.fetchone())["c"]
+
     cur = await db.execute("SELECT value FROM stats_kv WHERE key = 'suppressed_alerts'")
     row = await cur.fetchone()
     suppressed_alerts = row["value"] if row else 0
 
     # Signal-over-noise: how much raw activity got compressed down to
     # alerts actually worth a human's attention today.
-    noise_reduction_ratio = round(alerts_today / events_today, 4) if events_today else 0.0
+    noise_reduction_ratio = round(meaningful_alerts_today / events_today, 4) if events_today else 0.0
 
     return {
         "active_agents": active_agents,
@@ -314,6 +324,7 @@ async def get_stats():
         "cred_accesses_yesterday": cred_accesses_yesterday,
         "sessions_today": sessions_today,
         "alerts_today": alerts_today,
+        "meaningful_alerts_today": meaningful_alerts_today,
         "noise_reduction_ratio": noise_reduction_ratio,
         "suppressed_alerts": suppressed_alerts,
     }

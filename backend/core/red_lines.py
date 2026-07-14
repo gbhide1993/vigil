@@ -33,7 +33,8 @@ RED_LINE_WINDOW_SECONDS = 60  # default, overridden per-rule in RED_LINE_WINDOWS
 RED_LINE_WINDOWS = {
     "ssh_access":            300,   # 5 min — SSH access is rare, keep tight
     "env_outside_workspace": 300,
-    "claude_cache_write":    300,
+    "claude_cache_write":    300,   # genuinely anomalous tier — no active session
+    "checkpoint_activity":   300,   # normal /rewind tier — dismissible, not a Red Line
     "unknown_destination":   600,   # network polling can fire constantly
     "dangerous_command":     600,   # curl/wget in loops
     "cross_project_read":    300,
@@ -41,6 +42,14 @@ RED_LINE_WINDOWS = {
     "config_exec":           300,   # CVE-2025-59536 pattern
     "mcp_autoapproval":      300,   # CVE-2026-21852 pattern (MCP attack surface)
 }
+
+# RL3: how long after a session's ended_at a hidden-cache write is still
+# considered "correlated with an active session" rather than anomalous —
+# checkpoint writes can lag slightly behind the session-close tick
+# (SessionManager.close_idle_sessions runs on a 60s scheduler interval, see
+# core/sessions.py), so a strict "must be exactly open" check would
+# misclassify writes that land in that gap as anomalous.
+CLAUDE_CACHE_SESSION_GRACE_SECONDS = 60
 
 # Env vars whose value is expected to point at the agent's own official API
 # host. Keyed by the var name; checked against AGENT_PRIORS[agent]["known_network_destinations"]
@@ -141,6 +150,33 @@ def is_env_outside_workspace(path: str) -> bool:
 
 def is_claude_cache_write(path: str) -> bool:
     return bool(CLAUDE_CACHE_PATTERN.search(path))
+
+
+async def has_active_or_recent_session(agent_id: int, db) -> bool:
+    """RL3 tiering: does agent_id have a session that's currently open
+    (ended_at IS NULL) or closed within the last
+    CLAUDE_CACHE_SESSION_GRACE_SECONDS? Used to distinguish normal
+    checkpoint activity (write correlates with an active session) from a
+    genuinely anomalous cache write (no session in progress at all).
+
+    NOTE: this correlates on session *existence*, not on matching the
+    specific UUID subfolder under ~/.claude/file-history/ against a
+    specific row in the sessions table — Claude Code's own internal
+    checkpoint-folder UUIDs and V-LAW's session UUIDs (core/sessions.py,
+    SessionManager.touch: uuid.uuid4() per V-LAW-observed session) are two
+    independent ID spaces with no known mapping between them, so a literal
+    string match would be fabricated, not a real signal. "Does this agent
+    have any active/recent session" is the honest, available proxy."""
+    cur = await db.execute(
+        """
+        SELECT 1 FROM sessions
+        WHERE agent_id = ?
+          AND (ended_at IS NULL OR ended_at > datetime('now', ? || ' seconds'))
+        LIMIT 1
+        """,
+        (agent_id, f"-{CLAUDE_CACHE_SESSION_GRACE_SECONDS}"),
+    )
+    return await cur.fetchone() is not None
 
 
 def is_unknown_destination(dest: str) -> bool:
@@ -291,7 +327,17 @@ class RedLines:
         # (agent_id, rule_key, target) -> {"last_fired": float, "batched": int}
         self._state: dict[tuple, dict] = {}
 
-    async def _fire(self, agent_id: int, rule_key: str, severity: str, title: str, description: str, extra_detail: dict, target: str) -> None:
+    async def _fire(
+        self, agent_id: int, rule_key: str, severity: str, title: str, description: str, extra_detail: dict, target: str,
+        rule_type: str = "red_line",
+    ) -> None:
+        """rule_type defaults to "red_line" — the non-disableable floor
+        every existing call site relies on (api/alerts.py's resolve_alert
+        gates purely on rule_type == "red_line"). RL3's normal-checkpoint
+        tier is the one exception: it passes rule_type="checkpoint_activity"
+        so it's dismissible like an ordinary alert, while still sharing
+        this method's batching/dedup window logic — see
+        check_claude_cache_write below."""
         now = time.time()
         window = RED_LINE_WINDOWS.get(rule_key, RED_LINE_WINDOW_SECONDS)
         state_key = (agent_id, rule_key, target)
@@ -311,9 +357,9 @@ class RedLines:
             severity,
             title=title,
             description=description,
-            reason=f"red_line_{rule_key}",
+            reason=f"red_line_{rule_key}" if rule_type == "red_line" else rule_key,
             extra_detail=extra_detail,
-            rule_type="red_line",
+            rule_type=rule_type,
             target=target,
         )
 
@@ -339,7 +385,22 @@ class RedLines:
             target=path,
         )
 
-    async def check_claude_cache_write(self, agent_id: int, agent_name: str, path: str) -> None:
+    async def check_claude_cache_write(self, agent_id: int, agent_name: str, path: str, db) -> None:
+        """RL3: hidden cache directory write. Two tiers, distinguishing
+        normal /rewind checkpoint activity from genuinely anomalous writes:
+
+          - Write correlates with an active/recently-active session for
+            this agent (see has_active_or_recent_session): normal
+            checkpoint activity. Fires severity="low",
+            rule_type="checkpoint_activity" — informational, logged for
+            audit, but dismissible like any regular alert (NOT gated by
+            the red_line non-disableable check in api/alerts.py, since
+            that gate keys on rule_type == "red_line" specifically).
+          - No active/recent session at all: genuinely anomalous — a cache
+            write with no corresponding Claude Code session in progress.
+            Fires severity="high", rule_type="red_line" exactly as RL3
+            did before this split — non-disableable, Accept-Risk only.
+        """
         if not is_claude_cache_write(path):
             return
         # Dedup on the containing directory, not the individual snapshot
@@ -347,10 +408,25 @@ class RedLines:
         # distinct per-turn snapshot files in a single burst under one
         # session directory, which is one logical event, not N.
         directory = str(Path(path.replace("\\", "/")).parent)
+
+        if await has_active_or_recent_session(agent_id, db):
+            await self._fire(
+                agent_id, "checkpoint_activity", "low",
+                title=f"{agent_name} checkpoint write (normal /rewind activity)",
+                description=f"{agent_name} wrote to its hidden cache directory during an active session — "
+                             "consistent with normal /rewind checkpoint behavior.",
+                extra_detail={"path": path},
+                target=directory,
+                rule_type="checkpoint_activity",
+            )
+            return
+
         await self._fire(
             agent_id, "claude_cache_write", "high",
-            title=f"RED LINE: hidden cache write by {agent_name}",
-            description=f"{agent_name} wrote to Claude's hidden cache directory. This may include credential file copies.",
+            title=f"RED LINE: {agent_name} wrote to hidden cache directory with no active session — unusual pattern",
+            description=f"{agent_name} wrote to Claude's hidden cache directory with no active or recently-active "
+                         "session in progress. This may include credential file copies and does not match normal "
+                         "/rewind checkpoint behavior.",
             extra_detail={"path": path},
             target=directory,
         )
