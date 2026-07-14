@@ -125,6 +125,47 @@ function FirstSessionCard({ session, topFinding, onDismiss }) {
   )
 }
 
+function isFullCoverage(configAuditSummary) {
+  const match = /^(\d+)\/(\d+)/.exec(configAuditSummary || '')
+  if (!match) return false
+  return match[1] === match[2]
+}
+
+function ProofOfValueCard({ proofOfValue, configAudit, showConfigDetail, onToggleConfigDetail }) {
+  const alertToday = proofOfValue.days_clean === 0
+  const fullCoverage = isFullCoverage(proofOfValue.config_audit_summary)
+
+  return (
+    <div className={`proof-of-value-card ${alertToday ? 'pov-alert' : ''}`}>
+      <div className="pov-headline">
+        {alertToday
+          ? 'Alert today — streak reset'
+          : `${proofOfValue.days_clean} day${proofOfValue.days_clean !== 1 ? 's' : ''} clean`}
+      </div>
+      <div className="pov-stats">
+        {proofOfValue.agents_watched} agent{proofOfValue.agents_watched !== 1 ? 's' : ''} watched
+        {' '}· {proofOfValue.files_monitored_7d} files monitored
+        {' '}· {proofOfValue.network_destinations_verified_7d} destinations verified
+      </div>
+      <div className="pov-config" onClick={onToggleConfigDetail}>
+        Config: {proofOfValue.config_audit_summary}
+        {!fullCoverage && <span className="pov-fix-link"> — Fix this →</span>}
+      </div>
+      {showConfigDetail && (
+        <div className="config-detail-expand">
+          {configAudit?.missing.map((item) => (
+            <div key={item.pattern} className="config-missing-row">
+              <code>{item.pattern}</code>
+              <span className="config-reason">{item.reason}</span>
+              <span className={`badge ${item.severity}`}>{item.severity}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function trendArrow(delta) {
   if (delta > 0) return { symbol: '▲', className: 'trend-up' }
   if (delta < 0) return { symbol: '▼', className: 'trend-down' }
@@ -159,23 +200,28 @@ export default function LiveFeed() {
   const [sessions, setSessions] = useState(null)
   const [firstSessionCard, setFirstSessionCard] = useState(null)
   const prevSessionCountRef = useRef(null)
+  const [proofOfValue, setProofOfValue] = useState(null)
+  const [configAudit, setConfigAudit] = useState(null)
+  const [showConfigDetail, setShowConfigDetail] = useState(false)
 
   useEffect(() => {
     let cancelled = false
 
     async function load() {
       try {
-        const [statsData, eventsData, healthData, sessionsData] = await Promise.all([
+        const [statsData, eventsData, healthData, sessionsData, proofOfValueData] = await Promise.all([
           api.getStats(),
           api.getEvents({ limit: 50 }),
           api.getHealth(),
           api.getSessions(),
+          api.getProofOfValue(),
         ])
         if (cancelled) return
         setStats(statsData)
         setEvents(eventsData.events)
         setBaselineActive(healthData.baseline_active)
         setSessions(sessionsData.sessions)
+        setProofOfValue(proofOfValueData)
         setError(null)
       } catch (err) {
         if (!cancelled) setError(err.message)
@@ -189,6 +235,23 @@ export default function LiveFeed() {
       clearInterval(id)
     }
   }, [])
+
+  useEffect(() => {
+    if (!showConfigDetail || configAudit) return
+    let cancelled = false
+    async function loadConfigAudit() {
+      try {
+        const data = await api.getConfigAudit()
+        if (!cancelled) setConfigAudit(data)
+      } catch {
+        // non-fatal; the expand section just stays empty
+      }
+    }
+    loadConfigAudit()
+    return () => {
+      cancelled = true
+    }
+  }, [showConfigDetail, configAudit])
 
   useEffect(() => {
     if (sessions === null) return
@@ -275,6 +338,15 @@ export default function LiveFeed() {
             ))}
           </div>
         </div>
+      )}
+
+      {proofOfValue && (
+        <ProofOfValueCard
+          proofOfValue={proofOfValue}
+          configAudit={configAudit}
+          showConfigDetail={showConfigDetail}
+          onToggleConfigDetail={() => setShowConfigDetail((v) => !v)}
+        />
       )}
 
       <div className="stat-grid">

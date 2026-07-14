@@ -38,6 +38,8 @@ export const api = {
   getStats: () => request('/stats'),
   getHealth: () => request('/health'),
   getInsights: () => request('/insights'),
+  getProofOfValue: () => request('/digest/proof-of-value'),
+  getConfigAudit: () => request('/config-audit'),
   exportJsonUrl: (date) => `${BASE}/export/json?date=${date}`,
   exportPdfUrl: (date) => `${BASE}/export/pdf?date=${date}`,
 }
