@@ -2,6 +2,7 @@
 caused them. This is the core of V-LAW's per-agent attribution."""
 
 import json
+import time
 
 import psutil
 
@@ -24,6 +25,38 @@ KNOWN_DESTINATIONS = {
     "api.salesforce.com":  "agentforce",
 }
 
+# A PID's parent chain doesn't change between polls unless the process
+# itself changes (i.e. the PID is reused for a new process) — walking up
+# to 10 parent levels via psutil.Process().parent() on every poll for a
+# still-running PID is wasted work, and was the dominant remaining cost
+# once ProcessWatcher.poll/NetworkWatcher.poll stopped blocking the event
+# loop directly (~4s for ~109 connections, measured on a real dev machine).
+# TTL is a memory-growth safeguard for dead PIDs, not a correctness window
+# — process identity itself doesn't expire. Same TTL + size-cap cleanup
+# shape as core.red_lines._purge_stale_pending_config_writes.
+_agent_attribution_cache: dict[int, tuple[str | None, float]] = {}
+ATTRIBUTION_CACHE_TTL_SECONDS = 30
+ATTRIBUTION_CACHE_MAX_ENTRIES = 2000
+
+
+def _purge_stale_attribution_cache() -> None:
+    """TTL + size-cap cleanup for _agent_attribution_cache. Called on every
+    get_agent_for_pid so the dict never grows unbounded over a long-running
+    session (many short-lived PIDs) without needing its own scheduler job."""
+    now = time.time()
+    stale_pids = [
+        pid for pid, (_, cached_at) in _agent_attribution_cache.items()
+        if now - cached_at > ATTRIBUTION_CACHE_TTL_SECONDS
+    ]
+    for pid in stale_pids:
+        _agent_attribution_cache.pop(pid, None)
+
+    if len(_agent_attribution_cache) > ATTRIBUTION_CACHE_MAX_ENTRIES:
+        oldest_first = sorted(_agent_attribution_cache.items(), key=lambda kv: kv[1][1])
+        overflow = len(_agent_attribution_cache) - ATTRIBUTION_CACHE_MAX_ENTRIES
+        for pid, _ in oldest_first[:overflow]:
+            _agent_attribution_cache.pop(pid, None)
+
 
 class Attributor:
     def __init__(self):
@@ -32,7 +65,25 @@ class Attributor:
 
     def get_agent_for_pid(self, pid: int) -> str | None:
         """Match a PID to a known agent by process name, walking up the
-        parent chain if the direct process isn't a known agent binary."""
+        parent chain if the direct process isn't a known agent binary.
+        Cached per-PID (see _agent_attribution_cache above) since a PID's
+        parent chain and name are immutable for the process's lifetime —
+        only the TTL bounds cache memory for PIDs that have since exited,
+        it doesn't re-check anything for a still-running PID."""
+        _purge_stale_attribution_cache()
+
+        now = time.time()
+        cached = _agent_attribution_cache.get(pid)
+        if cached is not None:
+            agent, cached_at = cached
+            if now - cached_at < ATTRIBUTION_CACHE_TTL_SECONDS:
+                return agent
+
+        agent = self._walk_parent_chain(pid)
+        _agent_attribution_cache[pid] = (agent, now)
+        return agent
+
+    def _walk_parent_chain(self, pid: int) -> str | None:
         try:
             proc = psutil.Process(pid)
         except (psutil.NoSuchProcess, psutil.AccessDenied):

@@ -7,6 +7,7 @@ DNS was tried and found unreliable (can hang well past any configured
 socket timeout on some OS resolver configurations), so instead the known
 hostnames are forward-resolved once at startup into an IP set."""
 
+import asyncio
 import json
 import socket
 
@@ -46,38 +47,36 @@ class NetworkWatcher:
         self._known_ips = _resolve_known_destination_ips()
 
     async def poll(self) -> None:
+        """psutil.net_connections() enumerates every socket on the machine
+        and Attributor.get_agent_for_pid() walks each connection's process
+        parent chain — both synchronous and OS-bound. Run directly inside
+        this async def, they block the single asyncio event loop that also
+        serves HTTP (same failure mode fixed in ProcessWatcher.poll — see
+        that method's docstring). Offloaded to the thread pool executor via
+        run_in_executor; only DB writes and alert firing stay on the loop."""
+        loop = asyncio.get_event_loop()
         try:
-            connections = psutil.net_connections(kind="inet")
+            candidates = await loop.run_in_executor(None, self._gather_candidate_connections)
         except (psutil.AccessDenied, PermissionError):
             return  # requires elevated privileges on some platforms
 
         db = await get_db()
         current_keys: set[tuple] = set()
 
-        for conn in connections:
-            if conn.status != psutil.CONN_ESTABLISHED or conn.raddr is None:
-                continue
-            if conn.pid is None:
-                continue
-
-            ip = conn.raddr.ip
-            port = conn.raddr.port
-            key = (conn.pid, ip, port)
+        for candidate in candidates:
+            key = candidate["key"]
             current_keys.add(key)
 
             if key in self._seen_connections:
                 continue  # already logged this connection
 
-            known_hostname = self._known_ips.get(ip)
-
-            agent_name = self.attributor.get_agent_for_pid(conn.pid)
-            if agent_name is None and known_hostname is not None:
-                agent_name = self.attributor.get_agent_for_destination(known_hostname)
-
+            agent_name = candidate["agent_name"]
             if agent_name is None:
                 continue
 
-            agent_id = await self.attributor.get_or_create_agent(agent_name, conn.pid)
+            conn_pid, ip, port = key
+            known_hostname = candidate["known_hostname"]
+            agent_id = await self.attributor.get_or_create_agent(agent_name, conn_pid)
             session_id = await self.attributor.sessions.touch(agent_id)
 
             dest_label = known_hostname or ip
@@ -98,6 +97,35 @@ class NetworkWatcher:
 
         self._seen_connections = current_keys
         await db.commit()
+
+    def _gather_candidate_connections(self) -> list[dict]:
+        """Synchronous — runs in the thread pool executor via poll(). Does
+        every blocking psutil lookup (connection enumeration and
+        Attributor.get_agent_for_pid's parent-chain walk per connection) up
+        front, so the caller's async loop over the results never touches
+        psutil directly. Includes already-seen connections too — poll()
+        still needs the full current-key set to know what dropped off."""
+        connections = psutil.net_connections(kind="inet")
+
+        candidates = []
+        for conn in connections:
+            if conn.status != psutil.CONN_ESTABLISHED or conn.raddr is None:
+                continue
+            if conn.pid is None:
+                continue
+
+            ip = conn.raddr.ip
+            port = conn.raddr.port
+            key = (conn.pid, ip, port)
+
+            known_hostname = self._known_ips.get(ip)
+
+            agent_name = self.attributor.get_agent_for_pid(conn.pid)
+            if agent_name is None and known_hostname is not None:
+                agent_name = self.attributor.get_agent_for_destination(known_hostname)
+
+            candidates.append({"key": key, "agent_name": agent_name, "known_hostname": known_hostname})
+        return candidates
 
     async def _is_approved_destination(self, db, dest_label: str, ip: str) -> bool:
         cur = await db.execute(
