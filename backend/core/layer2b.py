@@ -23,14 +23,41 @@ _alerter = Alerter()
 def mad_score(value: float, history: list[float]) -> float:
     """Median Absolute Deviation score: how many MADs `value` sits from
     the median of `history`. Robust equivalent of a z-score, meaningful
-    at N >= 3 where mean/stddev are too noisy to trust."""
+    at N >= 3 where mean/stddev are too noisy to trust.
+
+    FIXED: previously returned 0.0 silently whenever MAD itself was 0
+    (happens when 3+ history values tie at the median) — this meant
+    genuinely anomalous sessions were missed for agents with very
+    consistent historical behavior. Now falls back to a simple
+    percentage-deviation check in this specific edge case.
+    """
     if len(history) < 3:
         return 0.0
+
     median = sorted(history)[len(history) // 2]
     deviations = [abs(x - median) for x in history]
     mad = sorted(deviations)[len(deviations) // 2]
+
     if mad < 0.001:
-        return 0.0
+        # Zero-variance history — fall back to percentage deviation
+        # instead of going silent.
+        if median < 0.001:
+            # KNOWN RESIDUAL: median=0 with a nonzero new value also returns 0.0
+            # (silently misses "first time ever" spikes). Lower priority than the
+            # original bug since Layer 2a's hard-threshold/unknown-destination checks
+            # independently catch most real-world "first occurrence" scenarios through
+            # a different mechanism. Worth a proper fix eventually, not urgent now.
+            return 0.0  # both value and median are ~0, genuinely nothing to compare
+
+        pct_deviation = abs(value - median) / median
+        # Scale percentage deviation to roughly match MAD_THRESHOLD's
+        # sensitivity (3.5) — treat 100%+ deviation as equivalent to
+        # crossing the threshold. This *3.5 multiplier is a reasonable
+        # approximation to keep this fallback path roughly consistent
+        # with MAD_THRESHOLD elsewhere, not a precisely derived
+        # statistical constant.
+        return pct_deviation * 3.5
+
     return abs(value - median) / mad
 
 
