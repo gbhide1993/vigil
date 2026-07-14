@@ -296,6 +296,38 @@ function maybeNotifyNewAlert(alert) {
   notification.show()
 }
 
+// Builds the toast body text for the 9AM digest. Two formats:
+//   - Clean day (body.clean === true): proof-of-value leads, since the
+//     alert summary alone ("All clear.") doesn't remind the customer why
+//     they're paying on the majority of days nothing went wrong.
+//   - Day with alerts: the existing alert summary keeps priority (it's
+//     the actionable part), with a shorter proof-of-value line appended
+//     after a separator — still present, but secondary to what needs
+//     attention today.
+// proof_of_value fields are always real query results from
+// backend/api/digest_api.py — a genuine 0 is shown as 0, never omitted.
+function formatDigestBody(body) {
+  const pov = body.proof_of_value
+  if (!pov) return body.summary // defensive: older backend without proof_of_value
+
+  if (body.clean) {
+    return (
+      `${pov.days_clean} day${pov.days_clean !== 1 ? 's' : ''} clean. ` +
+      `${pov.agents_watched} agent${pov.agents_watched !== 1 ? 's' : ''} watched. ` +
+      `${pov.files_monitored_7d} files monitored.\n` +
+      `${pov.network_destinations_verified_7d} destination${pov.network_destinations_verified_7d !== 1 ? 's' : ''} verified. ` +
+      `Config: ${pov.config_audit_summary}.`
+    )
+  }
+
+  return (
+    `${body.summary}\n` +
+    `—\n` +
+    `${pov.days_clean} day${pov.days_clean !== 1 ? 's' : ''} clean before today. ` +
+    `${pov.agents_watched} agent${pov.agents_watched !== 1 ? 's' : ''} watched this week.`
+  )
+}
+
 async function triggerDigestNow() {
   try {
     const { status, body } = await httpRequest('GET', '/digest/daily')
@@ -305,7 +337,7 @@ async function triggerDigestNow() {
     }
     const notification = new Notification({
       title: 'V-LAW Morning Digest',
-      body: body.summary,
+      body: formatDigestBody(body),
       icon: path.join(__dirname, 'assets', body.clean ? 'icon_green.png' : 'icon_red.png'),
     })
     notification.on('click', () => {
