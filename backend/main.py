@@ -63,6 +63,7 @@ from config.policy import load_policy
 from core.aggregator import Aggregator
 from core.attributor import Attributor
 from core.baseline import Baseline
+from core.config_auditor import audit_all_configs
 from core.insights import get_insights
 from core.red_lines import SESSION_LAUNCH_DIR
 from db.database import close_db, get_db, init_db
@@ -364,6 +365,17 @@ async def health():
 @app.get("/api/insights")
 async def insights():
     return await get_insights()
+
+
+@app.get("/config-audit")
+@app.get("/api/config-audit")
+async def config_audit():
+    """Audits the user's own native Claude Code config (permissions.deny
+    in settings.json) against core.config_auditor.RECOMMENDED_DENY_PATTERNS
+    — read-only, never writes to the user's config. Runs synchronously
+    against local disk reads (no DB/network), cheap enough to call on
+    every request rather than caching."""
+    return audit_all_configs(str(SESSION_LAUNCH_DIR))
 
 
 @app.get("/anomalies/recent")

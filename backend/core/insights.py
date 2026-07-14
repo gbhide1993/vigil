@@ -6,7 +6,67 @@ weeks. These are plain facts, not anomalies: no statistics, no
 baseline dependency, just "what happened today" framed usefully.
 """
 
+from core.config_auditor import audit_all_configs
 from db.database import get_db
+
+# Below this coverage_score (see core.config_auditor.audit_config), the
+# first-run config-audit insight card fires. Chosen as "less than half the
+# recommended baseline is configured" — a coarse, defensible threshold
+# rather than a tuned one, since there's no alert-volume history yet to
+# tune it against for a user's very first session.
+CONFIG_AUDIT_FIRST_RUN_THRESHOLD = 50.0
+
+
+async def _first_run_config_audit_card(db) -> dict | None:
+    """Fires only for a genuinely first-time agent (agents.session_count
+    == 1 — incremented in core/sessions.py::SessionManager.touch on every
+    new session opened, the same "prior session count" signal RL7b/RL8
+    already reuse for their own early-session windows) whose native Claude
+    Code config covers less than CONFIG_AUDIT_FIRST_RUN_THRESHOLD percent
+    of the recommended deny-pattern baseline. Returns None otherwise —
+    never fires for returning users (session_count > 1) regardless of
+    coverage_score."""
+    cur = await db.execute(
+        "SELECT id, name FROM agents WHERE name = 'claude_code' AND session_count = 1 LIMIT 1"
+    )
+    agent = await cur.fetchone()
+    if agent is None:
+        return None
+
+    audit = audit_all_configs()
+    if audit["coverage_score"] >= CONFIG_AUDIT_FIRST_RUN_THRESHOLD:
+        return None
+
+    missing = audit["missing"]
+    highlight_count = min(3, len(missing))
+    # reason strings are single phrases like "Prevents direct .env file
+    # modification" — strip the leading verb ("Prevents "/"Flags ") and
+    # lowercase the rest rather than sentence-splitting on "." (which
+    # would incorrectly break on the literal ".env"/".ssh"/".aws" in the
+    # reason text itself).
+    highlights = ", ".join(
+        m["reason"].split(" ", 1)[1].lower() if " " in m["reason"] else m["reason"].lower()
+        for m in missing[:highlight_count]
+    )
+
+    if not audit["config_found"]:
+        text = ("Your Claude Code config has no native protections configured at all. "
+                f"Vigil recommends adding rules for {highlights} — or let Vigil watch for these patterns automatically.")
+    else:
+        text = (f"Your Claude Code config has no protection against {highlights}. "
+                f"Vigil recommends adding these {highlight_count} rules to your native config — "
+                "or let Vigil watch for these patterns automatically.")
+
+    return {
+        "kind": "config_audit_first_run",
+        "text": text,
+        "detail": {
+            "agent_name": agent["name"],
+            "coverage_score": audit["coverage_score"],
+            "missing_count": len(missing),
+            "config_found": audit["config_found"],
+        },
+    }
 
 
 async def get_insights() -> dict:
@@ -55,6 +115,10 @@ async def get_insights() -> dict:
     agent_diversity = (await cur.fetchone())["c"]
 
     cards = []
+
+    config_audit_card = await _first_run_config_audit_card(db)
+    if config_audit_card is not None:
+        cards.append(config_audit_card)
 
     if first_time_dir is not None:
         cards.append({
