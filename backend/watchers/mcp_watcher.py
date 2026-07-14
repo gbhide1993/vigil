@@ -4,11 +4,13 @@ best-effort: localhost connections in that port range, plus processes
 whose command line mentions "mcp"."""
 
 import json
+import time
 
 import psutil
 
 from core.alerter import Alerter
 from core.attributor import Attributor
+from core.red_lines import RedLines
 from db.database import get_db
 
 POLL_INTERVAL_SECONDS = 5
@@ -26,6 +28,7 @@ class McpWatcher:
     def __init__(self, attributor: Attributor):
         self.attributor = attributor
         self.alerter = Alerter()
+        self.red_lines = RedLines()
         self._seen_connections: set[tuple] = set()
 
     async def poll(self) -> None:
@@ -107,7 +110,57 @@ class McpWatcher:
         event_id = cur.lastrowid
 
         if not is_approved:
-            await self._fire_unapproved_mcp_alert(db, agent_id, endpoint, event_id)
+            await self._check_mcp_auto_approval_or_fallback(db, agent_id, agent_name, endpoint, event_id)
+
+    async def _check_mcp_auto_approval_or_fallback(
+        self, db, agent_id: int, agent_name: str, endpoint: str, event_id: int,
+    ) -> None:
+        """RL8 (CVE-2026-21852 pattern): if this unapproved MCP connection
+        immediately follows a .mcp.json write in an early session for this
+        project, escalate to the non-disableable Red Line alert instead of
+        the generic unapproved_mcp alert — see
+        core.red_lines.RedLines.check_mcp_auto_approval. Falls back to the
+        existing generic alert (reason=unapproved_mcp, severity=high) in
+        every other case, so RL8 is purely additive: it never suppresses
+        the alert this code already fired before RL8 existed."""
+        pending = self.red_lines.pop_pending_mcp_config_write(agent_id)
+        if pending is not None:
+            prior_sessions = await self._count_prior_sessions(db, agent_id)
+            rl8_applicable = await self.red_lines.check_mcp_auto_approval(
+                agent_id, agent_name,
+                mcp_config_path=pending["path"], config_write_ts=pending["ts"],
+                mcp_endpoint=endpoint, mcp_connect_ts=time.time(),
+                is_approved_server=False, prior_sessions_for_project=prior_sessions,
+            )
+            if rl8_applicable:
+                return  # RL8 is the applicable rule — don't also fire the generic alert
+
+        await self._fire_unapproved_mcp_alert(db, agent_id, endpoint, event_id)
+
+    async def _count_prior_sessions(self, db, agent_id: int) -> int:
+        """Sessions for this agent, used as RL8's project-directory session
+        count. V-LAW runs one backend instance per active project
+        (core.red_lines.SESSION_LAUNCH_DIR is a single module-level
+        constant — there is no per-session project_path column in the
+        sessions table), so agent-scoped session count already is
+        project-scoped in this backend's actual deployment model. Mirrors
+        file_watcher.py::_count_prior_approved_sessions, but counts all
+        closed sessions (not just approved ones) — RL8's session-count
+        condition is about project familiarity, not approval history.
+
+        # LIMITATION: session count is agent-scoped, not project-scoped,
+        # because the current deployment model runs one backend instance
+        # per project (SESSION_LAUNCH_DIR is a single constant). If
+        # multi-project monitoring from one backend instance is ever added,
+        # this logic must be revisited to track sessions per
+        # (agent, project_path) pair, not agent alone.
+        """
+        cur = await db.execute(
+            "SELECT COUNT(*) c FROM sessions WHERE agent_id = ? AND ended_at IS NOT NULL",
+            (agent_id,),
+        )
+        row = await cur.fetchone()
+        return row["c"] if row else 0
 
     async def _is_approved_mcp_server(self, db, endpoint: str) -> bool:
         cur = await db.execute(

@@ -173,10 +173,14 @@ async def lifespan(app: FastAPI):
         host_root + str(SESSION_LAUNCH_DIR / ".cursor"),
         host_root + str(SESSION_LAUNCH_DIR / ".vscode"),
     ]
+    # RL8 (MCP auto-approval, CVE-2026-21852 pattern) needs .mcp.json writes
+    # at the project root — watched non-recursively so this doesn't balloon
+    # into watching the entire project tree just to catch one root-level file.
+    red_line_non_recursive_dirs = [host_root + str(SESSION_LAUNCH_DIR)]
     watch_paths = scope_dirs + [host_root + p for p in credential_dirs] + red_line_dirs
-    observer = start_file_watcher(attributor, aggregator, watch_paths)
+    observer = start_file_watcher(attributor, aggregator, watch_paths, red_line_non_recursive_dirs)
     _state["observer"] = observer
-    logger.info("file watcher started, watching %d paths", len(watch_paths))
+    logger.info("file watcher started, watching %d paths", len(watch_paths) + len(red_line_non_recursive_dirs))
 
     # 5. APScheduler jobs
     scheduler = AsyncIOScheduler()

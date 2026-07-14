@@ -15,7 +15,9 @@ agent from flooding the alerts view while still surfacing everything.
 
 RL7/RL7b (env var redirect, malicious config execution) were added for
 CVE-2026-21852 / CVE-2025-59536 class attacks — see check_env_var_redirect
-and check_malicious_config_execution below.
+and check_malicious_config_execution below. RL8 (MCP auto-approval) extends
+RL7's CVE-2026-21852 coverage to the MCP-server attack surface disclosed by
+Check Point Research — see check_mcp_auto_approval below.
 """
 
 import os
@@ -37,6 +39,7 @@ RED_LINE_WINDOWS = {
     "cross_project_read":    300,
     "env_redirect":          300,   # CVE-2026-21852 pattern
     "config_exec":           300,   # CVE-2025-59536 pattern
+    "mcp_autoapproval":      300,   # CVE-2026-21852 pattern (MCP attack surface)
 }
 
 # Env vars whose value is expected to point at the agent's own official API
@@ -57,6 +60,13 @@ ENV_URL_VARS = {"ANTHROPIC_BASE_URL", "OPENAI_BASE_URL"}
 AGENT_CONFIG_FILENAMES = {".claude/settings.json", ".cursor/config", ".vscode/settings.json"}
 CONFIG_EXEC_WINDOW_SECONDS = 2       # brief's "within 2 seconds" correlation window
 CONFIG_EXEC_SESSION_THRESHOLD = 3    # "fewer than 3 prior approved sessions"
+
+# RL8: project-scoped MCP server config. A write here followed by an MCP
+# connection within MCP_AUTOAPPROVAL_WINDOW_SECONDS is a candidate for
+# auto-approval — see check_mcp_auto_approval below.
+MCP_CONFIG_FILENAME = ".mcp.json"
+MCP_AUTOAPPROVAL_WINDOW_SECONDS = CONFIG_EXEC_WINDOW_SECONDS  # reuse RL7b's window, per brief
+MCP_AUTOAPPROVAL_SESSION_THRESHOLD = 3  # "one of the first 3 sessions for this project directory"
 
 SSH_DIR_PATTERN = re.compile(r"[\\/]\.ssh[\\/]", re.IGNORECASE)
 
@@ -196,6 +206,11 @@ def is_agent_config_path(path: str) -> bool:
     return any(normalized.endswith(name) for name in AGENT_CONFIG_FILENAMES)
 
 
+def is_mcp_config_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return normalized.endswith("/" + MCP_CONFIG_FILENAME) or normalized == MCP_CONFIG_FILENAME
+
+
 # How long a pending config write is kept before being purged as stale, if
 # nothing ever correlates against it. Deliberately above CONFIG_EXEC_WINDOW_SECONDS
 # (2s) so it never purges an entry that check_malicious_config_execution
@@ -236,6 +251,35 @@ def _purge_stale_pending_config_writes() -> None:
         overflow = len(_pending_config_writes) - PENDING_CONFIG_WRITE_MAX_ENTRIES
         for agent_id, _ in oldest_first[:overflow]:
             _pending_config_writes.pop(agent_id, None)
+
+
+# agent_id -> {"path": str, "ts": float} — most recent unresolved .mcp.json
+# write, tracked separately from _pending_config_writes above since RL8's
+# trigger is an MCP connection event, not a spawn/file-write, and its
+# correlation window/session threshold are conceptually distinct even
+# though they currently share the same values. Same TTL + module-level
+# sharing tradeoffs as _pending_config_writes apply here (see the
+# ARCHITECTURAL DEBT note above) — file_watcher.py records, mcp_watcher.py
+# consumes.
+_pending_mcp_config_writes: dict[int, dict] = {}
+
+
+def _purge_stale_pending_mcp_writes() -> None:
+    """Same TTL + size-cap cleanup as _purge_stale_pending_config_writes,
+    applied to _pending_mcp_config_writes."""
+    now = time.time()
+    stale_keys = [
+        agent_id for agent_id, entry in _pending_mcp_config_writes.items()
+        if now - entry["ts"] > PENDING_CONFIG_WRITE_TTL_SECONDS
+    ]
+    for agent_id in stale_keys:
+        _pending_mcp_config_writes.pop(agent_id, None)
+
+    if len(_pending_mcp_config_writes) > PENDING_CONFIG_WRITE_MAX_ENTRIES:
+        oldest_first = sorted(_pending_mcp_config_writes.items(), key=lambda kv: kv[1]["ts"])
+        overflow = len(_pending_mcp_config_writes) - PENDING_CONFIG_WRITE_MAX_ENTRIES
+        for agent_id, _ in oldest_first[:overflow]:
+            _pending_mcp_config_writes.pop(agent_id, None)
 
 
 class RedLines:
@@ -438,3 +482,89 @@ class RedLines:
             },
             target=config_path,
         )
+
+    def record_mcp_config_write(self, agent_id: int, config_path: str) -> None:
+        """Marks a .mcp.json write as a pending RL8 trigger candidate for
+        agent_id. Mirrors record_config_write's shared-module-level-state
+        pattern (see _pending_mcp_config_writes above) — file_watcher.py
+        records here, mcp_watcher.py consumes via pop_pending_mcp_config_write."""
+        if not is_mcp_config_path(config_path):
+            return
+        _purge_stale_pending_mcp_writes()
+        _pending_mcp_config_writes[agent_id] = {"path": config_path, "ts": time.time()}
+
+    def pop_pending_mcp_config_write(self, agent_id: int) -> dict | None:
+        """Returns and clears the pending .mcp.json write for agent_id if
+        one exists and is still within MCP_AUTOAPPROVAL_WINDOW_SECONDS,
+        else None."""
+        _purge_stale_pending_mcp_writes()
+        pending = _pending_mcp_config_writes.get(agent_id)
+        if pending is None:
+            return None
+        if time.time() - pending["ts"] > MCP_AUTOAPPROVAL_WINDOW_SECONDS:
+            _pending_mcp_config_writes.pop(agent_id, None)
+            return None
+        return pending
+
+    async def check_mcp_auto_approval(
+        self, agent_id: int, agent_name: str, mcp_config_path: str, config_write_ts: float,
+        mcp_endpoint: str, mcp_connect_ts: float, is_approved_server: bool, prior_sessions_for_project: int,
+    ) -> bool:
+        """RL8: Detect MCP server auto-approval from untrusted project
+        config, matching the MCP attack surface disclosed in CVE-2026-21852
+        (Check Point Research, Jan 2026) — extends RL7's env-var-redirect
+        coverage of the same CVE to project-scoped .mcp.json auto-approval.
+
+        Fires only when BOTH:
+          - mcp_endpoint is NOT in the approved_mcp_servers policy list, AND
+          - this is one of the first MCP_AUTOAPPROVAL_SESSION_THRESHOLD
+            sessions for this project directory (the CVE's actual
+            exploitation window — an attacker relies on the victim opening
+            an unfamiliar/new project, not a long-trusted one).
+
+        Caller is responsible for the actual event correlation (a .mcp.json
+        write followed by an MCP connection within
+        MCP_AUTOAPPROVAL_WINDOW_SECONDS) and for resolving is_approved_server
+        against policy's approved_mcp_servers — see record_mcp_config_write /
+        pop_pending_mcp_config_write above for how file_watcher.py and
+        mcp_watcher.py locate the pair. If either condition is false, the
+        caller falls back to mcp_watcher.py's existing generic
+        "Unapproved MCP server connection" alert (reason=unapproved_mcp,
+        severity=high) instead — RL8 is the early-session, non-disableable
+        escalation of that same signal, not a replacement for it.
+
+        Returns True if RL8's conditions were met (regardless of whether the
+        alert was actually inserted vs deduped by _fire's batching window) —
+        callers use this to decide whether to suppress the generic fallback
+        alert, not whether a new alert row was created."""
+        if not is_mcp_config_path(mcp_config_path):
+            return False
+        if is_approved_server:
+            return False
+        if prior_sessions_for_project >= MCP_AUTOAPPROVAL_SESSION_THRESHOLD:
+            return False
+        if (mcp_connect_ts - config_write_ts) > MCP_AUTOAPPROVAL_WINDOW_SECONDS:
+            return False
+
+        server_name = mcp_endpoint.split(":", 1)[1] if ":" in mcp_endpoint else mcp_endpoint
+
+        await self._fire(
+            agent_id, "mcp_autoapproval", "critical",
+            title=f"RED LINE: {agent_name} auto-approved an unrecognized MCP server ({mcp_endpoint}) "
+                  f"from a new project directory — possible CVE-2026-21852 pattern",
+            description=f"{agent_name}'s project config {mcp_config_path} was written, then it connected to "
+                         f"MCP server '{mcp_endpoint}' {round(mcp_connect_ts - config_write_ts, 2)}s later — "
+                         f"an unapproved server, in one of this project's first {MCP_AUTOAPPROVAL_SESSION_THRESHOLD} "
+                         f"sessions ({prior_sessions_for_project} prior). This matches the MCP auto-approval attack "
+                         "surface disclosed for CVE-2026-21852 by Check Point Research: a malicious repository's "
+                         ".mcp.json connecting to an attacker-controlled MCP server before the user has reviewed it.",
+            extra_detail={
+                "mcp_config_path": mcp_config_path,
+                "mcp_endpoint": mcp_endpoint,
+                "server_name": server_name,
+                "delay_seconds": round(mcp_connect_ts - config_write_ts, 2),
+                "prior_sessions_for_project": prior_sessions_for_project,
+            },
+            target=mcp_endpoint,
+        )
+        return True

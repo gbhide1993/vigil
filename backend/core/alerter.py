@@ -42,6 +42,7 @@ DEDUP_WINDOWS = {
     "red_line_cross_project_read":    300,
     "red_line_env_redirect":     300,   # RL7, CVE-2026-21852 pattern
     "red_line_config_exec":      300,   # RL7b, CVE-2025-59536 pattern
+    "red_line_mcp_autoapproval": 300,   # RL8, CVE-2026-21852 pattern (MCP attack surface)
     "volumetric_threshold":      3600,
     "time_anomaly":              3600,
     "ratio_anomaly":             3600,

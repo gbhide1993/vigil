@@ -11,7 +11,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver
 
 from core.attributor import Attributor
-from core.red_lines import RedLines, is_agent_config_path
+from core.red_lines import RedLines, is_agent_config_path, is_mcp_config_path
 from db.database import get_db
 
 POLL_INTERVAL_SECONDS = 1
@@ -80,6 +80,7 @@ class VlawFileHandler(FileSystemEventHandler):
 
         await self._check_red_lines(agent_id, agent_name, path, event_type)
         await self._check_config_exec(agent_id, agent_name, path, event_type)
+        await self._check_mcp_config_write(agent_id, path, event_type)
 
         await self.aggregator.ingest_file_event({
             "agent_id": agent_id,
@@ -129,6 +130,16 @@ class VlawFileHandler(FileSystemEventHandler):
             prior_approved_sessions=prior_approved_sessions,
         )
 
+    async def _check_mcp_config_write(self, agent_id: int, path: str, event_type: str) -> None:
+        """RL8 (CVE-2026-21852 pattern, MCP attack surface): records a
+        .mcp.json write as a pending trigger candidate. The correlating
+        MCP-connection half runs in watchers/mcp_watcher.py, which consumes
+        this via RedLines.pop_pending_mcp_config_write — see
+        core/red_lines.py::check_mcp_auto_approval for the full rule."""
+        is_write = event_type in ("file_write", "file_delete")
+        if is_write and is_mcp_config_path(path):
+            self.red_lines.record_mcp_config_write(agent_id, path)
+
     async def _count_prior_approved_sessions(self, agent_id: int) -> int:
         db = await get_db()
         cur = await db.execute(
@@ -139,9 +150,15 @@ class VlawFileHandler(FileSystemEventHandler):
         return row["c"] if row else 0
 
 
-def start_file_watcher(attributor: Attributor, aggregator, watch_paths: list[str]) -> PollingObserver:
-    """Starts a PollingObserver watching each path in watch_paths.
-    Returns the observer so the caller can stop() it on shutdown."""
+def start_file_watcher(
+    attributor: Attributor, aggregator, watch_paths: list[str], non_recursive_paths: list[str] | None = None,
+) -> PollingObserver:
+    """Starts a PollingObserver watching each path in watch_paths
+    (recursively) plus non_recursive_paths (top-level only — used for RL8's
+    .mcp.json, which lives at the project root; watching the whole project
+    tree recursively just to catch one root-level file would be a much
+    bigger scope/perf change than RL8 calls for). Returns the observer so
+    the caller can stop() it on shutdown."""
     loop = asyncio.get_event_loop()
 
     observer = PollingObserver(timeout=POLL_INTERVAL_SECONDS)
@@ -151,6 +168,11 @@ def start_file_watcher(attributor: Attributor, aggregator, watch_paths: list[str
         expanded = os.path.expanduser(path)
         if os.path.isdir(expanded):
             observer.schedule(handler, expanded, recursive=True)
+
+    for path in non_recursive_paths or []:
+        expanded = os.path.expanduser(path)
+        if os.path.isdir(expanded):
+            observer.schedule(handler, expanded, recursive=False)
 
     observer.start()
     return observer
