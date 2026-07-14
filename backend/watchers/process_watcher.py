@@ -4,11 +4,12 @@ each is logged individually and immediately."""
 
 import json
 import re
+import time
 
 import psutil
 
 from core.alerter import Alerter
-from core.attributor import Attributor
+from core.attributor import KNOWN_AGENTS, Attributor
 from core.red_lines import RedLines
 from db.database import get_db
 
@@ -21,6 +22,26 @@ POLL_INTERVAL_SECONDS = 3
 # subprocess spawn includes as flag text).
 SUSPICIOUS_EXE_PATTERNS = {"curl", "wget", "ssh", "scp", "nc", "ncat"}
 SUSPICIOUS_INLINE_PATTERNS = ["python -c", "python3 -c", "powershell -enc", "powershell -command"]
+
+# Agent-config env vars checked by RL7 (core/red_lines.py::check_env_var_redirect).
+# Kept here (not in red_lines.py) since this is the only place env vars are
+# actually read off a live process.
+RELEVANT_ENV_VARS = {
+    "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY",
+    "OPENAI_BASE_URL", "OPENAI_API_KEY",
+}
+
+
+def _match_known_agent_name(process_name: str) -> str | None:
+    """Direct name match against core.attributor.KNOWN_AGENTS — deliberately
+    does not walk the parent chain like Attributor.get_agent_for_pid does.
+    RL7 needs the specific process whose own environment carries the
+    redirected var, not whichever ancestor happens to be a known agent."""
+    lowered = process_name.lower()
+    for agent_key, process_names in KNOWN_AGENTS.items():
+        if any(pn.lower() in lowered for pn in process_names):
+            return agent_key
+    return None
 
 
 def _is_suspicious(cmdline: str, exe_basename: str) -> bool:
@@ -41,10 +62,16 @@ class ProcessWatcher:
     async def poll(self) -> None:
         """Called periodically by the scheduler. Detects PIDs not seen in
         the previous poll and checks whether they were spawned under a
-        known agent process tree."""
+        known agent process tree, then independently re-scans every
+        currently-running agent process for RL7 (see
+        _scan_all_agent_processes_for_env_redirect) — that scan must not be
+        gated behind "new PIDs this poll", since a redirect can be set on a
+        process that was already running before this poll started."""
         current_pids = set(psutil.pids())
         new_pids = current_pids - self._known_pids
         self._known_pids = current_pids
+
+        await self._scan_all_agent_processes_for_env_redirect()
 
         if not new_pids:
             return
@@ -74,6 +101,8 @@ class ProcessWatcher:
 
             exe_name = proc.name()
             await self.red_lines.check_dangerous_command(agent_id, agent_name, cmdline, exe_name)
+
+            await self._check_config_exec(agent_id, agent_name, exe_path or cmdline)
 
             suspicious = _is_suspicious(cmdline, exe_name)
             severity = "medium" if suspicious else "low"
@@ -113,3 +142,59 @@ class ProcessWatcher:
                 )
 
         await db.commit()
+
+    async def _scan_all_agent_processes_for_env_redirect(self) -> None:
+        """RL7: independently inspects every currently-running process whose
+        name matches a known agent binary (core.attributor.KNOWN_AGENTS),
+        not just PIDs newly spawned this poll and not just a single
+        "first match" PID. Each matching process's own environment is
+        checked on its own terms, so if 5 claude.exe processes are running
+        and only one has ANTHROPIC_BASE_URL redirected, that exact PID is
+        the one the alert is attributed to — see
+        core.red_lines.RedLines.check_env_var_redirect's pid parameter."""
+        for proc in psutil.process_iter(["pid", "name"]):
+            name = proc.info.get("name") or ""
+            agent_name = _match_known_agent_name(name)
+            if agent_name is None:
+                continue
+
+            pid = proc.info["pid"]
+            try:
+                full_env = proc.environ()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                # Best-effort: env vars are only readable while the process
+                # is alive and, on Windows/macOS, only for processes owned
+                # by the same user — skip this PID, never block the scan.
+                continue
+
+            agent_env = {k: v for k, v in full_env.items() if k.upper() in RELEVANT_ENV_VARS}
+            if not agent_env:
+                continue
+
+            agent_id = await self.attributor.get_or_create_agent(agent_name, pid)
+            session_id = await self.attributor.sessions.touch(agent_id)
+            await self.red_lines.check_env_var_redirect(agent_id, agent_name, session_id, agent_env, pid=pid)
+
+    async def _check_config_exec(self, agent_id: int, agent_name: str, spawned_path: str) -> None:
+        """RL7b (CVE-2025-59536 pattern), spawn-triggered half: consumes a
+        pending config write recorded by file_watcher.py (shared module-level
+        state in core.red_lines) if this spawn falls within the correlation
+        window. See file_watcher.py::_check_config_exec for the file-write
+        half of the same rule."""
+        pending = self.red_lines.pop_pending_config_write(agent_id)
+        if pending is None:
+            return
+
+        db = await get_db()
+        cur = await db.execute(
+            "SELECT COUNT(*) c FROM sessions WHERE agent_id = ? AND ended_at IS NOT NULL",
+            (agent_id,),
+        )
+        prior_approved_sessions = (await cur.fetchone())["c"]
+
+        await self.red_lines.check_malicious_config_execution(
+            agent_id, agent_name,
+            config_path=pending["path"], config_write_ts=pending["ts"],
+            triggered_event_path=spawned_path, triggered_event_ts=time.time(),
+            prior_approved_sessions=prior_approved_sessions,
+        )

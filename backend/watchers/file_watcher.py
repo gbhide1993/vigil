@@ -4,13 +4,15 @@ Docker Desktop on Windows, where native filesystem events are unreliable."""
 
 import asyncio
 import os
+import time
 
 import psutil
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver
 
 from core.attributor import Attributor
-from core.red_lines import RedLines
+from core.red_lines import RedLines, is_agent_config_path
+from db.database import get_db
 
 POLL_INTERVAL_SECONDS = 1
 
@@ -77,6 +79,7 @@ class VlawFileHandler(FileSystemEventHandler):
         session_id = await self.attributor.sessions.touch(agent_id)
 
         await self._check_red_lines(agent_id, agent_name, path, event_type)
+        await self._check_config_exec(agent_id, agent_name, path, event_type)
 
         await self.aggregator.ingest_file_event({
             "agent_id": agent_id,
@@ -99,6 +102,41 @@ class VlawFileHandler(FileSystemEventHandler):
         else:
             await self.red_lines.check_env_outside_workspace(agent_id, agent_name, path)
             await self.red_lines.check_cross_project_read(agent_id, agent_name, path)
+
+    async def _check_config_exec(self, agent_id: int, agent_name: str, path: str, event_type: str) -> None:
+        """RL7b (CVE-2025-59536 pattern): a project config write followed
+        within RedLines.CONFIG_EXEC_WINDOW_SECONDS by a spawn/write elsewhere.
+        State is shared at module level (core.red_lines._pending_config_writes)
+        so process_watcher.py's proc_spawn events can also consume a write
+        recorded here, and vice versa."""
+        is_write = event_type in ("file_write", "file_delete")
+
+        if is_agent_config_path(path) and is_write:
+            self.red_lines.record_config_write(agent_id, path)
+            return
+
+        pending = self.red_lines.pop_pending_config_write(agent_id)
+        if pending is None:
+            return
+        if path == pending["path"]:
+            return  # the config write's own event, not a separate trigger
+
+        prior_approved_sessions = await self._count_prior_approved_sessions(agent_id)
+        await self.red_lines.check_malicious_config_execution(
+            agent_id, agent_name,
+            config_path=pending["path"], config_write_ts=pending["ts"],
+            triggered_event_path=path, triggered_event_ts=time.time(),
+            prior_approved_sessions=prior_approved_sessions,
+        )
+
+    async def _count_prior_approved_sessions(self, agent_id: int) -> int:
+        db = await get_db()
+        cur = await db.execute(
+            "SELECT COUNT(*) c FROM sessions WHERE agent_id = ? AND ended_at IS NOT NULL",
+            (agent_id,),
+        )
+        row = await cur.fetchone()
+        return row["c"] if row else 0
 
 
 def start_file_watcher(attributor: Attributor, aggregator, watch_paths: list[str]) -> PollingObserver:

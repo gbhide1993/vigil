@@ -1,8 +1,11 @@
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
+from core.alerter import Alerter
+from core.verification import build_verification_report, touches_credential_path
 from db.database import get_db
 
 router = APIRouter()
+_alerter = Alerter()
 
 ANOMALY_RULE_TYPES = ("volumetric_threshold", "time_anomaly", "ratio_anomaly", "unknown_destination", "rolling_anomaly")
 
@@ -27,6 +30,54 @@ async def get_sessions(status: str | None = Query(default=None)):
     )
     rows = await cur.fetchall()
     return {"sessions": [dict(r) for r in rows]}
+
+
+@router.get("/sessions/{session_id}/verify")
+async def verify_session(session_id: str):
+    """Compares this session's agent-self-reported file activity (Claude
+    Code's own .jsonl transcript) against what V-LAW independently
+    observed at the OS level. See core/verification.py for the comparison
+    logic. A non-empty discrepancies list fires a verification_mismatch
+    alert as a side effect — that's the significant, actionable case."""
+    db = await get_db()
+
+    cur = await db.execute("SELECT id, agent_id FROM sessions WHERE id = ?", (session_id,))
+    session = await cur.fetchone()
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    cur = await db.execute("SELECT name FROM agents WHERE id = ?", (session["agent_id"],))
+    agent = await cur.fetchone()
+    agent_name = agent["name"] if agent else "unknown agent"
+
+    report = await build_verification_report(session_id, agent_name, db)
+
+    discrepancies = report.get("discrepancies")
+    if discrepancies:
+        await _fire_verification_mismatch_alert(session["agent_id"], agent_name, session_id, discrepancies)
+
+    return report
+
+
+async def _fire_verification_mismatch_alert(agent_id: int, agent_name: str, session_id: str, discrepancies: list[dict]) -> None:
+    has_credential_mismatch = any(
+        d["seen_by"] == "os_only" and touches_credential_path(d["path"])
+        for d in discrepancies
+    )
+    severity = "high" if has_credential_mismatch else "medium"
+    count = len(discrepancies)
+
+    await _alerter.fire_alert(
+        agent_id,
+        severity,
+        title=f"{agent_name}'s own session log does not match observed OS activity — {count} discrepancies found",
+        description=f"Session {session_id}: {count} file path(s) differ between {agent_name}'s self-reported "
+                     "session transcript and what V-LAW independently observed at the OS level.",
+        reason="verification_mismatch",
+        extra_detail={"session_id": session_id, "discrepancy_count": count, "discrepancies": discrepancies[:50]},
+        rule_type="verification_mismatch",
+        target=session_id,
+    )
 
 
 @router.get("/sessions/{session_id}/top-finding")

@@ -64,6 +64,7 @@ from core.aggregator import Aggregator
 from core.attributor import Attributor
 from core.baseline import Baseline
 from core.insights import get_insights
+from core.red_lines import SESSION_LAUNCH_DIR
 from db.database import close_db, get_db, init_db
 from license.license_service import LicenseService
 from watchers.file_watcher import start_file_watcher
@@ -160,8 +161,18 @@ async def lifespan(app: FastAPI):
     # Red Line rules 1 and 3 (SSH directory access, Claude hidden cache
     # writes) must fire regardless of policy configuration, so their
     # directories are always watched — independent of whatever the user
-    # has set in credential_paths/scope_directories.
-    red_line_dirs = [host_root + os.path.expanduser("~/.ssh/"), host_root + os.path.expanduser("~/.claude/file-history/")]
+    # has set in credential_paths/scope_directories. RL7b (project config
+    # execution, CVE-2025-59536 pattern) needs the active project's own
+    # .claude/.cursor/.vscode config dirs watched too — these live under
+    # the session's launch directory (core.red_lines.SESSION_LAUNCH_DIR),
+    # not under the user's home dir like the other red-line paths.
+    red_line_dirs = [
+        host_root + os.path.expanduser("~/.ssh/"),
+        host_root + os.path.expanduser("~/.claude/file-history/"),
+        host_root + str(SESSION_LAUNCH_DIR / ".claude"),
+        host_root + str(SESSION_LAUNCH_DIR / ".cursor"),
+        host_root + str(SESSION_LAUNCH_DIR / ".vscode"),
+    ]
     watch_paths = scope_dirs + [host_root + p for p in credential_dirs] + red_line_dirs
     observer = start_file_watcher(attributor, aggregator, watch_paths)
     _state["observer"] = observer

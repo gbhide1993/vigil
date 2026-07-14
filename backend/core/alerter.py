@@ -40,10 +40,13 @@ DEDUP_WINDOWS = {
     "red_line_unknown_destination":   1800,
     "red_line_dangerous_command":     600,
     "red_line_cross_project_read":    300,
+    "red_line_env_redirect":     300,   # RL7, CVE-2026-21852 pattern
+    "red_line_config_exec":      300,   # RL7b, CVE-2025-59536 pattern
     "volumetric_threshold":      3600,
     "time_anomaly":              3600,
     "ratio_anomaly":             3600,
     "rolling_anomaly":           3600,
+    "verification_mismatch":     3600,  # once per session is enough
 }
 DEFAULT_DEDUP_WINDOW = 300
 

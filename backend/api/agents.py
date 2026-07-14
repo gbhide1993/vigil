@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from config.policy import POLICY_FILE
+from core.cve_check import check_agent_cves, get_installed_agent_version
 from db.database import get_db
 
 router = APIRouter()
@@ -203,6 +204,21 @@ async def block_agent(agent_id: int, body: BlockRequest | None = None):
     cur = await db.execute("SELECT * FROM agents WHERE id = ?", (agent_id,))
     updated = await cur.fetchone()
     return dict(updated)
+
+
+@router.get("/agents/{agent_name}/cve-check")
+async def get_agent_cve_check(agent_name: str):
+    """Compares agent_name's installed version against backend/core/cve_check.py's
+    KNOWN_CVES table. installed_version is None when it couldn't be
+    determined (e.g. binary not found, --version output unparseable) —
+    that's a valid, non-error result, not a failure."""
+    installed_version = get_installed_agent_version(agent_name)
+    applicable_cves = check_agent_cves(agent_name)
+    return {
+        "agent_name": agent_name,
+        "installed_version": installed_version,
+        "cves": applicable_cves,
+    }
 
 
 @router.get("/agents/{agent_id}/sessions")
