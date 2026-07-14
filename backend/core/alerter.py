@@ -49,6 +49,8 @@ DEDUP_WINDOWS = {
     "ratio_anomaly":             3600,
     "rolling_anomaly":           3600,
     "verification_mismatch":     3600,  # once per session is enough
+    "cross_agent_conflict":            3600,  # 1 hour — same tier as rolling_anomaly/verification_mismatch: low-frequency, high-significance
+    "cross_agent_credential_pattern":  3600,  # 1 hour per unique credential path
 }
 DEFAULT_DEDUP_WINDOW = 300
 

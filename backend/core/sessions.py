@@ -6,6 +6,7 @@ table when a session closes, then handed to baseline.update_from_session()."""
 import uuid
 from datetime import datetime, timezone
 
+from core.cross_agent import check_cross_agent_credential_access, check_cross_agent_file_conflict
 from core.digest import generate_summary
 from core.layer2a import score_session_2a
 from core.layer2b import score_session_2b
@@ -74,6 +75,7 @@ class SessionManager:
             await self._write_summary(db, session_id, agent_id)
             await self._score_layer2a(db, session_id, agent_id)
             await self._score_layer2b(db, session_id, agent_id)
+            await self._check_cross_agent(db)
             closed.append(session_id)
 
         return closed
@@ -153,3 +155,15 @@ class SessionManager:
             await score_session_2b(session_id, agent_id, agent_name, db)
         except Exception as e:
             print(f"Layer2b scoring failed: {e}")
+
+    async def _check_cross_agent(self, db) -> None:
+        """Cross-agent correlation: same-file conflicts and credential
+        access aggregated across all agents, not scoped to the session
+        that just closed — these checks compare activity across the whole
+        unified event store. Session close must never fail due to scoring,
+        so any error here is swallowed, exactly like Layer 2a/2b above."""
+        try:
+            await check_cross_agent_file_conflict(db)
+            await check_cross_agent_credential_access(db)
+        except Exception as e:
+            print(f"Cross-agent correlation check failed: {e}")
