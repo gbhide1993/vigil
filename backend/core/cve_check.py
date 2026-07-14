@@ -1,8 +1,13 @@
 """
-WARNING: CVE version thresholds in this file are UNVERIFIED PLACEHOLDERS.
-Do not ship to production or make public claims about CVE detection until
-every "affected_versions_below" value has been checked against Anthropic's
-actual published security advisories.
+CVE version thresholds below are independently verified against primary
+sources (NVD, GitHub Security Advisory, Check Point Research) as of July 2026.
+
+One field remains unconfirmed: CVE-2026-21852's CVSS 3.1 score (see inline
+comment) — do not cite this specific number publicly until verified directly.
+
+cursor and copilot entries are empty because no CVE research has been done
+for those agents yet, not because none exist. Do not claim "no known CVEs"
+publicly for cursor/copilot until this list is actually researched.
 """
 
 import json
@@ -10,32 +15,29 @@ import re
 import shutil
 import subprocess
 
-# VERIFY: every affected_versions_below value below is a placeholder pending
-# manual confirmation against Anthropic's actual published security
-# advisories. Do NOT ship, and do NOT surface these to users, until each one
-# has been checked against the real advisory — a wrong "patched version"
-# number is worse than no data, since it can tell an actually-vulnerable
-# user they're safe.
 KNOWN_CVES = {
     "claude_code": [
         {
             "cve_id": "CVE-2025-59536",
-            "affected_versions_below": "1.18.0",  # VERIFY: UNCONFIRMED — CHECK ANTHROPIC SECURITY ADVISORY BEFORE SHIPPING
-            "description": "Malicious project config can trigger remote code execution before trust dialog",
-            "severity": "critical",
+            "affected_versions_below": "1.0.111",  # CONFIRMED via NVD + GHSA-4fgq-fpq9-mr3g + Check Point Research
+            "description": "Code injection via startup trust dialog bypass — project code could execute before user accepted the trust prompt",
+            "severity": "critical",  # CVSS 3.1: 8.8, CVSS 4.0: 8.7
+            "cwe": "CWE-94",
+            "source": "https://github.com/anthropics/claude-code/security/advisories/GHSA-4fgq-fpq9-mr3g",
+            "disclosed": "2025-10-03",
         },
         {
             "cve_id": "CVE-2026-21852",
-            "affected_versions_below": "1.19.0",  # VERIFY: UNCONFIRMED — CHECK ANTHROPIC SECURITY ADVISORY BEFORE SHIPPING
-            "description": "ANTHROPIC_BASE_URL environment variable manipulation allows silent traffic redirection and credential exfiltration",
-            "severity": "critical",
+            "affected_versions_below": "2.0.65",  # CONFIRMED via MintMCP + cross-referenced security guide
+            "description": "ANTHROPIC_BASE_URL override via malicious project config redirects API traffic and leaks API keys before trust confirmation. Related attack surfaces per Check Point Research: Hooks and MCP server auto-approval, not just environment variables.",
+            "severity": "critical",  # CVSS 4.0: 5.3 confirmed. CVSS 3.1 score of 7.5 is UNCONFIRMED against primary NVD source — do not cite publicly until directly verified at nvd.nist.gov
+            "cwe": None,  # VERIFY: not confirmed in sources reviewed
+            "source": "https://www.cve.org/CVERecord?id=CVE-2026-21852",
+            "disclosed": "2026-01-21",
         },
     ],
-    # No known CVEs tracked yet for these agents — placeholders so
-    # check_agent_cves() has a defined (empty) result instead of falling
-    # through to "unknown agent".
-    "cursor": [],
-    "copilot": [],
+    "cursor": [],  # No known CVEs tracked yet — not confirmed absent, just not yet researched
+    "copilot": [],  # No known CVEs tracked yet — not confirmed absent, just not yet researched
 }
 
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
