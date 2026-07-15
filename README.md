@@ -4,6 +4,8 @@
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![Version](https://img.shields.io/badge/version-0.2.0--beta-orange)
 
+<img width="3189" height="1671" alt="vlaw_arch" src="https://github.com/user-attachments/assets/83aae026-707c-4f17-86a4-dfdd6b20048a" />
+
 
 Local OS-level monitor for Claude Code, Cursor, and Copilot.
 Tray icon goes red when agents access files, network, credentials, or spawn suspicious processes.
