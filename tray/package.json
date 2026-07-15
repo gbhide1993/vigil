@@ -1,6 +1,6 @@
 {
   "name": "vlaw-tray",
-  "version": "0.1.1-beta",
+  "version": "0.2.0-beta",
   "description": "V-LAW system tray widget",
   "private": true,
   "main": "main.js",

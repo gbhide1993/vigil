@@ -9,10 +9,25 @@ const { spawn, execFile } = require('child_process')
 // (e.g. auto-launch at boot plus a manual double-click of the shortcut)
 // spawns a second backend that fails to bind the already-taken port,
 // showing a false "Backend crashed" state next to the real, working one.
+// app.quit() only *requests* a shutdown — it does not halt synchronous
+// execution of the rest of this file. Without the early return below, a
+// losing second instance would still run through app.whenReady() and
+// spawnBackend() before the quit actually took effect, briefly producing
+// a second vlaw-backend.exe.
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 if (!gotSingleInstanceLock) {
   app.quit()
+  process.exit(0)
 }
+
+app.on('second-instance', () => {
+  // Someone launched V-LAW again (e.g. double-clicked the desktop shortcut
+  // while it's already running) — surface the existing flyout instead of
+  // doing nothing or starting a second backend.
+  if (flyout && !flyout.isDestroyed()) {
+    toggleFlyout()
+  }
+})
 
 const BACKEND_URL = 'http://localhost:7422'
 const WEB_UI_URL = 'http://localhost:7422'
@@ -33,6 +48,7 @@ let backendProcess = null
 let backendReady = false
 let backendFailCount = 0
 let backendStableTimer = null
+let waitingForBackend = false
 const MAX_BACKEND_FAILURES = 3
 const BACKEND_STABLE_MS = 10000
 
@@ -48,6 +64,11 @@ function getBackendPath() {
 }
 
 function spawnBackend() {
+  if (backendProcess && !backendProcess.killed) {
+    console.log(`Backend already running (PID ${backendProcess.pid}), skipping duplicate spawn`)
+    return
+  }
+
   const backendPath = getBackendPath()
 
   if (!backendPath) {
@@ -121,36 +142,53 @@ function handleBackendCrash() {
 }
 
 async function waitForBackend(maxAttempts = 30, intervalMs = 1000) {
-  console.log('Waiting for backend to be ready...')
-
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const res = await fetch(`${BACKEND_URL}/health`, { signal: AbortSignal.timeout(1000) })
-      if (res.ok) {
-        console.log(`Backend ready after ${i + 1}s`)
-        backendReady = true
-        setTrayIdle()
-        pollAlerts()
-        pollTimer = setInterval(pollAlerts, POLL_INTERVAL_MS)
-        // Only clear the failure count once the backend has stayed up for a
-        // while — a backend that passes the health check and then crashes a
-        // second later is still crash-looping, not recovered.
-        if (backendStableTimer) clearTimeout(backendStableTimer)
-        backendStableTimer = setTimeout(() => {
-          backendFailCount = 0
-          backendStableTimer = null
-        }, BACKEND_STABLE_MS)
-        return
-      }
-    } catch {
-      // Not ready yet — keep waiting
-    }
-    await new Promise((r) => setTimeout(r, intervalMs))
+  // Guards against two overlapping poll loops — e.g. the initial
+  // whenReady() call still polling while a slow-to-bind (not actually
+  // dead) backend process trips the exit handler for an unrelated reason
+  // and handleBackendCrash() starts a second retry loop. Without this,
+  // the second loop's first failed health check could look like grounds
+  // to call spawnBackend() again elsewhere, spawning a silent orphan next
+  // to the original process that was simply still starting up.
+  if (waitingForBackend) {
+    console.log('Already waiting for backend, skipping duplicate wait loop')
+    return
   }
+  waitingForBackend = true
 
-  console.error('Backend failed to start within 30 seconds')
-  setTrayWarning()
-  tray.setToolTip('V-LAW — Backend failed to start. Right-click → Restart Backend.')
+  try {
+    console.log('Waiting for backend to be ready...')
+
+    for (let i = 0; i < maxAttempts; i++) {
+      try {
+        const res = await fetch(`${BACKEND_URL}/health`, { signal: AbortSignal.timeout(1000) })
+        if (res.ok) {
+          console.log(`Backend ready after ${i + 1}s`)
+          backendReady = true
+          setTrayIdle()
+          pollAlerts()
+          pollTimer = setInterval(pollAlerts, POLL_INTERVAL_MS)
+          // Only clear the failure count once the backend has stayed up for a
+          // while — a backend that passes the health check and then crashes a
+          // second later is still crash-looping, not recovered.
+          if (backendStableTimer) clearTimeout(backendStableTimer)
+          backendStableTimer = setTimeout(() => {
+            backendFailCount = 0
+            backendStableTimer = null
+          }, BACKEND_STABLE_MS)
+          return
+        }
+      } catch {
+        // Not ready yet — keep waiting
+      }
+      await new Promise((r) => setTimeout(r, intervalMs))
+    }
+
+    console.error('Backend failed to start within 30 seconds')
+    setTrayWarning()
+    tray.setToolTip('V-LAW — Backend failed to start. Right-click → Restart Backend.')
+  } finally {
+    waitingForBackend = false
+  }
 }
 
 function httpRequest(method, urlPath, body) {
@@ -355,7 +393,7 @@ function setTrayIcon(iconName, tooltip) {
   tray.setToolTip(tooltip)
 }
 
-const APP_VERSION = '0.1.1-beta'
+const APP_VERSION = '0.2.0-beta'
 
 function setTrayIdle() {
   const tooltip = activeSessionCount > 0

@@ -82,7 +82,7 @@ logging.basicConfig(
 logger = logging.getLogger("vlaw")
 logger.info("V-LAW backend starting. BASE_DIR=%s", BASE_DIR)
 
-VERSION = "0.1.1-beta"
+VERSION = "0.2.0-beta"
 PORT = int(os.environ.get("VLAW_PORT", 7422))
 
 _state: dict = {}
