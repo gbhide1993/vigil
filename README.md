@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/badge/license-Proprietary-red)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
-![Version](https://img.shields.io/badge/version-1.0.0--beta-orange)
+![Version](https://img.shields.io/badge/version-0.1.1--beta-orange)
 ![Downloads](https://img.shields.io/github/downloads/gbhide1993/vlaw/total)
 
 Local OS-level monitor for Claude Code, Cursor, and Copilot.  
@@ -13,7 +13,7 @@ Tray icon goes red when agents access files, network, credentials, or spawn susp
 
 ## Download
 
-### [⬇ Download VLaw-Setup.exe — v1.0.0 Beta](https://github.com/gbhide1993/vlaw/releases/tag/v1.0.0-beta)
+### [⬇ Download VLaw-Setup.exe — v0.1.1-beta](https://github.com/gbhide1993/vlaw/releases/download/v0.1.1-beta/VLaw-Setup.exe)
 
 Windows 10/11 · 101MB · One-click install
 
