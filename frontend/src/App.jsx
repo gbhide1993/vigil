@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react'
 import Sidebar from './components/Sidebar'
-import LiveFeed from './components/LiveFeed'
+import Status from './components/Status'
+import Incidents from './components/Incidents'
+import History from './components/History'
 import AgentDetail from './components/AgentDetail'
-import Alerts from './components/Alerts'
-import Export from './components/Export'
+import Settings from './components/Settings'
 import { api } from './api'
 
 export default function App() {
-  const [view, setView] = useState('live')
+  const [view, setView] = useState('status')
   const [openAlertCount, setOpenAlertCount] = useState(0)
 
   useEffect(() => {
@@ -32,10 +33,11 @@ export default function App() {
     <div className="app-shell">
       <Sidebar view={view} onNavigate={setView} openAlertCount={openAlertCount} />
       <main className="main-content">
-        {view === 'live' && <LiveFeed />}
+        {view === 'status' && <Status onNavigate={setView} />}
+        {view === 'incidents' && <Incidents onNavigate={setView} />}
+        {view === 'history' && <History />}
         {view === 'agents' && <AgentDetail />}
-        {view === 'alerts' && <Alerts onNavigate={setView} />}
-        {view === 'export' && <Export />}
+        {view === 'settings' && <Settings />}
       </main>
     </div>
   )

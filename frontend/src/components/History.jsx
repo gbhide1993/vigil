@@ -328,6 +328,19 @@ export default function History() {
           </div>
         </div>
       </div>
+
+      <div className="history-export-row">
+        <span className="history-export-label mono">
+          {filteredEvents.length} events
+          {query ? ` matching "${query}"` : ' in current view'}
+        </span>
+        <button
+          className="btn-export-inline"
+          onClick={() => window.open(api.exportPdfUrl(new Date().toISOString().slice(0, 10)), '_blank')}
+        >
+          Export session report →
+        </button>
+      </div>
     </div>
   )
 }

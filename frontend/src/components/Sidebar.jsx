@@ -2,10 +2,10 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 
 const NAV_ITEMS = [
-  { key: 'live', label: 'Live Feed' },
-  { key: 'agents', label: 'Agent Detail' },
-  { key: 'alerts', label: 'Alerts' },
-  { key: 'export', label: 'Export' },
+  { key: 'status', label: 'Status' },
+  { key: 'incidents', label: 'Incidents' },
+  { key: 'history', label: 'History' },
+  { key: 'settings', label: 'Settings' },
 ]
 
 function statusDotColor(agent) {
@@ -52,12 +52,12 @@ export default function Sidebar({ view, onNavigate, openAlertCount }) {
             onClick={() => onNavigate(item.key)}
           >
             <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              {item.key === 'agents' && pendingCount > 0 && <span className="status-dot amber" />}
-              {item.key === 'agents' && pendingCount > 0
+              {item.key === 'status' && pendingCount > 0 && <span className="status-dot amber" />}
+              {item.key === 'status' && pendingCount > 0
                 ? `${item.label} (${pendingCount} pending)`
                 : item.label}
             </span>
-            {item.key === 'alerts' && openAlertCount > 0 && (
+            {item.key === 'incidents' && openAlertCount > 0 && (
               <span className="sidebar-badge">{openAlertCount}</span>
             )}
           </button>
