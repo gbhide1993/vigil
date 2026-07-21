@@ -71,6 +71,7 @@ class Alerter:
         extra_detail: dict | None = None,
         rule_type: str = "policy",
         target: str | None = None,
+        session_id: str | None = None,
     ) -> int | None:
         """Create an alert row and its corresponding audit_log entry.
         Returns the new alert's id, or None if the alert was suppressed
@@ -95,10 +96,10 @@ class Alerter:
 
         cur = await db.execute(
             """
-            INSERT INTO alerts (event_id, agent_id, severity, title, description, rule_type)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO alerts (event_id, agent_id, severity, title, description, rule_type, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (event_id, agent_id, severity, title, description, rule_type),
+            (event_id, agent_id, severity, title, description, rule_type, session_id),
         )
         alert_id = cur.lastrowid
 

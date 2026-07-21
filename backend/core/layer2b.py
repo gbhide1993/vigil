@@ -182,6 +182,7 @@ async def score_session_2b(session_id: str, agent_id: int, agent_name: str, db) 
                 },
                 rule_type="rolling_anomaly",
                 target=metric_name,
+                session_id=session_id,
             )
             alert_ids.append(alert_id)
     except Exception as e:

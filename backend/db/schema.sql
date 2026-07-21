@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS alerts (
     rule_type TEXT DEFAULT 'policy', -- 'policy' or 'red_line' — red_line
                                       -- alerts are the non-disableable floor
                                       -- and cannot be resolved from the UI
+    session_id TEXT,              -- set directly by session-level detectors
+                                   -- (e.g. Layer 2b) that have no single
+                                   -- triggering event_id to join through
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
