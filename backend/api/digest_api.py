@@ -4,6 +4,7 @@ import httpx
 from fastapi import APIRouter
 
 from api.config_api import get_config_value
+from core.analytics import track
 from core.config_auditor import audit_all_configs
 from db.database import get_db
 
@@ -290,10 +291,17 @@ async def send_webhook():
     "reason": ...} instead of propagating an exception."""
     db = await get_db()
     url = await get_config_value(db, "webhook_url")
+
+    digest = await _build_daily_digest(db)
+    await track("digest_sent", {
+        "webhook_configured": bool(url),
+        "clean": digest.get("clean", True),
+        "days_clean": digest.get("proof_of_value", {}).get("days_clean", 0),
+    })
+
     if not url:
         return {"sent": False, "reason": "No webhook URL configured"}
 
-    digest = await _build_daily_digest(db)
     payload = format_webhook_payload(digest)
 
     async with httpx.AsyncClient() as client:

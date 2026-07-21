@@ -1,6 +1,14 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
 import { parseQuery } from '../queryParser'
+
+function debounce(fn, delay) {
+  let timer
+  return (...args) => {
+    clearTimeout(timer)
+    timer = setTimeout(() => fn(...args), delay)
+  }
+}
 
 const QUICK_FILTERS = [
   { label: 'After 6pm', query: 'after 6pm' },
@@ -159,8 +167,20 @@ export default function History() {
     }
   }, [])
 
+  const trackQueryDebounced = useCallback(
+    debounce((q, count) => {
+      if (q.trim()) {
+        api.trackEvent('query_used', { query_length: q.length, result_count: count })
+      }
+    }, 600),
+    []
+  )
+
   useEffect(() => {
-    setFilteredEvents(parseQuery(query, events))
+    const result = parseQuery(query, events)
+    setFilteredEvents(result)
+    trackQueryDebounced(query, result.length)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query, events])
 
   const netEvents = events.filter((e) => e.event_type === 'net_connect')
@@ -336,7 +356,10 @@ export default function History() {
         </span>
         <button
           className="btn-export-inline"
-          onClick={() => window.open(api.exportPdfUrl(new Date().toISOString().slice(0, 10)), '_blank')}
+          onClick={() => {
+            api.trackEvent('export_clicked', { source: 'history' })
+            window.open(api.exportPdfUrl(new Date().toISOString().slice(0, 10)), '_blank')
+          }}
         >
           Export session report →
         </button>

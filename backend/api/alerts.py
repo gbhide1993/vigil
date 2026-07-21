@@ -3,6 +3,7 @@ import json
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from core.analytics import track
 from db.database import get_db
 
 router = APIRouter()
@@ -52,12 +53,15 @@ async def get_alerts(
 
     cur = await db.execute(
         f"""
-        SELECT al.*, a.name as agent_name, e.session_id as session_id, e.path as event_path,
+        SELECT al.id, al.event_id, al.agent_id, al.severity, al.title, al.description,
+            al.status, al.resolved_by, al.resolved_at, al.resolution_note, al.rule_type,
+            al.created_at, a.name as agent_name,
+            COALESCE(al.session_id, e.session_id) as session_id, e.path as event_path,
             s.summary as session_summary
         FROM alerts al
         LEFT JOIN agents a ON a.id = al.agent_id
         LEFT JOIN events e ON e.id = al.event_id
-        LEFT JOIN sessions s ON s.id = e.session_id
+        LEFT JOIN sessions s ON s.id = COALESCE(al.session_id, e.session_id)
         {where}
         ORDER BY al.created_at DESC
         """,
@@ -117,7 +121,7 @@ async def resolve_alert(alert_id: int, body: ResolveAlertRequest):
         raise HTTPException(status_code=400, detail=f"resolution_note is required for action '{body.action}'")
 
     db = await get_db()
-    cur = await db.execute("SELECT id, rule_type FROM alerts WHERE id = ?", (alert_id,))
+    cur = await db.execute("SELECT id, rule_type, severity FROM alerts WHERE id = ?", (alert_id,))
     alert = await cur.fetchone()
     if alert is None:
         raise HTTPException(status_code=404, detail="alert not found")
@@ -148,6 +152,8 @@ async def resolve_alert(alert_id: int, body: ResolveAlertRequest):
         ),
     )
     await db.commit()
+
+    await track("alert_resolved", {"severity": alert["severity"], "rule_type": alert["rule_type"]})
 
     return {"id": alert_id, "status": new_status}
 

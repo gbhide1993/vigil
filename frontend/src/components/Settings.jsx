@@ -177,6 +177,63 @@ function ConfigAuditSection() {
   )
 }
 
+function AnalyticsSection() {
+  const [analytics, setAnalytics] = useState(null)
+
+  useEffect(() => {
+    let cancelled = false
+    async function load() {
+      try {
+        const data = await api.getAnalyticsSummary()
+        if (!cancelled) setAnalytics(data)
+      } catch {
+        // non-fatal; section just stays empty
+      }
+    }
+    load()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  return (
+    <div className="settings-section">
+      <h3>Usage Analytics</h3>
+      <p className="settings-desc">Local only. Never transmitted. Shows which features you actually use.</p>
+      {analytics && analytics.total_events > 0 ? (
+        <div className="analytics-grid">
+          <div className="analytics-item">
+            <span className="analytics-val mono">{analytics.days_active}</span>
+            <span className="analytics-label">days active</span>
+          </div>
+          <div className="analytics-item">
+            <span className="analytics-val mono">{analytics.events_by_type?.dashboard_open || 0}</span>
+            <span className="analytics-label">times opened</span>
+          </div>
+          <div className="analytics-item">
+            <span className="analytics-val mono">{analytics.events_by_type?.incident_viewed || 0}</span>
+            <span className="analytics-label">incidents viewed</span>
+          </div>
+          <div className="analytics-item">
+            <span className="analytics-val mono">{analytics.queries_run || 0}</span>
+            <span className="analytics-label">queries run</span>
+          </div>
+          <div className="analytics-item">
+            <span className="analytics-val mono">{analytics.digests_sent || 0}</span>
+            <span className="analytics-label">digests sent</span>
+          </div>
+          <div className="analytics-item">
+            <span className="analytics-val mono">{analytics.most_used_view || '—'}</span>
+            <span className="analytics-label">most used view</span>
+          </div>
+        </div>
+      ) : (
+        <p style={{ fontSize: '.82rem', color: '#94a3b8' }}>No usage data yet.</p>
+      )}
+    </div>
+  )
+}
+
 export default function Settings() {
   return (
     <div className="settings-page">
@@ -190,6 +247,7 @@ export default function Settings() {
       <AgentsSection />
       <WebhookSection />
       <ConfigAuditSection />
+      <AnalyticsSection />
     </div>
   )
 }

@@ -29,9 +29,19 @@ export default function App() {
     }
   }, [])
 
+  useEffect(() => {
+    api.trackEvent('dashboard_open', { view })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  function handleNavigate(newView) {
+    api.trackEvent('view_changed', { view: newView })
+    setView(newView)
+  }
+
   return (
     <div className="app-shell">
-      <Sidebar view={view} onNavigate={setView} openAlertCount={openAlertCount} />
+      <Sidebar view={view} onNavigate={handleNavigate} openAlertCount={openAlertCount} />
       <main className="main-content">
         {view === 'status' && <Status onNavigate={setView} />}
         {view === 'incidents' && <Incidents onNavigate={setView} />}

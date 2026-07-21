@@ -51,4 +51,13 @@ export const api = {
   sendTestWebhook: () => request('/digest/send-webhook', { method: 'POST' }),
   exportJsonUrl: (date) => `${BASE}/export/json?date=${date}`,
   exportPdfUrl: (date) => `${BASE}/export/pdf?date=${date}`,
+  getAnalyticsSummary: () => request('/analytics/summary'),
+  trackEvent: (event, properties = {}) => {
+    // Fire and forget — never await this, never let it throw.
+    fetch(`${BASE}/analytics/track`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event, properties }),
+    }).catch(() => {})
+  },
 }

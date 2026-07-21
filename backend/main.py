@@ -58,7 +58,7 @@ from fastapi import FastAPI, APIRouter
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from api import agents, alerts, config_api, digest_api, events, export, sessions
+from api import agents, alerts, analytics_api, config_api, digest_api, events, export, sessions
 from config.policy import load_policy
 from core.aggregator import Aggregator
 from core.attributor import Attributor
@@ -232,6 +232,7 @@ app.include_router(export.router)
 app.include_router(digest_api.router)
 app.include_router(sessions.router)
 app.include_router(config_api.router)
+app.include_router(analytics_api.router)
 
 # The built frontend calls /api/* (see frontend/src/api.js). In dev, Vite's
 # proxy strips that prefix before forwarding to the backend; in production
@@ -243,6 +244,7 @@ app.include_router(export.router, prefix="/api")
 app.include_router(digest_api.router, prefix="/api")
 app.include_router(sessions.router, prefix="/api")
 app.include_router(config_api.router, prefix="/api")
+app.include_router(analytics_api.router, prefix="/api")
 
 
 @app.get("/stats")
