@@ -119,6 +119,14 @@ CREATE TABLE IF NOT EXISTS stats_kv (
     value INTEGER DEFAULT 0
 );
 
+-- Generic app config (e.g. webhook_url) — string values, unlike stats_kv's
+-- integer counters. Read/written via backend/api/config_api.py.
+CREATE TABLE IF NOT EXISTS app_config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_id);
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);

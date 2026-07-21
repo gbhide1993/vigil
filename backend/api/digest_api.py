@@ -1,7 +1,9 @@
 import json
 
+import httpx
 from fastapi import APIRouter
 
+from api.config_api import get_config_value
 from core.config_auditor import audit_all_configs
 from db.database import get_db
 
@@ -128,10 +130,7 @@ async def _build_proof_of_value(db) -> dict:
     }
 
 
-@router.get("/digest/daily")
-async def get_daily_digest():
-    db = await get_db()
-
+async def _build_daily_digest(db) -> dict:
     cur = await db.execute(
         "SELECT COUNT(*) c FROM alerts WHERE created_at > datetime('now', '-24 hours')"
     )
@@ -207,6 +206,12 @@ async def get_daily_digest():
     }
 
 
+@router.get("/digest/daily")
+async def get_daily_digest():
+    db = await get_db()
+    return await _build_daily_digest(db)
+
+
 @router.get("/digest/proof-of-value")
 async def get_proof_of_value():
     """Standalone endpoint so the web UI's Live Feed can show this as a
@@ -214,3 +219,87 @@ async def get_proof_of_value():
     _build_proof_of_value() logic /digest/daily uses, not a duplicate."""
     db = await get_db()
     return await _build_proof_of_value(db)
+
+
+def format_webhook_payload(digest: dict) -> dict:
+    """Formats the daily digest as a Slack Block Kit message. Compatible
+    with: Slack Incoming Webhooks, Teams Incoming Webhooks, Discord
+    webhooks (falls back to the `text` field)."""
+    pov = digest.get("proof_of_value", {})
+    days_clean = pov.get("days_clean", 0)
+    agents = pov.get("agents_watched", 0)
+    files = pov.get("files_monitored_7d", 0)
+    destinations = pov.get("network_destinations_verified_7d", 0)
+    config = pov.get("config_audit_summary", "unknown")
+    red_lines = digest.get("red_line_count", 0)
+    meaningful = digest.get("meaningful_alerts_24h", 0)
+    is_clean = digest.get("clean", True)
+
+    if is_clean and days_clean > 0:
+        status_emoji = "🟢"
+        status_text = f"{days_clean} day{'s' if days_clean != 1 else ''} clean"
+    elif red_lines > 0:
+        status_emoji = "🔴"
+        status_text = f"{red_lines} Red Line alert{'s' if red_lines != 1 else ''} today"
+    else:
+        status_emoji = "🟡"
+        status_text = f"{meaningful} alert{'s' if meaningful != 1 else ''} today"
+
+    text = (
+        f"{status_emoji} *Vigil Morning Digest*\n"
+        f"{status_text} · {agents} agent{'s' if agents != 1 else ''} watched · "
+        f"{files} files monitored · {destinations} destinations verified\n"
+        f"Config: {config}"
+    )
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"{status_emoji} Vigil Morning Digest"},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Status*\n{status_text}"},
+                {"type": "mrkdwn", "text": f"*Agents watched*\n{agents}"},
+                {"type": "mrkdwn", "text": f"*Files monitored*\n{files}"},
+                {"type": "mrkdwn", "text": f"*Destinations verified*\n{destinations}"},
+            ],
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Config audit:* {config}"},
+        },
+        {"type": "divider"},
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": "Vigil · Local AI Agent Watchdog · getvvault.com/vigil"}],
+        },
+    ]
+
+    return {"text": text, "blocks": blocks}
+
+
+@router.post("/digest/send-webhook")
+async def send_webhook():
+    """POSTs the current digest to the configured webhook URL, formatted
+    as a Slack Block Kit message. Used by both the tray's 9AM cron and
+    the Settings page's manual "Send test" button. Never raises — a
+    misconfigured or unreachable webhook must not break the digest flow
+    that calls this, so every failure path returns {"sent": False,
+    "reason": ...} instead of propagating an exception."""
+    db = await get_db()
+    url = await get_config_value(db, "webhook_url")
+    if not url:
+        return {"sent": False, "reason": "No webhook URL configured"}
+
+    digest = await _build_daily_digest(db)
+    payload = format_webhook_payload(digest)
+
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(url, json=payload, timeout=10.0)
+            resp.raise_for_status()
+            return {"sent": True, "status_code": resp.status_code}
+        except Exception as e:
+            return {"sent": False, "reason": str(e)}

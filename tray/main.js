@@ -385,6 +385,19 @@ async function triggerDigestNow() {
   } catch (err) {
     console.error('digest trigger failed:', err.message)
   }
+
+  // Fire-and-forget: a webhook failure (unconfigured, unreachable, bad
+  // URL) must never affect the toast above, which has already shown by
+  // the time this runs.
+  httpRequest('POST', '/digest/send-webhook')
+    .then(({ body }) => {
+      if (body && body.sent) {
+        console.log('Morning digest sent to webhook')
+      } else if (body) {
+        console.log('Webhook send skipped:', body.reason)
+      }
+    })
+    .catch((err) => console.log('Webhook send failed (non-critical):', err.message))
 }
 
 function setTrayIcon(iconName, tooltip) {

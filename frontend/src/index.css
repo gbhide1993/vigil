@@ -811,6 +811,29 @@ tbody tr:hover {
 
 .btn-settings-save:hover { opacity: .85; }
 
+.btn-settings-test {
+  background: none;
+  border: 1px solid rgba(13, 148, 136, .30);
+  color: var(--color-teal);
+  padding: 9px 18px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: .82rem;
+  transition: all .18s;
+  white-space: nowrap;
+}
+
+.btn-settings-test:hover {
+  background: rgba(13, 148, 136, .08);
+  border-color: var(--color-teal);
+}
+
+.btn-settings-test:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .settings-note {
   font-size: .76rem;
   color: #94a3b8;

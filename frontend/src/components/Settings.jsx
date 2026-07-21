@@ -54,12 +54,52 @@ function AgentsSection() {
 function WebhookSection() {
   const [webhookUrl, setWebhookUrl] = useState(() => localStorage.getItem(WEBHOOK_STORAGE_KEY) || '')
   const [saved, setSaved] = useState(false)
+  const [saveError, setSaveError] = useState(null)
+  const [testStatus, setTestStatus] = useState(null)
 
-  function handleSaveWebhook() {
+  useEffect(() => {
+    let cancelled = false
+    async function load() {
+      try {
+        const data = await api.getWebhookUrl()
+        if (!cancelled && data.url) {
+          setWebhookUrl(data.url)
+          localStorage.setItem(WEBHOOK_STORAGE_KEY, data.url)
+        }
+      } catch {
+        // backend unreachable — keep showing the cached localStorage value
+      }
+    }
+    load()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  async function handleSaveWebhook() {
+    setSaveError(null)
     localStorage.setItem(WEBHOOK_STORAGE_KEY, webhookUrl)
-    setSaved(true)
-    setTimeout(() => setSaved(false), 2000)
+    try {
+      await api.setWebhookUrl(webhookUrl)
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+    } catch (err) {
+      setSaveError(err.message)
+    }
   }
+
+  async function handleTestWebhook() {
+    setTestStatus('sending')
+    try {
+      const data = await api.sendTestWebhook()
+      setTestStatus(data.sent ? 'success' : 'failed')
+    } catch {
+      setTestStatus('failed')
+    }
+    setTimeout(() => setTestStatus(null), 3000)
+  }
+
+  const testLabel = { sending: 'Sending...', success: '✓ Sent', failed: '✗ Failed' }[testStatus] || 'Send test'
 
   return (
     <div className="settings-section">
@@ -78,9 +118,13 @@ function WebhookSection() {
         <button className="btn-settings-save" onClick={handleSaveWebhook}>
           {saved ? '✓ Saved' : 'Save'}
         </button>
+        <button className="btn-settings-test" onClick={handleTestWebhook} disabled={!webhookUrl || testStatus === 'sending'}>
+          {testLabel}
+        </button>
       </div>
+      {saveError && <p className="settings-note" style={{ color: 'var(--critical)', fontStyle: 'normal' }}>Save failed: {saveError}</p>}
       <p className="settings-note">
-        Webhook delivery coming in next update. Save your URL now and it will activate automatically.
+        Webhook delivery sends at 9AM daily via the desktop tray app.
       </p>
     </div>
   )

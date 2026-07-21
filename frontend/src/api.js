@@ -35,11 +35,20 @@ export const api = {
     request(`/alerts/${alertId}/resolve`, { method: 'POST', body: JSON.stringify(body) }),
   bulkDismissAlerts: (severity) =>
     request(`/alerts/bulk-dismiss?severity=${severity}`, { method: 'POST' }),
+  getSessionEvents: (sessionId, agentId) => {
+    const qs = new URLSearchParams({ agent: agentId, limit: 500 }).toString()
+    return request(`/events?${qs}`).then((data) => ({
+      events: data.events.filter((e) => e.session_id === sessionId),
+    }))
+  },
   getStats: () => request('/stats'),
   getHealth: () => request('/health'),
   getInsights: () => request('/insights'),
   getProofOfValue: () => request('/digest/proof-of-value'),
   getConfigAudit: () => request('/config-audit'),
+  getWebhookUrl: () => request('/config/webhook-url'),
+  setWebhookUrl: (url) => request('/config/webhook-url', { method: 'POST', body: JSON.stringify({ url }) }),
+  sendTestWebhook: () => request('/digest/send-webhook', { method: 'POST' }),
   exportJsonUrl: (date) => `${BASE}/export/json?date=${date}`,
   exportPdfUrl: (date) => `${BASE}/export/pdf?date=${date}`,
 }
