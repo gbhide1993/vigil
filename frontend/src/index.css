@@ -866,6 +866,33 @@ tbody tr:hover {
 
 .settings-missing-row:last-child { border-bottom: none; }
 
+.analytics-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+  margin-top: 8px;
+}
+
+.analytics-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.analytics-val {
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: var(--color-navy);
+  line-height: 1;
+}
+
+.analytics-label {
+  font-size: .72rem;
+  color: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+
 /* ---- History export row ---- */
 
 .history-export-row {
