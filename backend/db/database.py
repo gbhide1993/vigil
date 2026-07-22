@@ -48,6 +48,9 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     if "rule_type" not in columns:
         await db.execute("ALTER TABLE alerts ADD COLUMN rule_type TEXT DEFAULT 'policy'")
         await db.commit()
+    if "session_id" not in columns:
+        await db.execute("ALTER TABLE alerts ADD COLUMN session_id TEXT")
+        await db.commit()
 
     cur = await db.execute("PRAGMA table_info(sessions)")
     columns = {row["name"] for row in await cur.fetchall()}

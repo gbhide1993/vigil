@@ -10,7 +10,8 @@ async def get_events(
     agent: int | None = Query(default=None),
     type: str | None = Query(default=None),
     since: str | None = Query(default=None),
-    limit: int = Query(default=50, le=500),
+    session: str | None = Query(default=None),
+    limit: int = Query(default=50, le=2000),
 ):
     db = await get_db()
 
@@ -26,6 +27,9 @@ async def get_events(
     if since is not None:
         clauses.append("created_at >= ?")
         params.append(since)
+    if session is not None:
+        clauses.append("session_id = ?")
+        params.append(session)
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     params.append(limit)

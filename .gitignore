@@ -69,3 +69,5 @@ tray/vlaw-backend.exe
 
 # Runtime policy (generated, not source)
 backend/policy/
+
+scanner/

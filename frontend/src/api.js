@@ -36,10 +36,8 @@ export const api = {
   bulkDismissAlerts: (severity) =>
     request(`/alerts/bulk-dismiss?severity=${severity}`, { method: 'POST' }),
   getSessionEvents: (sessionId, agentId) => {
-    const qs = new URLSearchParams({ agent: agentId, limit: 500 }).toString()
-    return request(`/events?${qs}`).then((data) => ({
-      events: data.events.filter((e) => e.session_id === sessionId),
-    }))
+    const qs = new URLSearchParams({ session: sessionId, agent: agentId, limit: 2000 }).toString()
+    return request(`/events?${qs}`)
   },
   getStats: () => request('/stats'),
   getHealth: () => request('/health'),

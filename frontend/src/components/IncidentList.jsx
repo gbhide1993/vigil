@@ -26,11 +26,12 @@ const STORY_LABELS = {
   file_write: { action: 'wrote to', severity: 'medium' },
 }
 
-function buildStory(alert, relatedEvents) {
+function buildStory(alert, relatedEvents, fullTimeline = false) {
   const story = []
 
   relatedEvents
     .filter((event) => {
+      if (fullTimeline) return true
       if (!alert.created_at) return true
       const alertTime = new Date(alert.created_at.replace(' ', 'T') + 'Z').getTime()
       const eventTime = new Date(event.created_at.replace(' ', 'T') + 'Z').getTime()
@@ -53,9 +54,13 @@ function buildStory(alert, relatedEvents) {
   return story
 }
 
-function StoryTimeline({ story }) {
+function StoryTimeline({ story, fullTimeline }) {
   if (story.length === 0) {
-    return <div className="empty-state" style={{ padding: '16px 0' }}>No related events found for this window.</div>
+    return (
+      <div className="empty-state" style={{ padding: '16px 0' }}>
+        {fullTimeline ? 'No events found for this session.' : 'No related events found for this window.'}
+      </div>
+    )
   }
   return (
     <div className="story-timeline">
@@ -73,9 +78,10 @@ function StoryTimeline({ story }) {
   )
 }
 
-function IncidentCard({ alert, onNavigate, onResolved }) {
-  const [story, setStory] = useState(null)
+function IncidentCard({ alert, onResolved }) {
+  const [sessionEvents, setSessionEvents] = useState(null)
   const [expanded, setExpanded] = useState(true)
+  const [showFullTimeline, setShowFullTimeline] = useState(false)
   const [busy, setBusy] = useState(false)
   const [errorMsg, setErrorMsg] = useState(null)
   const isRedLine = alert.rule_type === 'red_line'
@@ -85,18 +91,20 @@ function IncidentCard({ alert, onNavigate, onResolved }) {
     async function load() {
       try {
         const data = await api.getSessionEvents(alert.session_id, alert.agent_id)
-        if (!cancelled) setStory(buildStory(alert, data.events))
+        if (!cancelled) setSessionEvents(data.events)
       } catch {
-        if (!cancelled) setStory([])
+        if (!cancelled) setSessionEvents([])
       }
     }
     if (alert.session_id) load()
-    else setStory([])
+    else setSessionEvents([])
     return () => {
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [alert.id])
+
+  const story = sessionEvents === null ? null : buildStory(alert, sessionEvents, showFullTimeline)
 
   async function handleResolve() {
     setBusy(true)
@@ -142,11 +150,11 @@ function IncidentCard({ alert, onNavigate, onResolved }) {
 
       {expanded && (
         <>
-          <StoryTimeline story={story || []} />
+          <StoryTimeline story={story || []} fullTimeline={showFullTimeline} />
 
           <div className="incident-footer">
-            <button className="btn ghost" onClick={() => onNavigate('agents')}>
-              Full timeline →
+            <button className="btn ghost" onClick={() => setShowFullTimeline((v) => !v)}>
+              {showFullTimeline ? '← Just this incident' : 'Full timeline →'}
             </button>
             <button className="btn ghost" onClick={handleExport}>
               Export PDF
@@ -171,7 +179,7 @@ export default function IncidentList({ alerts, onNavigate, onResolved }) {
   return (
     <div className="incident-list">
       {alerts.map((alert) => (
-        <IncidentCard key={alert.id} alert={alert} onNavigate={onNavigate} onResolved={onResolved} />
+        <IncidentCard key={alert.id} alert={alert} onResolved={onResolved} />
       ))}
     </div>
   )
