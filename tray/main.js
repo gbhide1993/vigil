@@ -32,15 +32,16 @@ app.on('second-instance', () => {
 const BACKEND_URL = 'http://localhost:7422'
 const WEB_UI_URL = 'http://localhost:7422'
 const POLL_INTERVAL_MS = 4000
+const TOOLTIP_POLL_INTERVAL_MS = 60000
 
 let tray = null
 let flyout = null
 let pollTimer = null
+let tooltipPollTimer = null
 let currentAlert = null
 let qualifyingCount = 0
 let consecutiveFailures = 0
 let lastNotifiedAlertId = undefined // undefined = not yet primed by first poll
-let activeSessionCount = 0
 
 const FAILURE_THRESHOLD = 3
 
@@ -167,6 +168,8 @@ async function waitForBackend(maxAttempts = 30, intervalMs = 1000) {
           setTrayIdle()
           pollAlerts()
           pollTimer = setInterval(pollAlerts, POLL_INTERVAL_MS)
+          updateTrayTooltip()
+          tooltipPollTimer = setInterval(updateTrayTooltip, TOOLTIP_POLL_INTERVAL_MS)
           // Only clear the failure count once the backend has stayed up for a
           // while — a backend that passes the health check and then crashes a
           // second later is still crash-looping, not recovered.
@@ -263,14 +266,50 @@ function withTruncatedAction(alert) {
   return { ...alert, action_display: truncateAction(rawAction) }
 }
 
-async function pollActiveSessionCount() {
+function formatMB(bytes) {
+  return (bytes / (1024 * 1024)).toFixed(1)
+}
+
+// Live status string for the tray tooltip, independent of the icon-driving
+// pollAlerts() loop above. Runs on its own 60s cadence per the first-run
+// spec — this is about giving a new user a plain-English read of "is it
+// working" at a glance, not about alerting, so it doesn't need pollAlerts()'s
+// 4s responsiveness.
+async function updateTrayTooltip() {
+  if (!backendReady || !tray) return
   try {
-    const { status, body } = await httpRequest('GET', '/sessions?status=open')
-    if (status === 200 && body) {
-      activeSessionCount = (body.sessions || []).length
+    // Neither endpoint supports a server-side `limit` — /sessions is already
+    // ordered newest-first, so slicing client-side after the fetch gives the
+    // same "most recent" result the spec asks for.
+    const [sessionsRes, openAlertsRes] = await Promise.all([
+      httpRequest('GET', '/sessions?limit=1'),
+      httpRequest('GET', '/alerts?status=open&limit=1'),
+    ])
+
+    const sessions = ((sessionsRes.body && sessionsRes.body.sessions) || []).slice(0, 1)
+    const openAlerts = (openAlertsRes.body && openAlertsRes.body.alerts) || []
+
+    if (sessions.length === 0) {
+      tray.setToolTip('Vigil — Watching. No sessions recorded yet.')
+      return
     }
+
+    if (openAlerts.length > 0) {
+      tray.setToolTip(`Vigil — ${openAlerts.length} alert${openAlerts.length !== 1 ? 's' : ''} need review.`)
+      return
+    }
+
+    const lastSession = sessions[0]
+    if (lastSession.ended_at == null) {
+      tray.setToolTip(`Vigil — Live: ${lastSession.agent_name || 'agent'} session in progress`)
+      return
+    }
+
+    const files = (lastSession.file_reads || 0) + (lastSession.file_writes || 0)
+    const mb = formatMB(lastSession.net_egress_bytes || 0)
+    tray.setToolTip(`Vigil — Last session clean. ${files} files, ${mb} MB egress.`)
   } catch (err) {
-    // non-fatal — tooltip just keeps the last known count until this succeeds again
+    // non-fatal — tooltip just keeps its last known text until this succeeds again
   }
 }
 
@@ -282,7 +321,6 @@ async function pollAlerts() {
       throw new Error(`unexpected response status ${status}`)
     }
     consecutiveFailures = 0
-    await pollActiveSessionCount()
     const alerts = (body.alerts || []).filter(isQualifyingAlert)
     if (alerts.length === 0) {
       currentAlert = null
@@ -400,19 +438,20 @@ async function triggerDigestNow() {
     .catch((err) => console.log('Webhook send failed (non-critical):', err.message))
 }
 
-function setTrayIcon(iconName, tooltip) {
+// Sets only the tray icon image. Tooltip text is owned exclusively by
+// updateTrayTooltip()'s 60s poll (see above) so the two don't fight over
+// tray.setToolTip() — this function used to also set a generic tooltip
+// on every 4s pollAlerts() tick, which clobbered the live status string.
+function setTrayIcon(iconName, fallbackTooltip) {
   if (!tray) return
   tray.setImage(path.join(__dirname, 'assets', iconName))
-  tray.setToolTip(tooltip)
+  if (!backendReady) tray.setToolTip(fallbackTooltip)
 }
 
 const APP_VERSION = '0.2.0-beta'
 
 function setTrayIdle() {
-  const tooltip = activeSessionCount > 0
-    ? `V-LAW v${APP_VERSION} — Watching ${activeSessionCount} agent${activeSessionCount !== 1 ? 's' : ''}. All clear.`
-    : `V-LAW v${APP_VERSION} — All clear`
-  setTrayIcon('icon_green.png', tooltip)
+  setTrayIcon('icon_green.png', `V-LAW v${APP_VERSION} — All clear`)
 }
 
 function setTrayAlert() {
@@ -540,6 +579,7 @@ function createTray() {
         click: () => {
           killBackendProcess()
           if (pollTimer) clearInterval(pollTimer)
+          if (tooltipPollTimer) clearInterval(tooltipPollTimer)
           if (backendStableTimer) {
             clearTimeout(backendStableTimer)
             backendStableTimer = null
@@ -629,6 +669,7 @@ app.on('window-all-closed', (e) => {
 
 app.on('before-quit', () => {
   if (pollTimer) clearInterval(pollTimer)
+  if (tooltipPollTimer) clearInterval(tooltipPollTimer)
   if (backendProcess) {
     console.log('Killing backend process before quit...')
     killBackendProcess()

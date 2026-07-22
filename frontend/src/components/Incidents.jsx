@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import IncidentList from './IncidentList'
+import SessionInsightCard from './SessionInsightCard'
 
 export default function Incidents({ onNavigate }) {
   const [alerts, setAlerts] = useState([])
@@ -32,6 +33,8 @@ export default function Incidents({ onNavigate }) {
           <div className="page-subtitle">HIGH and CRITICAL alerts, with full story context</div>
         </div>
       </div>
+
+      <SessionInsightCard />
 
       <div className="alerts-filter-bar">
         <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
