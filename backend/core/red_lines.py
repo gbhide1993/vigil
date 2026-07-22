@@ -329,7 +329,7 @@ class RedLines:
 
     async def _fire(
         self, agent_id: int, rule_key: str, severity: str, title: str, description: str, extra_detail: dict, target: str,
-        rule_type: str = "red_line",
+        rule_type: str = "red_line", session_id: str | None = None,
     ) -> None:
         """rule_type defaults to "red_line" — the non-disableable floor
         every existing call site relies on (api/alerts.py's resolve_alert
@@ -361,9 +361,10 @@ class RedLines:
             extra_detail=extra_detail,
             rule_type=rule_type,
             target=target,
+            session_id=session_id,
         )
 
-    async def check_ssh_access(self, agent_id: int, agent_name: str, path: str) -> None:
+    async def check_ssh_access(self, agent_id: int, agent_name: str, path: str, session_id: str | None = None) -> None:
         if not is_ssh_path(path):
             return
         await self._fire(
@@ -372,9 +373,10 @@ class RedLines:
             description=f"{agent_name} accessed your SSH directory. This is unusual and worth reviewing.",
             extra_detail={"path": path},
             target=path,
+            session_id=session_id,
         )
 
-    async def check_env_outside_workspace(self, agent_id: int, agent_name: str, path: str) -> None:
+    async def check_env_outside_workspace(self, agent_id: int, agent_name: str, path: str, session_id: str | None = None) -> None:
         if not is_env_outside_workspace(path):
             return
         await self._fire(
@@ -383,9 +385,10 @@ class RedLines:
             description=f"{agent_name} read an environment file outside your active project.",
             extra_detail={"path": path},
             target=path,
+            session_id=session_id,
         )
 
-    async def check_claude_cache_write(self, agent_id: int, agent_name: str, path: str, db) -> None:
+    async def check_claude_cache_write(self, agent_id: int, agent_name: str, path: str, db, session_id: str | None = None) -> None:
         """RL3: hidden cache directory write. Two tiers, distinguishing
         normal /rewind checkpoint activity from genuinely anomalous writes:
 
@@ -418,9 +421,14 @@ class RedLines:
                 extra_detail={"path": path},
                 target=directory,
                 rule_type="checkpoint_activity",
+                session_id=session_id,
             )
             return
 
+        # No active/recent session exists — leaving session_id unset here
+        # is intentional, not an oversight: this alert's entire premise is
+        # "no corresponding session was in progress," so attaching one
+        # would misrepresent what was actually observed.
         await self._fire(
             agent_id, "claude_cache_write", "high",
             title=f"RED LINE: {agent_name} wrote to hidden cache directory with no active session — unusual pattern",
@@ -431,7 +439,7 @@ class RedLines:
             target=directory,
         )
 
-    async def check_unknown_destination(self, agent_id: int, agent_name: str, destination: str) -> None:
+    async def check_unknown_destination(self, agent_id: int, agent_name: str, destination: str, session_id: str | None = None) -> None:
         if not is_unknown_destination(destination):
             return
         await self._fire(
@@ -440,9 +448,10 @@ class RedLines:
             description=f"{agent_name} connected to an unrecognised destination: {destination}",
             extra_detail={"destination": destination},
             target=destination,
+            session_id=session_id,
         )
 
-    async def check_dangerous_command(self, agent_id: int, agent_name: str, cmdline: str, exe_basename: str = "") -> None:
+    async def check_dangerous_command(self, agent_id: int, agent_name: str, cmdline: str, exe_basename: str = "", session_id: str | None = None) -> None:
         matched = is_dangerous_command(cmdline, exe_basename)
         if matched is None:
             return
@@ -452,9 +461,10 @@ class RedLines:
             description=f"{agent_name} spawned a potentially sensitive command: {cmdline}",
             extra_detail={"command": cmdline, "matched_pattern": matched},
             target=exe_basename or cmdline,
+            session_id=session_id,
         )
 
-    async def check_cross_project_read(self, agent_id: int, agent_name: str, path: str) -> None:
+    async def check_cross_project_read(self, agent_id: int, agent_name: str, path: str, session_id: str | None = None) -> None:
         if not is_cross_project_read(path):
             return
         await self._fire(
@@ -463,6 +473,7 @@ class RedLines:
             description=f"{agent_name} read files from a different project directory than the active workspace.",
             extra_detail={"path": path},
             target=path,
+            session_id=session_id,
         )
 
     # FIXED: previously used get_agent_for_pid's "first match" logic which could
@@ -493,6 +504,7 @@ class RedLines:
                              "official API host. Traffic and credentials may be routed to an attacker-controlled endpoint.",
                 extra_detail={"session_id": session_id, "var_name": var_name, "value": value, "pid": pid},
                 target=f"{var_name}={value}",
+                session_id=session_id,
             )
 
     def record_config_write(self, agent_id: int, config_path: str) -> None:
@@ -521,6 +533,7 @@ class RedLines:
     async def check_malicious_config_execution(
         self, agent_id: int, agent_name: str, config_path: str, config_write_ts: float,
         triggered_event_path: str, triggered_event_ts: float, prior_approved_sessions: int,
+        session_id: str | None = None,
     ) -> None:
         """RL7b: a project config write (.claude/settings.json, .cursor/config,
         .vscode/settings.json) immediately followed (<= CONFIG_EXEC_WINDOW_SECONDS)
@@ -557,6 +570,7 @@ class RedLines:
                 "prior_approved_sessions": prior_approved_sessions,
             },
             target=config_path,
+            session_id=session_id,
         )
 
     def record_mcp_config_write(self, agent_id: int, config_path: str) -> None:
@@ -585,6 +599,7 @@ class RedLines:
     async def check_mcp_auto_approval(
         self, agent_id: int, agent_name: str, mcp_config_path: str, config_write_ts: float,
         mcp_endpoint: str, mcp_connect_ts: float, is_approved_server: bool, prior_sessions_for_project: int,
+        session_id: str | None = None,
     ) -> bool:
         """RL8: Detect MCP server auto-approval from untrusted project
         config, matching the MCP attack surface disclosed in CVE-2026-21852
@@ -642,5 +657,6 @@ class RedLines:
                 "prior_sessions_for_project": prior_sessions_for_project,
             },
             target=mcp_endpoint,
+            session_id=session_id,
         )
         return True

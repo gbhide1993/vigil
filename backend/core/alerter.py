@@ -148,7 +148,9 @@ class Alerter:
 
     # --- Policy-driven rules not owned by a specific watcher ---------
 
-    async def check_credential_access(self, agent_id: int, path: str, event_id: int | None = None) -> None:
+    async def check_credential_access(
+        self, agent_id: int, path: str, event_id: int | None = None, session_id: str | None = None,
+    ) -> None:
         """HIGH: credential path accessed. MEDIUM instead for .env
         specifically, per the severity table."""
         is_dotenv = os.path.basename(path) == ".env"
@@ -162,9 +164,12 @@ class Alerter:
             event_id=event_id,
             extra_detail={"path": path},
             target=path,
+            session_id=session_id,
         )
 
-    async def check_out_of_scope_access(self, agent_id: int, path: str, event_id: int | None = None) -> None:
+    async def check_out_of_scope_access(
+        self, agent_id: int, path: str, event_id: int | None = None, session_id: str | None = None,
+    ) -> None:
         """MEDIUM: path accessed outside policy scope_directories, or
         CRITICAL if inside never_scope_directories."""
         db = await get_db()
@@ -184,6 +189,7 @@ class Alerter:
                 event_id=event_id,
                 extra_detail={"path": path},
                 target=path,
+                session_id=session_id,
             )
             return
 
@@ -198,6 +204,7 @@ class Alerter:
                 event_id=event_id,
                 extra_detail={"path": path},
                 target=path,
+                session_id=session_id,
             )
 
     async def check_anomaly_score(self, agent_id: int, session_id: str, anomaly_score: float) -> None:
@@ -211,6 +218,7 @@ class Alerter:
                 description=f"Session {session_id} scored {anomaly_score:.2f} vs this agent's baseline.",
                 reason="anomaly_score",
                 extra_detail={"session_id": session_id, "anomaly_score": anomaly_score},
+                session_id=session_id,
             )
 
     async def _get_policy_list(self, db, key: str) -> list[str]:

@@ -78,8 +78,8 @@ class VlawFileHandler(FileSystemEventHandler):
         agent_id = await self.attributor.get_or_create_agent(agent_name, pid)
         session_id = await self.attributor.sessions.touch(agent_id)
 
-        await self._check_red_lines(agent_id, agent_name, path, event_type)
-        await self._check_config_exec(agent_id, agent_name, path, event_type)
+        await self._check_red_lines(agent_id, agent_name, path, event_type, session_id)
+        await self._check_config_exec(agent_id, agent_name, path, event_type, session_id)
         await self._check_mcp_config_write(agent_id, path, event_type)
 
         await self.aggregator.ingest_file_event({
@@ -90,22 +90,22 @@ class VlawFileHandler(FileSystemEventHandler):
             "attribution_confidence": confidence,
         })
 
-    async def _check_red_lines(self, agent_id: int, agent_name: str, path: str, event_type: str) -> None:
+    async def _check_red_lines(self, agent_id: int, agent_name: str, path: str, event_type: str, session_id: str | None = None) -> None:
         """Red Line rules run before any policy-based check for the same
         event (the aggregator's check_out_of_scope_access/
         check_credential_access run later, either immediately or on
         flush)."""
         is_write = event_type in ("file_write", "file_delete")
 
-        await self.red_lines.check_ssh_access(agent_id, agent_name, path)
+        await self.red_lines.check_ssh_access(agent_id, agent_name, path, session_id=session_id)
         if is_write:
             db = await get_db()
-            await self.red_lines.check_claude_cache_write(agent_id, agent_name, path, db)
+            await self.red_lines.check_claude_cache_write(agent_id, agent_name, path, db, session_id=session_id)
         else:
-            await self.red_lines.check_env_outside_workspace(agent_id, agent_name, path)
-            await self.red_lines.check_cross_project_read(agent_id, agent_name, path)
+            await self.red_lines.check_env_outside_workspace(agent_id, agent_name, path, session_id=session_id)
+            await self.red_lines.check_cross_project_read(agent_id, agent_name, path, session_id=session_id)
 
-    async def _check_config_exec(self, agent_id: int, agent_name: str, path: str, event_type: str) -> None:
+    async def _check_config_exec(self, agent_id: int, agent_name: str, path: str, event_type: str, session_id: str | None = None) -> None:
         """RL7b (CVE-2025-59536 pattern): a project config write followed
         within RedLines.CONFIG_EXEC_WINDOW_SECONDS by a spawn/write elsewhere.
         State is shared at module level (core.red_lines._pending_config_writes)
@@ -129,6 +129,7 @@ class VlawFileHandler(FileSystemEventHandler):
             config_path=pending["path"], config_write_ts=pending["ts"],
             triggered_event_path=path, triggered_event_ts=time.time(),
             prior_approved_sessions=prior_approved_sessions,
+            session_id=session_id,
         )
 
     async def _check_mcp_config_write(self, agent_id: int, path: str, event_type: str) -> None:

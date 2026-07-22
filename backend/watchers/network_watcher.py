@@ -81,12 +81,12 @@ class NetworkWatcher:
 
             dest_label = known_hostname or ip
 
-            await self.red_lines.check_unknown_destination(agent_id, agent_name, dest_label)
+            await self.red_lines.check_unknown_destination(agent_id, agent_name, dest_label, session_id=session_id)
 
             is_approved = await self._is_approved_destination(db, dest_label, ip)
 
             if known_hostname is None and not is_approved:
-                await self._fire_unapproved_destination_alert(db, agent_id, dest_label, port)
+                await self._fire_unapproved_destination_alert(db, agent_id, dest_label, port, session_id)
 
             await self.aggregator.ingest_net_event({
                 "agent_id": agent_id,
@@ -139,7 +139,7 @@ class NetworkWatcher:
             return True
         return any(dest_label.endswith(suffix) for suffix in approved)
 
-    async def _fire_unapproved_destination_alert(self, db, agent_id: int, dest_label: str, port: int) -> None:
+    async def _fire_unapproved_destination_alert(self, db, agent_id: int, dest_label: str, port: int, session_id: str | None = None) -> None:
         await self.alerter.fire_alert(
             agent_id,
             "low",
@@ -148,4 +148,5 @@ class NetworkWatcher:
             reason="unapproved_destination",
             extra_detail={"host": dest_label, "port": port},
             target=dest_label,
+            session_id=session_id,
         )

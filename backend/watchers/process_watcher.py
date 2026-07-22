@@ -114,9 +114,9 @@ class ProcessWatcher:
             agent_id = await self.attributor.get_or_create_agent(agent_name, pid)
             session_id = await self.attributor.sessions.touch(agent_id)
 
-            await self.red_lines.check_dangerous_command(agent_id, agent_name, cmdline, exe_name)
+            await self.red_lines.check_dangerous_command(agent_id, agent_name, cmdline, exe_name, session_id=session_id)
 
-            await self._check_config_exec(agent_id, agent_name, exe_path or cmdline)
+            await self._check_config_exec(agent_id, agent_name, exe_path or cmdline, session_id)
 
             suspicious = _is_suspicious(cmdline, exe_name)
             severity = "medium" if suspicious else "low"
@@ -153,6 +153,7 @@ class ProcessWatcher:
                     event_id=event_id,
                     extra_detail={"pid": pid, "cmdline": cmdline},
                     target=exe_path,
+                    session_id=session_id,
                 )
 
         await db.commit()
@@ -233,7 +234,7 @@ class ProcessWatcher:
             hits.append({"pid": pid, "agent_name": agent_name, "agent_env": agent_env})
         return hits
 
-    async def _check_config_exec(self, agent_id: int, agent_name: str, spawned_path: str) -> None:
+    async def _check_config_exec(self, agent_id: int, agent_name: str, spawned_path: str, session_id: str | None = None) -> None:
         """RL7b (CVE-2025-59536 pattern), spawn-triggered half: consumes a
         pending config write recorded by file_watcher.py (shared module-level
         state in core.red_lines) if this spawn falls within the correlation
@@ -255,4 +256,5 @@ class ProcessWatcher:
             config_path=pending["path"], config_write_ts=pending["ts"],
             triggered_event_path=spawned_path, triggered_event_ts=time.time(),
             prior_approved_sessions=prior_approved_sessions,
+            session_id=session_id,
         )

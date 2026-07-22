@@ -110,7 +110,9 @@ class Aggregator:
                     buf["count"],
                 ),
             )
-            await self.alerter.check_out_of_scope_access(agent_id, directory, event_id=cur.lastrowid)
+            await self.alerter.check_out_of_scope_access(
+                agent_id, directory, event_id=cur.lastrowid, session_id=buf["session_id"],
+            )
 
         expired_net_keys = [
             k for k, v in self._net_buffer.items()
@@ -158,4 +160,6 @@ class Aggregator:
             ),
         )
         await db.commit()
-        await self.alerter.check_credential_access(event["agent_id"], event["path"], event_id=cur.lastrowid)
+        await self.alerter.check_credential_access(
+            event["agent_id"], event["path"], event_id=cur.lastrowid, session_id=event["session_id"],
+        )

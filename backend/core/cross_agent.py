@@ -162,6 +162,11 @@ async def check_cross_agent_file_conflict(db, window_minutes: int = 10) -> list[
             },
             rule_type="cross_agent_conflict",
             target=path,
+            # Attributed to agent_a's session — the alert itself is already
+            # attributed to agent_a_touch["agent_id"] above, so its own
+            # session (not agent_b's, a different agent entirely) is the
+            # correct match for the story timeline.
+            session_id=agent_a_touch["session_id"],
         )
         if alert_id is not None:
             fired.append(alert_id)

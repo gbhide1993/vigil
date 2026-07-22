@@ -77,6 +77,7 @@ async def _fire_verification_mismatch_alert(agent_id: int, agent_name: str, sess
         extra_detail={"session_id": session_id, "discrepancy_count": count, "discrepancies": discrepancies[:50]},
         rule_type="verification_mismatch",
         target=session_id,
+        session_id=session_id,
     )
 
 

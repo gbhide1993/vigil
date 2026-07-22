@@ -110,10 +110,10 @@ class McpWatcher:
         event_id = cur.lastrowid
 
         if not is_approved:
-            await self._check_mcp_auto_approval_or_fallback(db, agent_id, agent_name, endpoint, event_id)
+            await self._check_mcp_auto_approval_or_fallback(db, agent_id, agent_name, endpoint, event_id, session_id)
 
     async def _check_mcp_auto_approval_or_fallback(
-        self, db, agent_id: int, agent_name: str, endpoint: str, event_id: int,
+        self, db, agent_id: int, agent_name: str, endpoint: str, event_id: int, session_id: str | None = None,
     ) -> None:
         """RL8 (CVE-2026-21852 pattern): if this unapproved MCP connection
         immediately follows a .mcp.json write in an early session for this
@@ -131,11 +131,12 @@ class McpWatcher:
                 mcp_config_path=pending["path"], config_write_ts=pending["ts"],
                 mcp_endpoint=endpoint, mcp_connect_ts=time.time(),
                 is_approved_server=False, prior_sessions_for_project=prior_sessions,
+                session_id=session_id,
             )
             if rl8_applicable:
                 return  # RL8 is the applicable rule — don't also fire the generic alert
 
-        await self._fire_unapproved_mcp_alert(db, agent_id, endpoint, event_id)
+        await self._fire_unapproved_mcp_alert(db, agent_id, endpoint, event_id, session_id)
 
     async def _count_prior_sessions(self, db, agent_id: int) -> int:
         """Sessions for this agent, used as RL8's project-directory session
@@ -172,7 +173,7 @@ class McpWatcher:
         approved = json.loads(row["policy_value"])
         return endpoint in approved
 
-    async def _fire_unapproved_mcp_alert(self, db, agent_id: int, endpoint: str, event_id: int) -> None:
+    async def _fire_unapproved_mcp_alert(self, db, agent_id: int, endpoint: str, event_id: int, session_id: str | None = None) -> None:
         await self.alerter.fire_alert(
             agent_id,
             "high",
@@ -182,4 +183,5 @@ class McpWatcher:
             event_id=event_id,
             extra_detail={"endpoint": endpoint},
             target=endpoint,
+            session_id=session_id,
         )
