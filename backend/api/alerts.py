@@ -29,6 +29,12 @@ class CreateSuppressionRequest(BaseModel):
     reason: str | None = None
 
 
+class BulkResolveRequest(BaseModel):
+    session_id: str | None = None
+    older_than_hours: float | None = None
+    all: bool = False
+
+
 @router.get("/alerts")
 async def get_alerts(
     status: str | None = Query(default=None),
@@ -110,6 +116,70 @@ async def bulk_dismiss(severity: str = Query(...), actor: str = Query(default="a
         )
     await db.commit()
     return {"dismissed": len(ids)}
+
+
+@router.post("/alerts/bulk-resolve")
+async def bulk_resolve(body: BulkResolveRequest, actor: str = Query(default="admin")):
+    """Resolve many open alerts at once by filter — used operator-side to
+    clear backlogs (e.g. pre-fix alerts with no session_id) without walking
+    them one by one. Only ever updates status; never deletes, so resolved
+    alerts stay in the DB for audit."""
+    has_session_filter = "session_id" in body.model_fields_set
+    if not has_session_filter and body.older_than_hours is None and not body.all:
+        raise HTTPException(
+            status_code=400,
+            detail="must specify one of: session_id, older_than_hours, all",
+        )
+
+    db = await get_db()
+
+    clauses = ["al.status IN ('open', 'investigating')", "al.rule_type != 'red_line'"]
+    params: list = []
+
+    if has_session_filter:
+        if body.session_id is None:
+            clauses.append(
+                "al.id IN (SELECT al2.id FROM alerts al2 LEFT JOIN events e2 ON e2.id = al2.event_id "
+                "WHERE COALESCE(al2.session_id, e2.session_id) IS NULL)"
+            )
+        else:
+            clauses.append(
+                "al.id IN (SELECT al2.id FROM alerts al2 LEFT JOIN events e2 ON e2.id = al2.event_id "
+                "WHERE COALESCE(al2.session_id, e2.session_id) = ?)"
+            )
+            params.append(body.session_id)
+
+    if body.older_than_hours is not None:
+        clauses.append("al.created_at <= datetime('now', ?)")
+        params.append(f"-{body.older_than_hours} hours")
+
+    where = " AND ".join(clauses)
+
+    cur = await db.execute(f"SELECT al.id FROM alerts al WHERE {where}", params)
+    ids = [r["id"] for r in await cur.fetchall()]
+    if not ids:
+        return {"resolved": 0}
+
+    placeholders = ", ".join("?" for _ in ids)
+    await db.execute(
+        f"""
+        UPDATE alerts
+        SET status = 'resolved', resolved_by = ?, resolved_at = CURRENT_TIMESTAMP,
+            resolution_note = 'bulk resolved via /alerts/bulk-resolve'
+        WHERE id IN ({placeholders})
+        """,
+        (actor, *ids),
+    )
+    for alert_id in ids:
+        await db.execute(
+            """
+            INSERT INTO audit_log (action, entity_type, entity_id, actor, detail)
+            VALUES ('bulk_resolve', 'alert', ?, ?, ?)
+            """,
+            (alert_id, actor, json.dumps(body.model_dump(exclude_unset=True))),
+        )
+    await db.commit()
+    return {"resolved": len(ids)}
 
 
 @router.post("/alerts/{alert_id}/resolve")
