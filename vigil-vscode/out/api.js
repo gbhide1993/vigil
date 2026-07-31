@@ -1,11 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.VigilAPI = void 0;
-const undici_1 = require("undici");
-const _keepAliveAgent = new undici_1.Agent({
-    keepAliveTimeout: 10000,
-    connections: 2
-});
 const REQUEST_TIMEOUT_MS = 3000;
 const HEALTH_CHECK_TIMEOUT_MS = 10000;
 class VigilAPI {
@@ -19,7 +14,16 @@ class VigilAPI {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
         try {
-            return await fetch(url, { ...init, signal: controller.signal, dispatcher: _keepAliveAgent });
+            const response = await fetch(url, { ...init, signal: controller.signal });
+            // Consume the body so the underlying socket can be released back to the pool
+            let data = null;
+            try {
+                data = await response.json();
+            }
+            catch {
+                data = null;
+            }
+            return { ok: response.ok, status: response.status, data };
         }
         finally {
             clearTimeout(timer);
@@ -35,7 +39,7 @@ class VigilAPI {
             if (!res.ok) {
                 return null;
             }
-            return await res.json();
+            return res.data;
         }
         catch {
             return null;
@@ -47,7 +51,7 @@ class VigilAPI {
             if (!res.ok) {
                 return null;
             }
-            return await res.json();
+            return res.data;
         }
         catch {
             return null;

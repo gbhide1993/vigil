@@ -59,7 +59,7 @@ from fastapi import FastAPI, APIRouter
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from api import agents, alerts, analytics_api, config_api, digest_api, events, export, mcp_routes, platform_routes, sessions
+from api import agents, alerts, analytics_api, config_api, digest_api, events, export, git_routes, mcp_routes, platform_routes, sessions
 from config.policy import load_policy
 from core.aggregator import Aggregator
 from core.attributor import Attributor
@@ -240,8 +240,8 @@ async def lifespan(app: FastAPI):
     # ProcessWatcher._known_pids), so collapsing missed runs doesn't drop any
     # detection — there's no queued-event backlog to lose.
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(process_watcher.poll, "interval", seconds=30, id="process_watcher", max_instances=1, coalesce=True)
-    scheduler.add_job(network_watcher.poll, "interval", seconds=30, id="network_watcher", max_instances=1, coalesce=True)
+    # scheduler.add_job(process_watcher.poll, "interval", seconds=120, id="process_watcher", max_instances=1, coalesce=True)
+    scheduler.add_job(network_watcher.poll, "interval", seconds=120, id="network_watcher", max_instances=1, coalesce=True)
     scheduler.add_job(mcp_watcher.poll, "interval", seconds=30, id="mcp_watcher", max_instances=1, coalesce=True)
     scheduler.add_job(aggregator.flush_buffers, "interval", seconds=15, id="aggregator_flush", max_instances=1, coalesce=True)
     scheduler.add_job(_baseline_tick, "interval", hours=1, id="baseline_update", args=[baseline], max_instances=1, coalesce=True)
@@ -298,6 +298,7 @@ app.include_router(config_api.router)
 app.include_router(analytics_api.router)
 app.include_router(mcp_routes.router)
 app.include_router(platform_routes.router)
+app.include_router(git_routes.router)
 
 # The built frontend calls /api/* (see frontend/src/api.js). In dev, Vite's
 # proxy strips that prefix before forwarding to the backend; in production

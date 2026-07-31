@@ -4,6 +4,7 @@ FOR /F "tokens=5" %%P IN ('netstat -ano ^| findstr ":7422 " ^| findstr "LISTENIN
     echo [Vigil] Stopping existing process %%P...
     TaskKill /PID %%P /F >nul 2>&1
 )
+del /F /Q "%~dp0data\vigil.lock" 2>nul
 timeout /t 3 /nobreak >nul
 
 echo [Vigil] Starting backend...

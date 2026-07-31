@@ -41,7 +41,7 @@
           "description": "Port where Vigil is running"
         },
         "vigil.pollIntervalSeconds": {
-          "type": "number", "default": 10,
+          "type": "number", "default": 30,
           "description": "How often to poll Vigil (seconds)"
         },
         "vigil.showFileDecorations": {

@@ -13,6 +13,13 @@ and VLAW_HOST_ROOT is left unset so paths resolve as-is.
 
 import os
 
+import sys
+if sys.platform == 'win32':
+    import asyncio
+    asyncio.set_event_loop_policy(
+        asyncio.WindowsSelectorEventLoopPolicy()
+    )
+
 os.environ.setdefault("VLAW_DATA_DIR", "../data")
 os.environ.setdefault("VLAW_POLICY_FILE", "../policy/vlaw-policy.native.json")
 os.environ.setdefault("VLAW_PORT", "7422")

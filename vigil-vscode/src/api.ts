@@ -1,10 +1,3 @@
-import { Agent } from 'undici';
-
-const _keepAliveAgent = new Agent({
-  keepAliveTimeout: 10000,
-  connections: 2
-});
-
 export interface SessionStatus {
   session_id: string | null;
   active: boolean;
@@ -45,11 +38,19 @@ export class VigilAPI {
     return `http://127.0.0.1:${this.port}`;
   }
 
-  private async fetchWithTimeout(url: string, init?: RequestInit, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Response> {
+  private async fetchWithTimeout(url: string, init?: RequestInit, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<{ ok: boolean; status: number; data: any }> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      return await fetch(url, { ...init, signal: controller.signal, dispatcher: _keepAliveAgent } as unknown as RequestInit);
+      const response = await fetch(url, { ...init, signal: controller.signal });
+      // Consume the body so the underlying socket can be released back to the pool
+      let data: any = null;
+      try {
+        data = await response.json();
+      } catch {
+        data = null;
+      }
+      return { ok: response.ok, status: response.status, data };
     } finally {
       clearTimeout(timer);
     }
@@ -65,7 +66,7 @@ export class VigilAPI {
       if (!res.ok) {
         return null;
       }
-      return await res.json();
+      return res.data;
     } catch {
       return null;
     }
@@ -77,7 +78,7 @@ export class VigilAPI {
       if (!res.ok) {
         return null;
       }
-      return await res.json();
+      return res.data;
     } catch {
       return null;
     }
