@@ -104,6 +104,20 @@ async def close_db() -> None:
         _db = None
 
 
+async def get_read_db() -> aiosqlite.Connection:
+    """
+    Short-lived read-only connection for API handlers.
+    Opens fresh, reads, caller must close.
+    Never shares state with the Aggregator writer.
+    PRAGMA query_only prevents accidental writes.
+    """
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA busy_timeout = 5000")
+    await db.execute("PRAGMA query_only = ON")
+    return db
+
+
 import atexit as _atexit
 import asyncio as _asyncio_shutdown
 
