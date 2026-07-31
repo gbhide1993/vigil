@@ -1,0 +1,69 @@
+{
+  "name": "vigil",
+  "displayName": "Vigil — AI Session Monitor",
+  "description": "See what Claude Code, Cursor, and Copilot actually do on your machine. OS-level evidence. Runs locally. Nothing leaves your machine.",
+  "version": "0.2.1",
+  "publisher": "vvault",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "keywords": [
+    "claude code", "cursor", "github copilot",
+    "AI coding", "AI agents", "observability",
+    "security", "evidence", "audit"
+  ],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [{
+        "id": "vigil-container",
+        "title": "Vigil",
+        "icon": "media/vigil.svg"
+      }]
+    },
+    "views": {
+      "vigil-container": [
+        { "id": "vigil.currentSession", "name": "Current Session" },
+        { "id": "vigil.redLines",       "name": "Red Lines" },
+        { "id": "vigil.findings",       "name": "Findings" }
+      ]
+    },
+    "commands": [
+      { "command": "vigil.openDashboard",    "title": "Vigil: Open Dashboard" },
+      { "command": "vigil.refresh",          "title": "Vigil: Refresh" },
+      { "command": "vigil.copyEvidenceHash", "title": "Vigil: Copy Evidence Hash" }
+    ],
+    "configuration": {
+      "title": "Vigil",
+      "properties": {
+        "vigil.apiPort": {
+          "type": "number", "default": 7422,
+          "description": "Port where Vigil is running"
+        },
+        "vigil.pollIntervalSeconds": {
+          "type": "number", "default": 10,
+          "description": "How often to poll Vigil (seconds)"
+        },
+        "vigil.showFileDecorations": {
+          "type": "boolean", "default": true,
+          "description": "Show friction badges on files in Explorer"
+        },
+        "vigil.redLineNotifications": {
+          "type": "boolean", "default": true,
+          "description": "Show notifications for Red Line events"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch":   "tsc -watch -p ./",
+    "package": "npx vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node":   "^18.0.0",
+    "typescript":    "^5.0.0",
+    "@vscode/vsce":  "^2.0.0"
+  }
+}

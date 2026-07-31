@@ -14,7 +14,7 @@ from core.attributor import Attributor
 from core.red_lines import RedLines, is_agent_config_path, is_mcp_config_path
 from db.database import get_db
 
-POLL_INTERVAL_SECONDS = 1
+POLL_INTERVAL_SECONDS = 3
 
 EVENT_TYPE_MAP = {
     "created": "file_write",
@@ -69,7 +69,12 @@ class VlawFileHandler(FileSystemEventHandler):
         )
 
     async def _handle_event(self, path: str, event_type: str) -> None:
-        pid, confidence = _find_owning_agent_pid(self.attributor)
+        # _find_owning_agent_pid does a synchronous psutil.process_iter() scan
+        # over every running process — offloaded via run_in_executor (same
+        # pattern as ProcessWatcher.poll/NetworkWatcher.poll) so it never
+        # blocks the event loop that also serves HTTP and runs the scheduler.
+        loop = asyncio.get_event_loop()
+        pid, confidence = await loop.run_in_executor(None, _find_owning_agent_pid, self.attributor)
         agent_name = self.attributor.get_agent_for_pid(pid) if pid else None
 
         if agent_name is None:

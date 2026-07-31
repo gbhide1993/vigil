@@ -61,6 +61,10 @@ Name: "{commondesktop}\{#AppName}"; Filename: "{app}\tray\{#AppExeName}"; Tasks:
 ; so the entry always lands in the correct hive for the install context.
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "VLAW"; ValueData: """{app}\tray\{#AppExeName}"""; Flags: uninsdeletevalue
 
+; Lets every client (VS Code extension, JetBrains plugin, CLI) find Vigil
+; via one registry key instead of hardcoded paths.
+Root: HKCU; Subkey: "Software\Vigil"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletekey
+
 [Run]
 ; Launch V-LAW after install
 Filename: "{app}\tray\{#AppExeName}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent

@@ -3,6 +3,7 @@ localhost ports 8000-9000 or communicate over stdio, so detection is
 best-effort: localhost connections in that port range, plus processes
 whose command line mentions "mcp"."""
 
+import asyncio
 import json
 import time
 
@@ -32,15 +33,54 @@ class McpWatcher:
         self._seen_connections: set[tuple] = set()
 
     async def poll(self) -> None:
+        """psutil.net_connections()/process_iter() are synchronous and
+        OS-bound. Run directly inside this async def, they block the single
+        asyncio event loop that also serves HTTP and runs the scheduler —
+        same failure mode already fixed in ProcessWatcher.poll/
+        NetworkWatcher.poll (see those methods' docstrings). Both scans are
+        offloaded to the thread pool executor via run_in_executor; only DB
+        writes and alert firing (already async) stay on the loop."""
         db = await get_db()
         current_keys: set[tuple] = set()
 
+        loop = asyncio.get_event_loop()
+
         # 1. Localhost connections in the MCP port range
+        port_candidates = await loop.run_in_executor(None, self._gather_port_candidates)
+        for pid, port in port_candidates:
+            key = ("port", pid, port)
+            current_keys.add(key)
+            if key in self._seen_connections:
+                continue
+
+            await self._log_mcp_connection(db, pid, endpoint=f"localhost:{port}")
+
+        # 2. Processes with "mcp" in their command line (stdio transport,
+        #    or servers not yet in an ESTABLISHED connection state)
+        proc_candidates = await loop.run_in_executor(None, self._gather_process_candidates)
+        for pid, name in proc_candidates:
+            key = ("proc", pid)
+            current_keys.add(key)
+            if key in self._seen_connections:
+                continue
+
+            await self._log_mcp_connection(db, pid, endpoint=f"stdio:{name}")
+
+        self._seen_connections = current_keys
+        await db.commit()
+
+    @staticmethod
+    def _gather_port_candidates() -> list[tuple[int, int]]:
+        """Synchronous — runs in the thread pool executor via poll(). Returns
+        (pid, port) pairs for established localhost connections in the MCP
+        port range, so the caller's async loop over the results never
+        touches psutil directly."""
         try:
             connections = psutil.net_connections(kind="inet")
         except (psutil.AccessDenied, PermissionError):
-            connections = []
+            return []
 
+        candidates = []
         for conn in connections:
             if conn.status != psutil.CONN_ESTABLISHED or conn.raddr is None:
                 continue
@@ -50,38 +90,26 @@ class McpWatcher:
                 continue
             if conn.pid is None:
                 continue
+            candidates.append((conn.pid, conn.raddr.port))
+        return candidates
 
-            key = ("port", conn.pid, conn.raddr.port)
-            current_keys.add(key)
-            if key in self._seen_connections:
-                continue
-
-            await self._log_mcp_connection(
-                db, conn.pid, endpoint=f"localhost:{conn.raddr.port}"
-            )
-
-        # 2. Processes with "mcp" in their command line (stdio transport,
-        #    or servers not yet in an ESTABLISHED connection state)
+    @staticmethod
+    def _gather_process_candidates() -> list[tuple[int, str]]:
+        """Synchronous — runs in the thread pool executor via poll(). Returns
+        (pid, name) pairs for processes whose command line mentions "mcp"."""
+        candidates = []
         for proc in psutil.process_iter(["pid", "name"]):
             try:
                 cmdline = " ".join(proc.cmdline())
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
-            if not _is_mcp_process(cmdline, proc.info["name"] or ""):
+            name = proc.info["name"] or ""
+            if not _is_mcp_process(cmdline, name):
                 continue
 
-            key = ("proc", proc.info["pid"])
-            current_keys.add(key)
-            if key in self._seen_connections:
-                continue
-
-            await self._log_mcp_connection(
-                db, proc.info["pid"], endpoint=f"stdio:{proc.info['name']}"
-            )
-
-        self._seen_connections = current_keys
-        await db.commit()
+            candidates.append((proc.info["pid"], name))
+        return candidates
 
     async def _log_mcp_connection(self, db, pid: int, endpoint: str) -> None:
         agent_name = self.attributor.get_agent_for_pid(pid)
