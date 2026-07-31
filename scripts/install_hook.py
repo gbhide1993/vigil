@@ -12,6 +12,9 @@ import sys
 import urllib.request
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 VIGIL_VERSION = "0.2.1-beta"
 VIGIL_MARKER = "# Vigil evidence hook"
 VIGIL_URL = "http://localhost:7422/git/commit-summary"
@@ -38,7 +41,21 @@ def install(repo: Path) -> int:
     hook_path = _hook_path(repo)
     hook_path.parent.mkdir(parents=True, exist_ok=True)
 
-    vigil_script = HOOK_SOURCE.read_text(encoding="utf-8")
+    def _to_git_bash_path(p: str) -> str:
+        p = p.replace("\\", "/")
+        if len(p) >= 2 and p[1] == ":":
+            p = f"/{p[0].lower()}{p[2:]}"
+        return p
+
+    python_path = _to_git_bash_path(sys.executable)
+    script_path = _to_git_bash_path(str(HOOK_SOURCE.resolve()))
+
+    hook_content = (
+        "#!/bin/sh\n"
+        f"{VIGIL_MARKER} — installed by Vigil v{VIGIL_VERSION}\n"
+        "# Remove this file or run: vigil uninstall-hook to disable\n"
+        f'exec "{python_path}" "{script_path}" "$@"\n'
+    )
 
     if hook_path.exists():
         existing = hook_path.read_text(encoding="utf-8")
@@ -46,11 +63,11 @@ def install(repo: Path) -> int:
             print("Existing post-commit hook found.")
             with open(hook_path, "a", encoding="utf-8") as f:
                 f.write("\n\n# --- Vigil evidence hook appended below ---\n")
-                f.write(vigil_script)
+                f.write(hook_content)
         else:
-            hook_path.write_text(vigil_script, encoding="utf-8")
+            hook_path.write_text(hook_content, encoding="utf-8")
     else:
-        hook_path.write_text(vigil_script, encoding="utf-8")
+        hook_path.write_text(hook_content, encoding="utf-8")
 
     try:
         import os

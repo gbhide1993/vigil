@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 VIGIL_URL = "http://localhost:7422/git/commit-summary"
-TIMEOUT_SECONDS = 3
+TIMEOUT_SECONDS = 10
 LOG_PATH = Path.home() / ".vigil" / "commit-evidence.jsonl"
 
 
