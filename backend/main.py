@@ -58,7 +58,7 @@ from fastapi import FastAPI, APIRouter
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from api import agents, alerts, analytics_api, config_api, digest_api, events, export, sessions
+from api import agents, alerts, analytics_api, config_api, digest_api, events, export, mcp_routes, platform_routes, sessions
 from config.policy import load_policy
 from core.aggregator import Aggregator
 from core.attributor import Attributor
@@ -66,7 +66,7 @@ from core.baseline import Baseline
 from core.config_auditor import audit_all_configs
 from core.insights import get_insights
 from core.red_lines import SESSION_LAUNCH_DIR
-from db.database import close_db, get_db, init_db
+from db.database import DB_PATH, close_db, get_db, init_db
 from license.license_service import LicenseService
 from watchers.file_watcher import start_file_watcher
 from watchers.mcp_watcher import McpWatcher
@@ -121,6 +121,50 @@ def _ensure_default_policy() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import os as _vigil_os
+    import sys as _vigil_sys
+
+    _lock_path = _vigil_os.path.join(_vigil_os.path.dirname(__file__),
+                                '..', 'data', 'vigil.lock')
+    _lock_path = _vigil_os.path.abspath(_lock_path)
+    _vigil_os.makedirs(_vigil_os.path.dirname(_lock_path), exist_ok=True)
+
+    try:
+        _lock_file = open(_lock_path, 'w')
+        if _vigil_os.name == 'nt':  # Windows
+            import msvcrt
+            msvcrt.locking(_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:  # Unix
+            import fcntl
+            fcntl.flock(_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_file.write(str(_vigil_os.getpid()))
+        _lock_file.flush()
+        logger.info("instance lock acquired (pid=%d)", _vigil_os.getpid())
+    except (IOError, OSError):
+        logger.error("Vigil is already running. Only one instance allowed.")
+        _vigil_sys.exit(1)
+
+    # 0. Recover from leftover WAL locks left by a previous unclean shutdown,
+    # before aiosqlite opens its own connection in init_db().
+    try:
+        import sqlite3 as _sqlite3
+        import os as _os
+        _db_path = str(DB_PATH) if 'DB_PATH' in dir() else \
+            _os.path.join(
+                _os.environ.get('VLAW_DATA_DIR',
+                    _os.path.join(_os.path.dirname(__file__),
+                                  '..', 'data')),
+                'vlaw.db'
+            )
+        _conn = _sqlite3.connect(_db_path, timeout=3)
+        _conn.execute("PRAGMA journal_mode=DELETE")
+        _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        _conn.commit()
+        _conn.close()
+        del _conn, _sqlite3, _os, _db_path
+    except Exception:
+        pass  # Never block startup — let init_db() report errors
+
     # 1. DB + schema
     await init_db()
     logger.info("database initialized")
@@ -184,18 +228,27 @@ async def lifespan(app: FastAPI):
     logger.info("file watcher started, watching %d paths", len(watch_paths) + len(red_line_non_recursive_dirs))
 
     # 5. APScheduler jobs
+    # max_instances=1 (APScheduler's own default, made explicit here) stops
+    # a slow poll from piling up overlapping runs of itself; coalesce=True
+    # collapses any runs missed while the loop was busy into a single catch-up
+    # run instead of firing them back-to-back. Each watcher re-derives its own
+    # "what's changed" state fresh from the OS every poll (see e.g.
+    # ProcessWatcher._known_pids), so collapsing missed runs doesn't drop any
+    # detection — there's no queued-event backlog to lose.
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(process_watcher.poll, "interval", seconds=3, id="process_watcher")
-    scheduler.add_job(network_watcher.poll, "interval", seconds=5, id="network_watcher")
-    scheduler.add_job(mcp_watcher.poll, "interval", seconds=5, id="mcp_watcher")
-    scheduler.add_job(aggregator.flush_buffers, "interval", seconds=5, id="aggregator_flush")
-    scheduler.add_job(_baseline_tick, "interval", hours=1, id="baseline_update", args=[baseline])
+    scheduler.add_job(process_watcher.poll, "interval", seconds=30, id="process_watcher", max_instances=1, coalesce=True)
+    scheduler.add_job(network_watcher.poll, "interval", seconds=30, id="network_watcher", max_instances=1, coalesce=True)
+    scheduler.add_job(mcp_watcher.poll, "interval", seconds=30, id="mcp_watcher", max_instances=1, coalesce=True)
+    scheduler.add_job(aggregator.flush_buffers, "interval", seconds=15, id="aggregator_flush", max_instances=1, coalesce=True)
+    scheduler.add_job(_baseline_tick, "interval", hours=1, id="baseline_update", args=[baseline], max_instances=1, coalesce=True)
     scheduler.add_job(
         attributor.sessions.close_idle_sessions,
         "interval",
         seconds=60,
         id="session_idle_check",
         args=[baseline],
+        max_instances=1,
+        coalesce=True,
     )
     scheduler.start()
     _state["scheduler"] = scheduler
@@ -208,6 +261,11 @@ async def lifespan(app: FastAPI):
     observer.stop()
     observer.join(timeout=5)
     await close_db()
+    try:
+        _lock_file.close()
+        _vigil_os.unlink(_lock_path)
+    except Exception:
+        pass
     logger.info("vlaw shutdown complete")
 
 
@@ -233,6 +291,8 @@ app.include_router(digest_api.router)
 app.include_router(sessions.router)
 app.include_router(config_api.router)
 app.include_router(analytics_api.router)
+app.include_router(mcp_routes.router)
+app.include_router(platform_routes.router)
 
 # The built frontend calls /api/* (see frontend/src/api.js). In dev, Vite's
 # proxy strips that prefix before forwarding to the backend; in production

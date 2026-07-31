@@ -45,14 +45,14 @@ def _purge_stale_attribution_cache() -> None:
     session (many short-lived PIDs) without needing its own scheduler job."""
     now = time.time()
     stale_pids = [
-        pid for pid, (_, cached_at) in _agent_attribution_cache.items()
+        pid for pid, (_, cached_at) in list(_agent_attribution_cache.items())
         if now - cached_at > ATTRIBUTION_CACHE_TTL_SECONDS
     ]
     for pid in stale_pids:
         _agent_attribution_cache.pop(pid, None)
 
     if len(_agent_attribution_cache) > ATTRIBUTION_CACHE_MAX_ENTRIES:
-        oldest_first = sorted(_agent_attribution_cache.items(), key=lambda kv: kv[1][1])
+        oldest_first = sorted(list(_agent_attribution_cache.items()), key=lambda kv: kv[1][1])
         overflow = len(_agent_attribution_cache) - ATTRIBUTION_CACHE_MAX_ENTRIES
         for pid, _ in oldest_first[:overflow]:
             _agent_attribution_cache.pop(pid, None)

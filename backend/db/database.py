@@ -2,11 +2,16 @@
 rest of the backend — no other module should open its own connection."""
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 
 import aiosqlite
+
+logger = logging.getLogger("vlaw")
+
+SCHEMA_VERSION = 1
 
 DATA_DIR = Path(os.environ.get("VLAW_DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "vlaw.db"
@@ -26,12 +31,20 @@ async def init_db() -> aiosqlite.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     _db = await aiosqlite.connect(DB_PATH)
+    await _db.execute("PRAGMA busy_timeout = 5000")
     _db.row_factory = aiosqlite.Row
     await _db.execute("PRAGMA foreign_keys = ON")
 
     schema_sql = SCHEMA_PATH.read_text()
     await _db.executescript(schema_sql)
     await _db.commit()
+
+    cur = await _db.execute("PRAGMA user_version")
+    current_version = (await cur.fetchone())[0]
+    if current_version < SCHEMA_VERSION:
+        await _db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        await _db.commit()
+        logger.info("schema version updated %d -> %d", current_version, SCHEMA_VERSION)
 
     await _migrate(_db)
     await _seed_policy(_db)
@@ -89,3 +102,49 @@ async def close_db() -> None:
     if _db is not None:
         await _db.close()
         _db = None
+
+
+import atexit as _atexit
+import asyncio as _asyncio_shutdown
+
+def _emergency_close_db():
+    """
+    Called by atexit on any process exit — clean or not.
+    Ensures the aiosqlite connection is closed and the
+    database file handle is released before the process dies.
+    This prevents 'database is locked' on the next startup.
+    """
+    global _db
+    if _db is not None:
+        try:
+            loop = _asyncio_shutdown.new_event_loop()
+            loop.run_until_complete(_db.close())
+            loop.close()
+        except Exception:
+            pass
+        finally:
+            _db = None
+
+_atexit.register(_emergency_close_db)
+
+import signal as _signal_shutdown
+import os as _os_shutdown
+
+def _handle_sigterm(signum, frame):
+    """
+    Handle TaskKill /F and system shutdown signals.
+    Closes DB before process is terminated.
+    """
+    _emergency_close_db()
+    raise SystemExit(0)
+
+# Only register on non-Windows or if not in a thread
+# SIGTERM is not supported on Windows for Python
+# but registering it is harmless on Windows
+try:
+    _signal_shutdown.signal(
+        _signal_shutdown.SIGTERM,
+        _handle_sigterm
+    )
+except (OSError, ValueError):
+    pass  # Not in main thread or not supported
