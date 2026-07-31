@@ -50,6 +50,7 @@ os.environ.setdefault("VLAW_DATA_DIR", os.path.join(BASE_DIR, "data"))
 os.environ.setdefault("VLAW_POLICY_FILE", os.path.join(BASE_DIR, "policy", "vlaw-policy.json"))
 os.environ.setdefault("VLAW_LICENSE_FILE", os.path.join(BASE_DIR, ".vlaw-license"))
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -182,6 +183,9 @@ async def lifespan(app: FastAPI):
 
     attributor = Attributor()
     aggregator = Aggregator()
+    aggregator._writer_task = asyncio.create_task(
+        aggregator.start_writer(), name="vigil_db_writer"
+    )
     baseline = Baseline()
     process_watcher = ProcessWatcher(attributor)
     network_watcher = NetworkWatcher(attributor, aggregator)
@@ -260,6 +264,7 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
     observer.stop()
     observer.join(timeout=5)
+    await aggregator.stop_writer()
     await close_db()
     try:
         _lock_file.close()
