@@ -1,5 +1,5 @@
 @echo off
-echo Building V-LAW installer...
+echo Building Vigil installer...
 
 echo Step 1: Building backend exe...
 cd ..\backend
@@ -19,15 +19,15 @@ if errorlevel 1 goto error
 echo Step 3: Copying artifacts to installer/build...
 cd ..\installer
 xcopy /E /Y /I ..\tray\dist\win-unpacked\* build\tray\
-xcopy /Y ..\backend\dist\vlaw-backend.exe build\backend\
+xcopy /Y ..\backend\dist\vlaw-backend.exe build\backend\vigil-backend.exe
 xcopy /E /Y /I ..\tray\assets\* build\assets\
 xcopy /E /Y /I ..\frontend\dist\* build\frontend\
 
 echo Step 4: Compiling installer...
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" vlaw-setup.iss
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" vigil-setup.iss
 if errorlevel 1 goto error
 
-echo Done. Installer at installer\output\VLaw-Setup.exe
+echo Done. Installer at installer\output\Vigil-Setup.exe
 goto end
 
 :error

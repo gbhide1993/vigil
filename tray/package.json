@@ -1,7 +1,7 @@
 {
-  "name": "vlaw-tray",
+  "name": "vigil-tray",
   "version": "0.2.0-beta",
-  "description": "V-LAW system tray widget",
+  "description": "Vigil system tray app",
   "private": true,
   "main": "main.js",
   "scripts": {
@@ -16,8 +16,8 @@
     "node-cron": "^4.6.0"
   },
   "build": {
-    "appId": "com.getvvault.vlaw",
-    "productName": "V-LAW",
+    "appId": "com.getvvault.vigil",
+    "productName": "Vigil",
     "win": {
       "target": "dir",
       "icon": "assets/app_icon.png"

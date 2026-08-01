@@ -13,7 +13,7 @@ const { spawn, execFile } = require('child_process')
 // execution of the rest of this file. Without the early return below, a
 // losing second instance would still run through app.whenReady() and
 // spawnBackend() before the quit actually took effect, briefly producing
-// a second vlaw-backend.exe.
+// a second vigil-backend.exe.
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 if (!gotSingleInstanceLock) {
   app.quit()
@@ -21,7 +21,7 @@ if (!gotSingleInstanceLock) {
 }
 
 app.on('second-instance', () => {
-  // Someone launched V-LAW again (e.g. double-clicked the desktop shortcut
+  // Someone launched Vigil again (e.g. double-clicked the desktop shortcut
   // while it's already running) — surface the existing flyout instead of
   // doing nothing or starting a second backend.
   if (flyout && !flyout.isDestroyed()) {
@@ -55,10 +55,10 @@ const BACKEND_STABLE_MS = 10000
 
 function getBackendPath() {
   if (app.isPackaged) {
-    // Installer layout: app\tray\V-LAW.exe and app\backend\vlaw-backend.exe
+    // Installer layout: app\tray\Vigil.exe and app\backend\vigil-backend.exe
     // are siblings under the install root, one level up from the tray exe.
     const appDir = path.dirname(path.dirname(process.execPath))
-    return path.join(appDir, 'backend', 'vlaw-backend.exe')
+    return path.join(appDir, 'backend', 'vigil-backend.exe')
   }
   // Dev mode — backend started manually
   return null
@@ -81,7 +81,7 @@ function spawnBackend() {
   if (!fs.existsSync(backendPath)) {
     console.error(`Backend exe not found at: ${backendPath}`)
     setTrayWarning()
-    tray.setToolTip('V-LAW — Backend not found. Reinstall V-LAW.')
+    tray.setToolTip('Vigil — Backend not found. Reinstall Vigil.')
     return
   }
 
@@ -131,7 +131,7 @@ function handleBackendCrash() {
 
   if (backendFailCount >= MAX_BACKEND_FAILURES) {
     setTrayWarning()
-    tray.setToolTip('V-LAW — Backend crashed. Right-click → Restart Backend.')
+    tray.setToolTip('Vigil — Backend crashed. Right-click → Restart Backend.')
     return
   }
 
@@ -188,7 +188,7 @@ async function waitForBackend(maxAttempts = 30, intervalMs = 1000) {
 
     console.error('Backend failed to start within 30 seconds')
     setTrayWarning()
-    tray.setToolTip('V-LAW — Backend failed to start. Right-click → Restart Backend.')
+    tray.setToolTip('Vigil — Backend failed to start. Right-click → Restart Backend.')
   } finally {
     waitingForBackend = false
   }
@@ -358,7 +358,7 @@ function maybeNotifyNewAlert(alert) {
   lastNotifiedAlertId = alert.id
 
   const isRedLine = typeof alert.rule_type === 'string' && alert.rule_type.includes('red_line')
-  const title = isRedLine ? 'V-LAW — RED LINE' : 'V-LAW — CRITICAL'
+  const title = isRedLine ? 'Vigil — RED LINE' : 'Vigil — CRITICAL'
   const body = (alert.title || '').slice(0, 80)
 
   const notification = new Notification({
@@ -412,7 +412,7 @@ async function triggerDigestNow() {
       return
     }
     const notification = new Notification({
-      title: 'V-LAW Morning Digest',
+      title: 'Vigil Morning Digest',
       body: formatDigestBody(body),
       icon: path.join(__dirname, 'assets', body.clean ? 'icon_green.png' : 'icon_red.png'),
     })
@@ -451,15 +451,15 @@ function setTrayIcon(iconName, fallbackTooltip) {
 const APP_VERSION = '0.2.0-beta'
 
 function setTrayIdle() {
-  setTrayIcon('icon_green.png', `V-LAW v${APP_VERSION} — All clear`)
+  setTrayIcon('icon_green.png', `Vigil v${APP_VERSION} — All clear`)
 }
 
 function setTrayAlert() {
-  setTrayIcon('icon_red.png', 'V-LAW: open critical alert')
+  setTrayIcon('icon_red.png', 'Vigil: open critical alert')
 }
 
 function setTrayWarning() {
-  setTrayIcon('icon_amber.png', 'V-LAW — Backend offline. Restart V-LAW.')
+  setTrayIcon('icon_amber.png', 'Vigil — Backend offline. Restart Vigil.')
 }
 
 function setTrayState(state) {
@@ -562,7 +562,7 @@ function toggleFlyout() {
 
 function createTray() {
   tray = new Tray(path.join(__dirname, 'assets', 'icon_green.png'))
-  tray.setToolTip('V-LAW: idle')
+  tray.setToolTip('Vigil: idle')
 
   tray.on('click', () => {
     toggleFlyout()
@@ -570,9 +570,9 @@ function createTray() {
 
   tray.on('right-click', () => {
     const template = [
-      { label: `V-LAW v${APP_VERSION}`, enabled: false },
+      { label: `Vigil v${APP_VERSION}`, enabled: false },
       { type: 'separator' },
-      { label: 'Open V-LAW', click: () => shell.openExternal(WEB_UI_URL) },
+      { label: 'Open Vigil', click: () => shell.openExternal(WEB_UI_URL) },
       { type: 'separator' },
       {
         label: 'Restart Backend',
@@ -587,7 +587,7 @@ function createTray() {
           backendReady = false
           backendFailCount = 0
           setTrayWarning()
-          tray.setToolTip('V-LAW — Restarting backend...')
+          tray.setToolTip('Vigil — Restarting backend...')
           setTimeout(() => {
             spawnBackend()
             waitForBackend()
@@ -600,7 +600,7 @@ function createTray() {
       template.push({ label: 'Test digest toast', click: () => triggerDigestNow() })
       template.push({ type: 'separator' })
     }
-    template.push({ label: 'Quit V-LAW', click: () => app.quit() })
+    template.push({ label: 'Quit Vigil', click: () => app.quit() })
     const menu = Menu.buildFromTemplate(template)
     tray.popUpContextMenu(menu)
   })
@@ -651,7 +651,7 @@ app.whenReady().then(() => {
 
   // Set amber immediately — backend not ready yet
   setTrayWarning()
-  tray.setToolTip('V-LAW — Starting...')
+  tray.setToolTip('Vigil — Starting...')
 
   // Spawn backend, then wait for health, then start polling
   spawnBackend()
