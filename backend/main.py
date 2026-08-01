@@ -240,7 +240,7 @@ async def lifespan(app: FastAPI):
     # ProcessWatcher._known_pids), so collapsing missed runs doesn't drop any
     # detection — there's no queued-event backlog to lose.
     scheduler = AsyncIOScheduler()
-    # scheduler.add_job(process_watcher.poll, "interval", seconds=120, id="process_watcher", max_instances=1, coalesce=True)
+    scheduler.add_job(process_watcher.poll, "interval", seconds=120, id="process_watcher", max_instances=1, coalesce=True)
     scheduler.add_job(network_watcher.poll, "interval", seconds=120, id="network_watcher", max_instances=1, coalesce=True)
     scheduler.add_job(mcp_watcher.poll, "interval", seconds=30, id="mcp_watcher", max_instances=1, coalesce=True)
     scheduler.add_job(aggregator.flush_buffers, "interval", seconds=15, id="aggregator_flush", max_instances=1, coalesce=True)
