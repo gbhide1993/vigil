@@ -33,6 +33,7 @@ async def init_db() -> aiosqlite.Connection:
     _db = await aiosqlite.connect(DB_PATH)
     await _db.execute("PRAGMA busy_timeout = 5000")
     await _db.execute("PRAGMA journal_mode=WAL")
+    await _db.execute("PRAGMA wal_autocheckpoint = 0")
     _db.row_factory = aiosqlite.Row
     await _db.execute("PRAGMA foreign_keys = ON")
 

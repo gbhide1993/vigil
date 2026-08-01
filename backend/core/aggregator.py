@@ -207,6 +207,12 @@ class Aggregator:
 
             await self.enqueue(_write_net_event)
 
+        async def _checkpoint():
+            db = await get_db()
+            await db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+
+        await self.enqueue(_checkpoint)
+
     async def _write_credential_event(self, event: dict) -> None:
         """Credential paths are never aggregated — always individual,
         immediately processed events. Routed through enqueue() like
