@@ -113,7 +113,7 @@ export class BackendManager {
   }
 
   private async downloadAndVerify(): Promise<string | null> {
-    const manifestUrl = 'https://download.getvvault.com/vigil-manifest.json';
+    const manifestUrl = 'https://download.getvvault.com/manifest.json';
     let manifest: any;
     try {
       const res = await fetch(manifestUrl);
@@ -125,7 +125,7 @@ export class BackendManager {
       return null;
     }
 
-    const assetInfo = manifest['vigil-backend-win-x64.exe'];
+    const assetInfo = manifest['win_x64'];
     if (!assetInfo || !assetInfo.url || !assetInfo.sha256) {
       return null;
     }
