@@ -113,7 +113,7 @@ export class BackendManager {
   }
 
   private async downloadAndVerify(): Promise<string | null> {
-    const manifestUrl = 'https://download.getvvault.com/manifest.json';
+    const manifestUrl = 'https://download.getvvault.com/vigil-manifest.json';
     let manifest: any;
     try {
       const res = await fetch(manifestUrl);
@@ -188,12 +188,12 @@ export class BackendManager {
 
     if (!exePath) {
       vscode.window.showInformationMessage(
-        'Vigil backend not found. Install from getvvault.com/vigil',
+        'Vigil backend not found. Install from download.getvvault.com',
         'Download'
       ).then(selection => {
         if (selection === 'Download') {
           vscode.env.openExternal(
-            vscode.Uri.parse('https://getvvault.com/vigil')
+            vscode.Uri.parse('https://download.getvvault.com/Vigil-Setup.exe')
           );
         }
       });

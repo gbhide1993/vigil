@@ -1,9 +1,15 @@
 {
-  "name": "vigil",
+  "name": "vigil-ai-monitor",
   "displayName": "Vigil — AI Session Monitor",
   "description": "See what Claude Code, Cursor, and Copilot actually do on your machine. OS-level evidence. Runs locally. Nothing leaves your machine.",
-  "version": "0.2.1",
+  "version": "0.2.3",
   "publisher": "vvault",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gbhide1993/vigil"
+  },
+  "license": "MIT",
+  "icon": "media/vigil-icon-128.png",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other"],
   "keywords": [
