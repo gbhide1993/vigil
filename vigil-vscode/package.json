@@ -2,7 +2,7 @@
   "name": "vigil-ai-monitor",
   "displayName": "Vigil — AI Session Monitor",
   "description": "See what Claude Code, Cursor, and Copilot actually do on your machine. OS-level evidence. Runs locally. Nothing leaves your machine.",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "publisher": "vvault",
   "repository": {
     "type": "git",

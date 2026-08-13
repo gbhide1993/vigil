@@ -14,6 +14,7 @@ export type BackendState = 'downloading' | 'starting' | 'running' | 'offline';
 export class BackendManager {
   private _state: BackendState = 'offline';
   private _capabilities: any | null = null;
+  private _startingUp = false;
   private _onStateChange = new vscode.EventEmitter<BackendState>();
   readonly onStateChange = this._onStateChange.event;
 
@@ -58,11 +59,11 @@ export class BackendManager {
 
   private isBackendProcessRunning(): boolean {
     try {
-      const output = execSync('tasklist /FI "IMAGENAME eq Vigil.exe" /NH', {
+      const output = execSync('tasklist /FI "IMAGENAME eq vigil-backend.exe" /NH', {
         encoding: 'utf8',
         windowsHide: true
       });
-      return output.includes('Vigil.exe');
+      return output.includes('vigil-backend.exe');
     } catch {
       return false;
     }
@@ -219,6 +220,10 @@ export class BackendManager {
   }
 
   async ensureVigilRunning(): Promise<boolean> {
+    if (this._startingUp) {
+      return false;
+    }
+
     if (await this.checkHealth()) {
       this.setState('running');
       await this.loadCapabilities();
@@ -236,26 +241,31 @@ export class BackendManager {
       return false;
     }
 
-    if (await this.tryRegistryInstall()) {
-      this.setState('running');
-      await this.loadCapabilities();
-      return true;
-    }
+    this._startingUp = true;
+    try {
+      if (await this.tryRegistryInstall()) {
+        this.setState('running');
+        await this.loadCapabilities();
+        return true;
+      }
 
-    if (await this.tryFallbackPath()) {
-      this.setState('running');
-      await this.loadCapabilities();
-      return true;
-    }
+      if (await this.tryFallbackPath()) {
+        this.setState('running');
+        await this.loadCapabilities();
+        return true;
+      }
 
-    if (await this.tryDownloadInstall()) {
-      this.setState('running');
-      await this.loadCapabilities();
-      return true;
-    }
+      if (await this.tryDownloadInstall()) {
+        this.setState('running');
+        await this.loadCapabilities();
+        return true;
+      }
 
-    this.setState('offline');
-    return false;
+      this.setState('offline');
+      return false;
+    } finally {
+      this._startingUp = false;
+    }
   }
 
   private async loadCapabilities(): Promise<void> {

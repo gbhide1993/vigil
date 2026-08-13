@@ -104,7 +104,7 @@ export class VigilAPI {
     }
     return {
       session_id: result.session_id ?? null,
-      active: !!result.active,
+      active: result.status === 'active' || result.active === true,
       agent: result.agent ?? null,
       duration_min: result.duration_min ?? 0,
       files_touched: result.files_touched ?? [],
