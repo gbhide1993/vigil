@@ -7,6 +7,7 @@ import { execSync, spawn } from 'child_process';
 const HEALTH_CHECK_TIMEOUT_MS = 10000;
 const START_WAIT_TIMEOUT_MS = 30000;
 const START_WAIT_POLL_MS = 1000;
+const ALREADY_RUNNING_EXTRA_WAIT_MS = 30000;
 
 export type BackendState = 'downloading' | 'starting' | 'running' | 'offline';
 
@@ -53,6 +54,18 @@ export class BackendManager {
       await new Promise((resolve) => setTimeout(resolve, START_WAIT_POLL_MS));
     }
     return false;
+  }
+
+  private isBackendProcessRunning(): boolean {
+    try {
+      const output = execSync('tasklist /FI "IMAGENAME eq Vigil.exe" /NH', {
+        encoding: 'utf8',
+        windowsHide: true
+      });
+      return output.includes('Vigil.exe');
+    } catch {
+      return false;
+    }
   }
 
   private spawnDetached(exePath: string) {
@@ -210,6 +223,17 @@ export class BackendManager {
       this.setState('running');
       await this.loadCapabilities();
       return true;
+    }
+
+    if (this.isBackendProcessRunning()) {
+      console.log('Vigil backend already running, waiting...');
+      if (await this.waitForHealth(START_WAIT_TIMEOUT_MS + ALREADY_RUNNING_EXTRA_WAIT_MS)) {
+        this.setState('running');
+        await this.loadCapabilities();
+        return true;
+      }
+      this.setState('offline');
+      return false;
     }
 
     if (await this.tryRegistryInstall()) {
