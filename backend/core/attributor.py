@@ -11,18 +11,56 @@ from core.sessions import SessionManager
 from db.database import get_db
 
 KNOWN_AGENTS = {
-    "cursor":        ["Cursor", "cursor_ui", "cursor-server"],
-    "claude_code":   ["claude", "claude-code", "claude_code"],
-    "copilot":       ["GitHub.Copilot", "copilot-agent"],
-    "agentforce":    ["salesforce-agent", "agentforce"],
+    "claude_code": [
+        "claude",
+        "claude-code",
+        "claude_code",
+        "claude-cli",
+    ],
+    "cursor": [
+        "Cursor",
+        "cursor_ui",
+        "cursor-server",
+        "cursor-agent",
+    ],
+    "copilot": [
+        "GitHub.Copilot",
+        "copilot-agent",
+        "copilot-language-server",
+        "gh-copilot",
+    ],
+    "codex": [
+        "codex",
+        "codex-cli",
+        "openai-codex",
+    ],
+    "agentforce": [
+        "salesforce-agent",
+        "agentforce",
+    ],
 }
 
 # Network destination -> agent mapping fallback
+# NOTE: Cursor and Codex CLI both talk to api.openai.com. Process-name
+# attribution (see KNOWN_AGENTS / _walk_parent_chain) always takes priority
+# over this table; this fallback only applies when process attribution
+# returns None. api.openai.com is mapped to "cursor" as the default for that
+# ambiguous case since Cursor has much higher adoption than Codex CLI today.
+# TODO: refine via User-Agent or request-path inspection to disambiguate.
 KNOWN_DESTINATIONS = {
-    "api.anthropic.com":   "claude_code",
-    "api.openai.com":      "cursor",
-    "api.github.com":      "copilot",
-    "api.salesforce.com":  "agentforce",
+    # Claude Code
+    "api.anthropic.com":        "claude_code",
+    "claude.ai":                "claude_code",
+    # Cursor (proxies OpenAI) — also covers Codex CLI ambiguity, see note above
+    "api.openai.com":           "cursor",
+    "cursor.sh":                "cursor",
+    "api2.cursor.sh":           "cursor",
+    # GitHub Copilot
+    "api.github.com":           "copilot",
+    "copilot-proxy.githubusercontent.com": "copilot",
+    "githubcopilot.microsoft.com": "copilot",
+    # Agentforce
+    "api.salesforce.com":       "agentforce",
 }
 
 # A PID's parent chain doesn't change between polls unless the process

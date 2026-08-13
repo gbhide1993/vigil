@@ -151,7 +151,7 @@ class BackendManager {
         catch {
             return null;
         }
-        const assetInfo = manifest['vigil-backend-win-x64.exe'];
+        const assetInfo = manifest['win_x64'];
         if (!assetInfo || !assetInfo.url || !assetInfo.sha256) {
             return null;
         }
@@ -204,9 +204,9 @@ class BackendManager {
             return false;
         }
         if (!exePath) {
-            vscode.window.showInformationMessage('Vigil backend not found. Install from getvvault.com/vigil', 'Download').then(selection => {
+            vscode.window.showInformationMessage('Vigil backend not found. Install from download.getvvault.com', 'Download').then(selection => {
                 if (selection === 'Download') {
-                    vscode.env.openExternal(vscode.Uri.parse('https://getvvault.com/vigil'));
+                    vscode.env.openExternal(vscode.Uri.parse('https://download.getvvault.com/Vigil-Setup.exe'));
                 }
             });
             return false;
