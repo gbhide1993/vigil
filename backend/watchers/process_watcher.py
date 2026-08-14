@@ -98,6 +98,9 @@ class ProcessWatcher:
 
         spawn_infos = await loop.run_in_executor(None, self._gather_spawn_info, new_pids)
 
+        for info in spawn_infos:
+            print(f"DEBUG spawn: name={info['exe_name']} agent={info['agent_name']} cmd={info['cmdline'][:80]}")
+
         db = await get_db()
 
         for info in spawn_infos:
