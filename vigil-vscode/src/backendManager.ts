@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { execSync, spawn } from 'child_process';
@@ -9,12 +10,51 @@ const START_WAIT_TIMEOUT_MS = 30000;
 const START_WAIT_POLL_MS = 1000;
 const ALREADY_RUNNING_EXTRA_WAIT_MS = 30000;
 
+const LOCK_FILE_PATH = path.join(os.tmpdir(), 'vigil-backend.lock');
+
+function isPidRunning(pid: number): boolean {
+  try {
+    const output = execSync(`tasklist /FI "PID eq ${pid}" /NH`, {
+      encoding: 'utf8',
+      windowsHide: true
+    });
+    return output.includes(String(pid));
+  } catch {
+    return false;
+  }
+}
+
+function acquireLock(): boolean {
+  try {
+    if (fs.existsSync(LOCK_FILE_PATH)) {
+      const contents = fs.readFileSync(LOCK_FILE_PATH, 'utf8').trim();
+      const lockedPid = parseInt(contents, 10);
+      if (!isNaN(lockedPid) && isPidRunning(lockedPid)) {
+        return false;
+      }
+    }
+    fs.writeFileSync(LOCK_FILE_PATH, String(process.pid), 'utf8');
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+export function releaseLock() {
+  try {
+    if (fs.existsSync(LOCK_FILE_PATH)) {
+      fs.unlinkSync(LOCK_FILE_PATH);
+    }
+  } catch {
+    // ignore cleanup failure
+  }
+}
+
 export type BackendState = 'downloading' | 'starting' | 'running' | 'offline';
 
 export class BackendManager {
   private _state: BackendState = 'offline';
   private _capabilities: any | null = null;
-  private _startingUp = false;
   private _onStateChange = new vscode.EventEmitter<BackendState>();
   readonly onStateChange = this._onStateChange.event;
 
@@ -220,17 +260,13 @@ export class BackendManager {
   }
 
   async ensureVigilRunning(): Promise<boolean> {
-    if (this._startingUp) {
-      return false;
-    }
-
     if (await this.checkHealth()) {
       this.setState('running');
       await this.loadCapabilities();
       return true;
     }
 
-    if (this.isBackendProcessRunning()) {
+    if (this.isBackendProcessRunning() || !acquireLock()) {
       console.log('Vigil backend already running, waiting...');
       if (await this.waitForHealth(START_WAIT_TIMEOUT_MS + ALREADY_RUNNING_EXTRA_WAIT_MS)) {
         this.setState('running');
@@ -241,31 +277,26 @@ export class BackendManager {
       return false;
     }
 
-    this._startingUp = true;
-    try {
-      if (await this.tryRegistryInstall()) {
-        this.setState('running');
-        await this.loadCapabilities();
-        return true;
-      }
-
-      if (await this.tryFallbackPath()) {
-        this.setState('running');
-        await this.loadCapabilities();
-        return true;
-      }
-
-      if (await this.tryDownloadInstall()) {
-        this.setState('running');
-        await this.loadCapabilities();
-        return true;
-      }
-
-      this.setState('offline');
-      return false;
-    } finally {
-      this._startingUp = false;
+    if (await this.tryRegistryInstall()) {
+      this.setState('running');
+      await this.loadCapabilities();
+      return true;
     }
+
+    if (await this.tryFallbackPath()) {
+      this.setState('running');
+      await this.loadCapabilities();
+      return true;
+    }
+
+    if (await this.tryDownloadInstall()) {
+      this.setState('running');
+      await this.loadCapabilities();
+      return true;
+    }
+
+    this.setState('offline');
+    return false;
   }
 
   private async loadCapabilities(): Promise<void> {

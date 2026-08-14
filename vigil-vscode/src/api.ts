@@ -107,7 +107,9 @@ export class VigilAPI {
       active: result.status === 'active' || result.active === true,
       agent: result.agent ?? null,
       duration_min: result.duration_min ?? 0,
-      files_touched: result.files_touched ?? [],
+      files_touched: Array.isArray(result.files_touched)
+        ? result.files_touched
+        : [],
       red_lines: result.red_lines ?? 0,
       friction_signals: result.friction_signals ?? 0,
       status: result.status ?? 'offline'

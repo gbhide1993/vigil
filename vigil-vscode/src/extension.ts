@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { VigilAPI } from './api';
-import { BackendManager } from './backendManager';
+import { BackendManager, releaseLock } from './backendManager';
 import { StatusBarManager } from './statusBar';
 import { SessionTreeProvider, RedLineTreeProvider, FindingsTreeProvider } from './sidebarProvider';
 import { VigilFileDecorationProvider } from './fileDecorator';
@@ -119,4 +119,5 @@ export function deactivate() {
     clearInterval(pollTimer);
     pollTimer = undefined;
   }
+  releaseLock();
 }
