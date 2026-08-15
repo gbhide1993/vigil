@@ -75,25 +75,35 @@ class SessionTreeProvider extends BaseTreeProvider {
     async refresh() {
         const online = await this.api.isOnline();
         if (!online) {
+            console.log('[VIGIL DEBUG][SessionTreeProvider.refresh] branch=offline');
             this.rootItems = [
                 new VigilTreeItem('Vigil is not running', vscode.TreeItemCollapsibleState.None, {
                     iconPath: new vscode.ThemeIcon('eye-closed')
                 })
             ];
+            console.log(`[VIGIL DEBUG][SessionTreeProvider.refresh] treeItems=${this.rootItems.length}`);
             this.fireChange();
             return;
         }
         const session = await this.api.getCurrentSession();
+        console.log(`[VIGIL DEBUG][SessionTreeProvider.refresh] session.active=${session?.active}`);
+        console.log(`[VIGIL DEBUG][SessionTreeProvider.refresh] session.status=${session?.status}`);
+        console.log(`[VIGIL DEBUG][SessionTreeProvider.refresh] session.session_id=${session?.session_id}`);
         if (!session || !session.active) {
+            console.log('[VIGIL DEBUG][SessionTreeProvider.refresh] branch=no active session');
             this.rootItems = [
                 new VigilTreeItem('No active session', vscode.TreeItemCollapsibleState.None, {
                     iconPath: new vscode.ThemeIcon('circle-slash')
                 })
             ];
+            console.log(`[VIGIL DEBUG][SessionTreeProvider.refresh] treeItems=${this.rootItems.length}`);
             this.fireChange();
             return;
         }
+        console.log('[VIGIL DEBUG][SessionTreeProvider.refresh] branch=active session');
+        console.log(`[VIGIL DEBUG][SessionTreeProvider.refresh] session passed to TreeView=${JSON.stringify(session)}`);
         this.rootItems = this.buildSessionItems(session);
+        console.log(`[VIGIL DEBUG][SessionTreeProvider.refresh] treeItems=${this.rootItems.length}`);
         this.fireChange();
     }
     buildSessionItems(session) {
@@ -150,7 +160,9 @@ class RedLineTreeProvider extends BaseTreeProvider {
         }
         this.rootItems = events.map((event) => {
             const time = this.formatTime(event.timestamp);
-            const child = new VigilTreeItem(`Process: ${event.process} | File: ${event.filepath}`, vscode.TreeItemCollapsibleState.None);
+            const child = new VigilTreeItem(event.filepath
+                ? `Process: ${event.process} | File: ${event.filepath}`
+                : `Process: ${event.process}`, vscode.TreeItemCollapsibleState.None);
             return new VigilTreeItem(`[${event.type}] ${event.description} — ${time}`, vscode.TreeItemCollapsibleState.Collapsed, {
                 iconPath: new vscode.ThemeIcon('alert'),
                 tooltip: `${event.description}\nSeverity: ${event.severity}\nSession: ${event.session_id}`,
@@ -193,12 +205,13 @@ class FindingsTreeProvider extends BaseTreeProvider {
             return;
         }
         this.rootItems = findings.map((finding) => {
-            const pct = Math.round((finding.confidence ?? 0) * 100);
-            const fileName = finding.filepath.split(/[\\/]/).pop() ?? finding.filepath;
-            const child = new VigilTreeItem(finding.description, vscode.TreeItemCollapsibleState.None);
-            return new VigilTreeItem(`⚠ ${finding.finding_type} (${pct}%) — ${fileName}`, vscode.TreeItemCollapsibleState.Collapsed, {
+            const fileName = finding.filepath
+                ? (finding.filepath.split(/[\\/]/).pop() ?? finding.filepath)
+                : 'unknown';
+            const child = new VigilTreeItem(finding.evidence, vscode.TreeItemCollapsibleState.None);
+            return new VigilTreeItem(`⚠ ${finding.finding_type} (${finding.confidence}) — ${fileName}`, vscode.TreeItemCollapsibleState.Collapsed, {
                 iconPath: new vscode.ThemeIcon('warning'),
-                tooltip: `${finding.description}\nSession: ${finding.session_id}`,
+                tooltip: `${finding.evidence}\nSession: ${finding.session_id}`,
                 children: [child]
             });
         });

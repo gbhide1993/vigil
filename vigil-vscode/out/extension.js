@@ -44,6 +44,7 @@ const fileDecorator_1 = require("./fileDecorator");
 const redLineWatcher_1 = require("./redLineWatcher");
 let pollTimer;
 async function activate(context) {
+    console.log('[VIGIL TRACE][activate] entered activate()');
     const config = vscode.workspace.getConfiguration('vigil');
     const port = config.get('apiPort', 7422);
     const pollIntervalSeconds = config.get('pollIntervalSeconds', 10);
@@ -71,14 +72,27 @@ async function activate(context) {
     const refreshAll = async () => {
         await Promise.all([
             statusBar.refresh(),
-            sessionProvider.refresh(),
-            redLineProvider.refresh(),
-            findingsProvider.refresh()
+            (async () => {
+                console.log('[VIGIL TRACE][refreshAll] before sessionProvider.refresh()');
+                await sessionProvider.refresh();
+                console.log('[VIGIL TRACE][refreshAll] after sessionProvider.refresh()');
+            })(),
+            (async () => {
+                console.log('[VIGIL TRACE][refreshAll] before redLineProvider.refresh()');
+                await redLineProvider.refresh();
+            })(),
+            (async () => {
+                console.log('[VIGIL TRACE][refreshAll] before findingsProvider.refresh()');
+                await findingsProvider.refresh();
+            })()
         ]);
         if (fileDecorationProvider) {
             const findings = await api.getFrictionFindings();
             const counts = new Map();
             for (const finding of findings) {
+                if (!finding.filepath) {
+                    continue;
+                }
                 counts.set(finding.filepath, (counts.get(finding.filepath) ?? 0) + 1);
             }
             fileDecorationProvider.setFrictionData(counts);
@@ -102,7 +116,9 @@ async function activate(context) {
         await vscode.env.clipboard.writeText(summary.evidence_hash);
         vscode.window.showInformationMessage('Evidence hash copied');
     }));
+    console.log('[VIGIL TRACE][activate] before await backendManager.ensureVigilRunning()');
     const running = await backendManager.ensureVigilRunning();
+    console.log(`[VIGIL TRACE][activate] after ensureVigilRunning() running=${running} backendState=${backendManager.state}`);
     if (running) {
         const welcomed = context.globalState.get('vigil.welcomed', false);
         if (!welcomed) {
@@ -110,7 +126,9 @@ async function activate(context) {
             await context.globalState.update('vigil.welcomed', true);
         }
     }
+    console.log('[VIGIL TRACE][activate] before await refreshAll()');
     await refreshAll();
+    console.log('[VIGIL TRACE][activate] after refreshAll()');
     pollTimer = setInterval(refreshAll, pollIntervalSeconds * 1000);
     context.subscriptions.push({
         dispose: () => {
@@ -128,5 +146,6 @@ function deactivate() {
         clearInterval(pollTimer);
         pollTimer = undefined;
     }
+    (0, backendManager_1.releaseLock)();
 }
 //# sourceMappingURL=extension.js.map

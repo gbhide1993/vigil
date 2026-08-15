@@ -2,7 +2,7 @@
 ; Inno Setup 6.x
 
 #define AppName "Vigil"
-#define AppVersion "0.2.1-beta"
+#define AppVersion "0.2.10"
 #define AppPublisher "Vvault Technologies"
 #define AppURL "https://getvvault.com/vigil"
 #define AppExeName "Vigil.exe"

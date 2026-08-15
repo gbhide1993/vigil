@@ -76,10 +76,20 @@ export class BackendManager {
   private async checkHealth(): Promise<boolean> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
+    const url = `http://127.0.0.1:${this.port}/health`;
     try {
-      const res = await fetch(`http://127.0.0.1:${this.port}/health`, { signal: controller.signal });
+      console.log(
+        `[health] attempting ${url} port=${this.port} pid=${process.pid} platform=${process.platform} node=${process.version}`
+      );
+      const res = await fetch(url, { signal: controller.signal });
+      console.log(`[health] response status=${res.status} url=${url} port=${this.port}`);
+      console.log(`[health] response ok=${res.ok} url=${url} port=${this.port}`);
       return res.ok;
-    } catch {
+    } catch (err: any) {
+      console.error(
+        `[health] exception name=${err?.name ?? 'unknown'} message=${err?.message ?? 'unknown'} url=${url} port=${this.port} pid=${process.pid} platform=${process.platform} node=${process.version}`
+      );
+      console.error(err?.stack ?? '[health] no stack available');
       return false;
     } finally {
       clearTimeout(timer);
@@ -260,9 +270,15 @@ export class BackendManager {
   }
 
   async ensureVigilRunning(): Promise<boolean> {
-    if (await this.checkHealth()) {
+    console.log('[VIGIL TRACE][ensureVigilRunning] before checkHealth()');
+    const healthOk = await this.checkHealth();
+    console.log(`[VIGIL TRACE][ensureVigilRunning] after checkHealth() result=${healthOk}`);
+    if (healthOk) {
       this.setState('running');
+      console.log('[VIGIL TRACE][ensureVigilRunning] before loadCapabilities()');
       await this.loadCapabilities();
+      console.log('[VIGIL TRACE][ensureVigilRunning] after loadCapabilities()');
+      console.log('[VIGIL TRACE][ensureVigilRunning] returning true');
       return true;
     }
 
@@ -270,32 +286,46 @@ export class BackendManager {
       console.log('Vigil backend already running, waiting...');
       if (await this.waitForHealth(START_WAIT_TIMEOUT_MS + ALREADY_RUNNING_EXTRA_WAIT_MS)) {
         this.setState('running');
+        console.log('[VIGIL TRACE][ensureVigilRunning] before loadCapabilities()');
         await this.loadCapabilities();
+        console.log('[VIGIL TRACE][ensureVigilRunning] after loadCapabilities()');
+        console.log('[VIGIL TRACE][ensureVigilRunning] returning true');
         return true;
       }
       this.setState('offline');
+      console.log('[VIGIL TRACE][ensureVigilRunning] returning false');
       return false;
     }
 
     if (await this.tryRegistryInstall()) {
       this.setState('running');
+      console.log('[VIGIL TRACE][ensureVigilRunning] before loadCapabilities()');
       await this.loadCapabilities();
+      console.log('[VIGIL TRACE][ensureVigilRunning] after loadCapabilities()');
+      console.log('[VIGIL TRACE][ensureVigilRunning] returning true');
       return true;
     }
 
     if (await this.tryFallbackPath()) {
       this.setState('running');
+      console.log('[VIGIL TRACE][ensureVigilRunning] before loadCapabilities()');
       await this.loadCapabilities();
+      console.log('[VIGIL TRACE][ensureVigilRunning] after loadCapabilities()');
+      console.log('[VIGIL TRACE][ensureVigilRunning] returning true');
       return true;
     }
 
     if (await this.tryDownloadInstall()) {
       this.setState('running');
+      console.log('[VIGIL TRACE][ensureVigilRunning] before loadCapabilities()');
       await this.loadCapabilities();
+      console.log('[VIGIL TRACE][ensureVigilRunning] after loadCapabilities()');
+      console.log('[VIGIL TRACE][ensureVigilRunning] returning true');
       return true;
     }
 
     this.setState('offline');
+    console.log('[VIGIL TRACE][ensureVigilRunning] returning false');
     return false;
   }
 

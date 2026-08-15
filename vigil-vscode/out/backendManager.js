@@ -34,14 +34,56 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.BackendManager = void 0;
+exports.releaseLock = releaseLock;
 const vscode = __importStar(require("vscode"));
 const fs = __importStar(require("fs"));
+const os = __importStar(require("os"));
 const path = __importStar(require("path"));
 const crypto = __importStar(require("crypto"));
 const child_process_1 = require("child_process");
 const HEALTH_CHECK_TIMEOUT_MS = 10000;
 const START_WAIT_TIMEOUT_MS = 30000;
 const START_WAIT_POLL_MS = 1000;
+const ALREADY_RUNNING_EXTRA_WAIT_MS = 30000;
+const LOCK_FILE_PATH = path.join(os.tmpdir(), 'vigil-backend.lock');
+function isPidRunning(pid) {
+    try {
+        const output = (0, child_process_1.execSync)(`tasklist /FI "PID eq ${pid}" /NH`, {
+            encoding: 'utf8',
+            windowsHide: true
+        });
+        return output.includes(String(pid));
+    }
+    catch {
+        return false;
+    }
+}
+function acquireLock() {
+    try {
+        if (fs.existsSync(LOCK_FILE_PATH)) {
+            const contents = fs.readFileSync(LOCK_FILE_PATH, 'utf8').trim();
+            const lockedPid = parseInt(contents, 10);
+            if (!isNaN(lockedPid) && isPidRunning(lockedPid)) {
+                return false;
+            }
+        }
+        fs.writeFileSync(LOCK_FILE_PATH, String(process.pid), 'utf8');
+        return true;
+    }
+    catch {
+        return true;
+    }
+}
+function releaseLock() {
+    try {
+        if (fs.existsSync(LOCK_FILE_PATH)) {
+            fs.unlinkSync(LOCK_FILE_PATH);
+        }
+    }
+    catch {
+        // ignore cleanup failure
+    }
+}
 class BackendManager {
     constructor(context, port) {
         this.context = context;
@@ -64,11 +106,17 @@ class BackendManager {
     async checkHealth() {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
+        const url = `http://127.0.0.1:${this.port}/health`;
         try {
-            const res = await fetch(`http://127.0.0.1:${this.port}/health`, { signal: controller.signal });
+            console.log(`[health] attempting ${url} port=${this.port} pid=${process.pid} platform=${process.platform} node=${process.version}`);
+            const res = await fetch(url, { signal: controller.signal });
+            console.log(`[health] response status=${res.status} url=${url} port=${this.port}`);
+            console.log(`[health] response ok=${res.ok} url=${url} port=${this.port}`);
             return res.ok;
         }
-        catch {
+        catch (err) {
+            console.error(`[health] exception name=${err?.name ?? 'unknown'} message=${err?.message ?? 'unknown'} url=${url} port=${this.port} pid=${process.pid} platform=${process.platform} node=${process.version}`);
+            console.error(err?.stack ?? '[health] no stack available');
             return false;
         }
         finally {
@@ -84,6 +132,18 @@ class BackendManager {
             await new Promise((resolve) => setTimeout(resolve, START_WAIT_POLL_MS));
         }
         return false;
+    }
+    isBackendProcessRunning() {
+        try {
+            const output = (0, child_process_1.execSync)('tasklist /FI "IMAGENAME eq vigil-backend.exe" /NH', {
+                encoding: 'utf8',
+                windowsHide: true
+            });
+            return output.includes('vigil-backend.exe');
+        }
+        catch {
+            return false;
+        }
     }
     spawnDetached(exePath) {
         const child = (0, child_process_1.spawn)(exePath, [], {
@@ -216,27 +276,57 @@ class BackendManager {
         return this.waitForHealth(START_WAIT_TIMEOUT_MS);
     }
     async ensureVigilRunning() {
-        if (await this.checkHealth()) {
+        console.log('[VIGIL TRACE][ensureVigilRunning] before checkHealth()');
+        const healthOk = await this.checkHealth();
+        console.log(`[VIGIL TRACE][ensureVigilRunning] after checkHealth() result=${healthOk}`);
+        if (healthOk) {
             this.setState('running');
+            console.log('[VIGIL TRACE][ensureVigilRunning] before loadCapabilities()');
             await this.loadCapabilities();
+            console.log('[VIGIL TRACE][ensureVigilRunning] after loadCapabilities()');
+            console.log('[VIGIL TRACE][ensureVigilRunning] returning true');
             return true;
+        }
+        if (this.isBackendProcessRunning() || !acquireLock()) {
+            console.log('Vigil backend already running, waiting...');
+            if (await this.waitForHealth(START_WAIT_TIMEOUT_MS + ALREADY_RUNNING_EXTRA_WAIT_MS)) {
+                this.setState('running');
+                console.log('[VIGIL TRACE][ensureVigilRunning] before loadCapabilities()');
+                await this.loadCapabilities();
+                console.log('[VIGIL TRACE][ensureVigilRunning] after loadCapabilities()');
+                console.log('[VIGIL TRACE][ensureVigilRunning] returning true');
+                return true;
+            }
+            this.setState('offline');
+            console.log('[VIGIL TRACE][ensureVigilRunning] returning false');
+            return false;
         }
         if (await this.tryRegistryInstall()) {
             this.setState('running');
+            console.log('[VIGIL TRACE][ensureVigilRunning] before loadCapabilities()');
             await this.loadCapabilities();
+            console.log('[VIGIL TRACE][ensureVigilRunning] after loadCapabilities()');
+            console.log('[VIGIL TRACE][ensureVigilRunning] returning true');
             return true;
         }
         if (await this.tryFallbackPath()) {
             this.setState('running');
+            console.log('[VIGIL TRACE][ensureVigilRunning] before loadCapabilities()');
             await this.loadCapabilities();
+            console.log('[VIGIL TRACE][ensureVigilRunning] after loadCapabilities()');
+            console.log('[VIGIL TRACE][ensureVigilRunning] returning true');
             return true;
         }
         if (await this.tryDownloadInstall()) {
             this.setState('running');
+            console.log('[VIGIL TRACE][ensureVigilRunning] before loadCapabilities()');
             await this.loadCapabilities();
+            console.log('[VIGIL TRACE][ensureVigilRunning] after loadCapabilities()');
+            console.log('[VIGIL TRACE][ensureVigilRunning] returning true');
             return true;
         }
         this.setState('offline');
+        console.log('[VIGIL TRACE][ensureVigilRunning] returning false');
         return false;
     }
     async loadCapabilities() {

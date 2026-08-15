@@ -1,6 +1,6 @@
 {
   "name": "vigil-tray",
-  "version": "0.2.0-beta",
+  "version": "0.2.10",
   "description": "Vigil system tray app",
   "private": true,
   "main": "main.js",

@@ -1,33 +1,47 @@
 # Vigil — AI Session Monitor
 
-See what Claude Code, Cursor, and Copilot actually do on your machine.
-
-Vigil is an OS-level evidence platform that observes AI coding agent sessions. This extension surfaces that evidence directly inside VS Code — status bar state, sidebar views, file badges, and Red Line alerts — all backed by a local Vigil backend running on `localhost:7422`.
+See what Claude Code, Cursor, and GitHub Copilot actually do on your machine.
+OS-level evidence. Runs locally. Nothing leaves your machine.
 
 ## What it shows
 
-- **Status bar** — current session state at a glance: offline, ready, active (clean or with friction), or an active Red Line alert. Click it to open the Vigil dashboard.
-- **Sidebar** (activity bar eye icon) — three views:
-  - **Current Session** — agent, duration, status, files touched, friction signals, Red Lines.
-  - **Red Lines** — Red Line events from the last 24 hours, with process and file context.
-  - **Findings** — friction findings (e.g. retry loops) with confidence and file context.
-- **File badges** — files with friction signals get a badge in the Explorer showing the friction count.
-- **Red Line alerts** — a warning notification pops up the moment a new Red Line event is detected, with a link to view evidence.
+The sidebar updates live while your AI agent works:
+
+- **Agent** — which agent is active (Claude Code, Cursor, Copilot)
+- **Duration** — how long the session has been running
+- **Status** — active or idle
+- **Files touched** — files the agent read or wrote
+- **Friction Signals** — patterns like retry loops or rapid reverts
+- **Red Lines** — high-risk events: unexpected network connections, credential access, suspicious commands
+
+## How to install
+
+1. Install this extension
+2. The Vigil backend downloads and installs automatically on first launch (one-time, ~110 MB)
+3. Start Claude Code, Cursor, or Copilot — your session appears in the sidebar within 30 seconds
+
+**Windows SmartScreen note:** When the backend installer runs, Windows may show a security warning. Click **More info** → **Run anyway**. This is expected — the installer is not yet code-signed.
+
+## How it works
+
+Vigil runs a local backend that monitors your machine at the OS level — independently of what the AI agent reports. File writes, network connections, process spawns, and credential access are all captured and attributed to the active agent session. Everything is stored locally in SQLite. No data leaves your machine.
+
+## Red Lines
+
+Eight rules that always run and cannot be disabled:
+
+- AI agent reads SSH keys or `.env` files outside the project
+- Network connection to an unrecognized destination
+- Agent launches `curl`, `wget`, `ssh`, or `nc`
+- `ANTHROPIC_BASE_URL` redirect detected (potential prompt injection)
+- Untrusted MCP server auto-approved
 
 ## Requirements
 
-- Vigil v0.2.1+ — installs automatically on first use if not already present.
-- VS Code 1.85+.
+- Windows 10 or 11
+- VS Code 1.85+
+- Internet connection for first install only
 
-## Settings
+## Supported agents
 
-| Setting | Default | Description |
-|---|---|---|
-| `vigil.apiPort` | `7422` | Port where Vigil is running |
-| `vigil.pollIntervalSeconds` | `10` | How often to poll Vigil (seconds) |
-| `vigil.showFileDecorations` | `true` | Show friction badges on files in Explorer |
-| `vigil.redLineNotifications` | `true` | Show notifications for Red Line events |
-
-## Privacy
-
-Everything stays on your machine. The extension reads from `localhost` only. Nothing is sent anywhere.
+Claude Code · Cursor · GitHub Copilot
