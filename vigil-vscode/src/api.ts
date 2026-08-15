@@ -16,15 +16,15 @@ export interface RedLineEvent {
   description: string;
   timestamp: string;
   process: string;
-  filepath: string;
+  filepath: string | null;
   session_id: string;
 }
 
 export interface FrictionFinding {
   finding_type: string;
-  confidence: number;
-  filepath: string;
-  description: string;
+  confidence: string;
+  filepath: string | null;
+  evidence: string;
   session_id: string;
 }
 

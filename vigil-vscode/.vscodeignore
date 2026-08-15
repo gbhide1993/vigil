@@ -9,3 +9,5 @@ node_modules/**
 **/tsconfig.json
 .git/**
 *.vsix
+*.log
+codex_debug_1.py

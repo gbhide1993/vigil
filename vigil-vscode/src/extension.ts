@@ -9,6 +9,7 @@ import { RedLineWatcher } from './redLineWatcher';
 let pollTimer: ReturnType<typeof setInterval> | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
+  console.log('[VIGIL TRACE][activate] entered activate()');
   const config = vscode.workspace.getConfiguration('vigil');
   const port = config.get<number>('apiPort', 7422);
   const pollIntervalSeconds = config.get<number>('pollIntervalSeconds', 10);
@@ -43,15 +44,28 @@ export async function activate(context: vscode.ExtensionContext) {
   const refreshAll = async () => {
     await Promise.all([
       statusBar.refresh(),
-      sessionProvider.refresh(),
-      redLineProvider.refresh(),
-      findingsProvider.refresh()
+      (async () => {
+        console.log('[VIGIL TRACE][refreshAll] before sessionProvider.refresh()');
+        await sessionProvider.refresh();
+        console.log('[VIGIL TRACE][refreshAll] after sessionProvider.refresh()');
+      })(),
+      (async () => {
+        console.log('[VIGIL TRACE][refreshAll] before redLineProvider.refresh()');
+        await redLineProvider.refresh();
+      })(),
+      (async () => {
+        console.log('[VIGIL TRACE][refreshAll] before findingsProvider.refresh()');
+        await findingsProvider.refresh();
+      })()
     ]);
 
     if (fileDecorationProvider) {
       const findings = await api.getFrictionFindings();
       const counts = new Map<string, number>();
       for (const finding of findings) {
+        if (!finding.filepath) {
+          continue;
+        }
         counts.set(finding.filepath, (counts.get(finding.filepath) ?? 0) + 1);
       }
       fileDecorationProvider.setFrictionData(counts);
@@ -86,7 +100,11 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  console.log('[VIGIL TRACE][activate] before await backendManager.ensureVigilRunning()');
   const running = await backendManager.ensureVigilRunning();
+  console.log(
+    `[VIGIL TRACE][activate] after ensureVigilRunning() running=${running} backendState=${backendManager.state}`
+  );
 
   if (running) {
     const welcomed = context.globalState.get<boolean>('vigil.welcomed', false);
@@ -96,7 +114,9 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   }
 
+  console.log('[VIGIL TRACE][activate] before await refreshAll()');
   await refreshAll();
+  console.log('[VIGIL TRACE][activate] after refreshAll()');
 
   pollTimer = setInterval(refreshAll, pollIntervalSeconds * 1000);
   context.subscriptions.push({
