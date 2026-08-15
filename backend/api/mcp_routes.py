@@ -115,6 +115,82 @@ class CallRequest(BaseModel):
     params: dict = {}
 
 
+class JsonRpcRequest(BaseModel):
+    jsonrpc: str = "2.0"
+    id: int | str | None = None
+    method: str
+    params: dict = {}
+
+
+MCP_PROTOCOL_VERSION = "2024-11-05"
+
+
+def _jsonrpc_result(request_id, result):
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+def _jsonrpc_error(request_id, code, message):
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+
+async def _handle_jsonrpc(body: JsonRpcRequest) -> dict:
+    if body.method == "initialize":
+        return _jsonrpc_result(
+            body.id,
+            {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": SERVER_INFO["name"], "version": SERVER_INFO["version"]},
+            },
+        )
+
+    if body.method == "notifications/initialized":
+        return _jsonrpc_result(body.id, {})
+
+    if body.method == "tools/list":
+        return _jsonrpc_result(body.id, {"tools": TOOLS})
+
+    if body.method == "tools/call":
+        tool_name = body.params.get("name")
+        tool_args = body.params.get("arguments") or {}
+        outcome = await dispatch_tool(tool_name, tool_args)
+        if outcome.get("error"):
+            return _jsonrpc_result(
+                body.id,
+                {
+                    "content": [{"type": "text", "text": outcome["error"]}],
+                    "isError": True,
+                },
+            )
+        return _jsonrpc_result(
+            body.id,
+            {
+                "content": [
+                    {"type": "text", "text": json.dumps(outcome.get("result"))}
+                ]
+            },
+        )
+
+    return _jsonrpc_error(body.id, -32601, f"Method not found: {body.method}")
+
+
+@router.get("")
+async def mcp_sse_handshake():
+    async def event_stream():
+        yield f"event: endpoint\ndata: /mcp\n\n"
+
+        while True:
+            await asyncio.sleep(KEEPALIVE_SECONDS)
+            yield "event: ping\ndata: {}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("")
+async def mcp_jsonrpc(body: JsonRpcRequest):
+    return await _handle_jsonrpc(body)
+
+
 @router.get("/info")
 async def mcp_info():
     return {"server": SERVER_INFO, "tools": TOOLS}
