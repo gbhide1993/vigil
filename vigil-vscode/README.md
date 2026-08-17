@@ -4,7 +4,7 @@
 
 ---
 
-![Vigil sidebar showing live session with Red Line alert](https://raw.githubusercontent.com/gbhide1993/vigil/main/vigil-vscode/media/screenshots/vigil_view_evidence.png)
+![Vigil sidebar showing live session with Red Line alert](media/screenshots/vigil_view_evidence.png)
 
 ---
 
@@ -29,7 +29,7 @@ The sidebar updates live while your AI agent works:
 - ⚠️ **Friction Signals** — patterns like retry loops, rapid reverts, repeated failures
 - 🚨 **Red Lines** — high-risk events: unexpected network connections, credential access, suspicious commands
 
-![Red Line alert firing in status bar](https://raw.githubusercontent.com/gbhide1993/vigil/main/vigil-vscode/media/screenshots/vigil_redline.png)
+![Red Line alert firing in status bar](media/screenshots/vigil_redline.png)
 
 ---
 
@@ -47,7 +47,7 @@ Current Red Line triggers:
 
 Every Red Line includes a **View Evidence** button with the raw OS-level event — timestamp, process, destination, and full context.
 
-![View Evidence panel showing Red Line detail](https://raw.githubusercontent.com/gbhide1993/vigil/main/vigil-vscode/media/screenshots/vigil_view_evidence.png)
+![View Evidence panel showing Red Line detail](media/screenshots/vigil_view_evidence.png)
 
 ---
 
@@ -131,7 +131,7 @@ Launch Vigil from your Start menu. Wait for the tray icon to appear, then open V
 
 Hover the status bar item (`Vigil: X.Xm`) to see a quick summary of the current session — agent, duration, files touched, friction signals, and Red Lines — without opening the sidebar.
 
-![Session stats tooltip](https://raw.githubusercontent.com/gbhide1993/vigil/main/vigil-vscode/media/screenshots/vigil_stats.png)
+![Session stats tooltip](media/screenshots/vigil_stats.png)
 
 ---
 
