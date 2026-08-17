@@ -8,17 +8,38 @@
 
 ---
 
-## Why Vigil
+## The problem
 
-AI coding agents tell you what they think they did. Vigil tells you what actually happened.
+AI coding agents read files, run commands, and modify your code.
 
-Agent-side guardrails stop what the agent is told to do. Vigil independently observes what the agent actually does — file writes, network connections, process spawns — at the OS level, in real time, without touching the agent itself.
+Most of the time that's fine. But there are moments when "the agent said it worked" isn't enough.
 
-> **Logs tell you what software reported. Evidence tells you what actually happened.**
+**"It said the bug was fixed. But the tests are still failing."**
+Did the agent change the wrong file? Retry the same broken approach? Revert something that was working?
+
+**"I asked it to change one file. Why did it touch 14?"**
+Agents expand scope while solving problems. Sometimes that's necessary. Sometimes it's not.
+
+**"It's been working for 20 minutes. Is it actually making progress?"**
+Agents can get stuck in loops — edit, test, fail, revert, retry — without surfacing that to you.
+
+**"Did the AI agent access something it shouldn't have?"**
+When something looks suspicious, the agent's own explanation isn't enough. You need independent evidence.
+
+**"Who — or what — actually made this change?"**
+AI-assisted development needs an evidence trail. Knowing the developer who started a task may not be enough anymore.
 
 ---
 
-## What it shows
+> **The question is no longer just "what did the agent say it did?"**
+>
+> **It's "what did the machine actually observe?"**
+
+That's the problem Vigil is built around.
+
+---
+
+## What Vigil shows
 
 The sidebar updates live while your AI agent works:
 
@@ -135,11 +156,11 @@ Hover the status bar item (`Vigil: X.Xm`) to see a quick summary of the current 
 
 ---
 
-## What's new in 0.2.14
+## What's new in 0.2.16
 
-- **Root cause fix**: MCP response envelope unwrapping — sidebar now correctly reads live session data from the backend
-- Red Line alerts now fire reliably for all monitored agents
-- Status bar shows real-time session duration
+- Images now render correctly on the Marketplace
+- Backend auto-start improved — handles stale processes and zombie detection
+- Registry detection now reads the correct Windows startup key
 
 [Full changelog](https://github.com/gbhide1993/vigil/blob/main/vigil-vscode/CHANGELOG.md)
 
@@ -175,8 +196,8 @@ The backend is running but no Red Line thresholds have been crossed. This is nor
 **MCP shows `ConnectionRefused`**
 The backend is not running or has not fully started yet. Check the Vigil tray icon. If missing, launch Vigil from Start menu, wait 10 seconds, then run `claude mcp list` again.
 
-**Backend version shows `0.2.0-beta`**
-This is a known display issue with the version string in the current release. It does not affect functionality.
+**Sidebar shows offline after install**
+Start the Vigil tray app first, then reload the VS Code window with `Ctrl+Shift+P` → "Reload Window".
 
 ---
 
