@@ -1,8 +1,12 @@
+![Vigil in action](https://download.getvvault.com/vigil_demo.gif)
+
 # Vigil — AI Session Monitor
 
 **See what Claude Code, Cursor, and Copilot actually do on your machine. OS-level evidence. Runs locally. Nothing leaves your machine.**
 
 ---
+
+![Vigil in action](https://download.getvvault.com/vigil_demo.gif)
 
 ![Vigil sidebar showing live session with Red Line alert](https://download.getvvault.com/vigil_view_evidence.png)
 
@@ -208,3 +212,5 @@ Vigil monitors your local machine. It does not transmit session data, file conte
 ---
 
 **getvvault.com · support@getvvault.com**
+
+
