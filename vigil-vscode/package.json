@@ -2,7 +2,7 @@
   "name": "vigil-ai-monitor",
   "displayName": "Vigil: Verify Coding Agent",
   "description": "Independent OS-level evidence of what your coding agent actually does.",
-  "version": "0.2.23",
+  "version": "0.2.24",
   "publisher": "vvault",
   "repository": {
     "type": "git",
