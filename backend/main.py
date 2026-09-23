@@ -183,6 +183,16 @@ async def lifespan(app: FastAPI):
 
     attributor = Attributor()
     aggregator = Aggregator()
+
+    # Crash recovery: replay any file events buffered in memory but not yet
+    # flushed to SQLite when the process last died (see
+    # Aggregator.buffer_file_event / _append_crash_recovery_line). Must run
+    # after init_db() (above) but before start_writer(), and uses get_db()
+    # directly rather than enqueue() since the writer task doesn't exist yet.
+    replayed = await aggregator.replay_crash_recovery_log()
+    if replayed:
+        logger.info("crash recovery: replayed %d file events from a previous run", replayed)
+
     aggregator._writer_task = asyncio.create_task(
         aggregator.start_writer(), name="vigil_db_writer"
     )

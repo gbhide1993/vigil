@@ -8,3 +8,11 @@ pydantic==2.10.4
 reportlab==4.2.5
 cryptography==44.0.0
 httpx==0.28.1
+
+# Windows-only: kernel-level ETW file watching (watchers/etw_file_watcher.py).
+# Degrades gracefully if unavailable/unable to start (missing package,
+# non-Windows, no admin) -- never required for the backend to run, see
+# watchers/file_watcher.py's module docstring. The real-time fallback tier
+# uses watchdog's own native Windows backend (already a dependency above),
+# not pywin32 -- no new dependency needed for that tier.
+pyetwkit==3.2.0; sys_platform == "win32"

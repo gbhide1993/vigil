@@ -24,6 +24,14 @@ CREATE TABLE IF NOT EXISTS events (
     data_volume_bytes INTEGER,    -- for network events
     severity TEXT DEFAULT 'low',  -- low, medium, high, critical
     anomaly_score REAL DEFAULT 0, -- 0.0-1.0, from baseline layer
+    pid INTEGER,                  -- OS pid this event is directly about
+                                   -- (or, for proc_spawn, its own pid) --
+                                   -- used by core.behaviour_detector to
+                                   -- pull a process's recent activity
+    behaviour_score REAL DEFAULT NULL, -- confidence from behaviour_detector,
+                                        -- set only for behaviourally-attributed events
+    event_source TEXT DEFAULT NULL,    -- 'etw' | 'realtime_heuristic' | 'poll' --
+                                        -- which file-watching tier produced this row
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

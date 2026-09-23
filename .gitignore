@@ -75,3 +75,10 @@ scanner/
 vlaw.zip
 
 installer
+
+fibonacci.py
+test_vigil.py
+
+test_buffer.txt
+test_file_watch.txt
+backend/test_write.txt

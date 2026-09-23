@@ -73,6 +73,23 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         await db.execute("ALTER TABLE sessions ADD COLUMN summary TEXT")
         await db.commit()
 
+    cur = await db.execute("PRAGMA table_info(events)")
+    columns = {row["name"] for row in await cur.fetchall()}
+    if "pid" not in columns:
+        # Lets core.behaviour_detector.get_recent_events_for_pid look up an
+        # unknown process's own recent activity directly, instead of only
+        # through the agent_id it doesn't have yet.
+        await db.execute("ALTER TABLE events ADD COLUMN pid INTEGER")
+        await db.commit()
+    if "behaviour_score" not in columns:
+        await db.execute("ALTER TABLE events ADD COLUMN behaviour_score REAL DEFAULT NULL")
+        await db.commit()
+    if "event_source" not in columns:
+        # 'etw' | 'realtime_heuristic' | 'poll' -- which file-watching tier
+        # produced this row (see watchers/file_watcher.py's module docstring).
+        await db.execute("ALTER TABLE events ADD COLUMN event_source TEXT DEFAULT NULL")
+        await db.commit()
+
 
 async def _seed_policy(db: aiosqlite.Connection) -> None:
     if not POLICY_FILE.exists():

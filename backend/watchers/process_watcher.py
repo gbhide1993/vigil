@@ -112,9 +112,15 @@ class ProcessWatcher:
             agent_name = info["agent_name"]
 
             if agent_name is None:
-                continue  # not under a known agent — not our concern
+                continue  # not under a known agent, and not agent-like by behaviour either
 
-            agent_id = await self.attributor.get_or_create_agent(agent_name, pid)
+            is_unidentified = agent_name == "unidentified_agent"
+            # get_behaviour_score_for_pid reads the score Attributor already
+            # computed (and cached) while resolving agent_name for this pid
+            # in _gather_spawn_info — see Attributor._score_behaviour.
+            confidence = self.attributor.get_behaviour_score_for_pid(pid) if is_unidentified else None
+
+            agent_id = await self.attributor.get_or_create_agent(agent_name, pid, confidence=confidence)
             session_id = await self.attributor.sessions.touch(agent_id)
 
             await self.red_lines.check_dangerous_command(agent_id, agent_name, cmdline, exe_name, session_id=session_id)
@@ -122,26 +128,35 @@ class ProcessWatcher:
             await self._check_config_exec(agent_id, agent_name, exe_path or cmdline, session_id)
 
             suspicious = _is_suspicious(cmdline, exe_name)
-            severity = "medium" if suspicious else "low"
+            # Behaviourally-flagged spawns are never "low" — being agent-like
+            # enough to attribute at all is itself medium-worthy, same as an
+            # explicitly suspicious command.
+            severity = "medium" if (suspicious or is_unidentified) else "low"
+
+            detail = {
+                "pid": pid,
+                "parent_pid": parent_pid,
+                "command": exe_name,
+                "args": info["args"],
+                "suspicious": suspicious,
+            }
+            if is_unidentified:
+                detail["behaviour_detected"] = True
+                detail["confidence"] = confidence
 
             cur = await db.execute(
                 """
                 INSERT INTO events
-                    (agent_id, session_id, event_type, path, detail, severity)
-                VALUES (?, ?, 'proc_spawn', ?, ?, ?)
+                    (agent_id, session_id, event_type, path, detail, severity, pid)
+                VALUES (?, ?, 'proc_spawn', ?, ?, ?, ?)
                 """,
                 (
                     agent_id,
                     session_id,
                     cmdline or exe_name,
-                    json.dumps({
-                        "pid": pid,
-                        "parent_pid": parent_pid,
-                        "command": exe_name,
-                        "args": info["args"],
-                        "suspicious": suspicious,
-                    }),
+                    json.dumps(detail),
                     severity,
+                    pid,
                 ),
             )
             event_id = cur.lastrowid
@@ -155,6 +170,24 @@ class ProcessWatcher:
                     reason="suspicious_command",
                     event_id=event_id,
                     extra_detail={"pid": pid, "cmdline": cmdline},
+                    target=exe_path,
+                    session_id=session_id,
+                )
+
+            if is_unidentified:
+                confidence_str = f"{confidence:.2f}" if confidence is not None else "unknown"
+                await self.alerter.fire_alert(
+                    agent_id,
+                    "medium",
+                    title="Unidentified agent-like process detected",
+                    description=(
+                        f"Process {exe_name} (pid={pid}) doesn't match any known agent by name, "
+                        f"but its recent behaviour scored {confidence_str} against V-LAW's "
+                        f"agent-likeness signals: {cmdline or exe_name}"
+                    ),
+                    reason="unidentified_agent_behaviour",
+                    event_id=event_id,
+                    extra_detail={"pid": pid, "process_name": exe_name, "confidence": confidence, "cmdline": cmdline},
                     target=exe_path,
                     session_id=session_id,
                 )

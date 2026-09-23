@@ -20,7 +20,14 @@ if sys.platform == 'win32':
         asyncio.WindowsSelectorEventLoopPolicy()
     )
 
-os.environ.setdefault("VLAW_DATA_DIR", "../data")
+# Absolute and LOCALAPPDATA-anchored, not relative to cwd -- "../data"
+# only resolved correctly when launched with cwd=backend/; launched from
+# anywhere else (e.g. cwd=repo root) it silently wrote the DB outside the
+# repo entirely (e.g. C:\Users\<user>\data\vlaw.db). Matches the frozen
+# build's own DB location (main.py's get_base_path), so native runs and
+# the installed .exe share the same on-disk DB.
+_local_app_data = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+os.environ.setdefault("VLAW_DATA_DIR", os.path.join(_local_app_data, "V-LAW", "data"))
 os.environ.setdefault("VLAW_POLICY_FILE", "../policy/vlaw-policy.native.json")
 os.environ.setdefault("VLAW_PORT", "7422")
 # Deliberately no VLAW_HOST_ROOT — native paths need no /host prefix.

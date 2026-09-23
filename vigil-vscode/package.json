@@ -1,8 +1,8 @@
 {
   "name": "vigil-ai-monitor",
-  "displayName": "Vigil — AI Session Monitor",
-  "description": "See what Claude Code, Cursor, and Copilot actually do on your machine. OS-level evidence. Runs locally. Nothing leaves your machine.",
-  "version": "0.2.20",
+  "displayName": "Vigil: Verify Coding Agent",
+  "description": "Independent OS-level evidence of what your coding agent actually does.",
+  "version": "0.2.22",
   "publisher": "vvault",
   "repository": {
     "type": "git",
@@ -11,7 +11,7 @@
   "license": "MIT",
   "icon": "media/vigil-icon-128.png",
   "engines": { "vscode": "^1.85.0" },
-  "categories": ["Other"],
+  "categories": ["AI"],
   "keywords": [
     "claude code", "cursor", "github copilot",
     "AI coding", "AI agents", "observability",
