@@ -1,6 +1,13 @@
+import io
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from core.alerter import Alerter
+from core.red_lines import SESSION_LAUNCH_DIR
 from core.verification import build_verification_report, touches_credential_path
 from db.database import get_db
 
@@ -122,3 +129,328 @@ async def get_session_top_finding(session_id: str):
         return {"kind": "anomaly", "alert": anomaly}
 
     return {"kind": None, "alert": None}
+
+
+def _is_outside_workdir(path: str) -> bool:
+    """Mirrors core.red_lines' notion of "outside the active workspace":
+    SESSION_LAUNCH_DIR is the directory V-LAW itself was started from."""
+    try:
+        resolved = Path(path).resolve()
+    except (OSError, ValueError):
+        return False
+    try:
+        resolved.relative_to(SESSION_LAUNCH_DIR)
+        return False
+    except ValueError:
+        return True
+
+
+async def _get_policy_list(db, key: str) -> list[str]:
+    cur = await db.execute("SELECT policy_value FROM policy WHERE policy_key = ?", (key,))
+    row = await cur.fetchone()
+    return json.loads(row["policy_value"]) if row else []
+
+
+async def _get_unique_file_paths(db, session_id: str) -> list[str]:
+    """File events are aggregated (core/aggregator.py) — individual paths
+    live in detail.paths (capped at 50 per aggregation window), not the
+    row's own `path` column, which holds the containing directory instead.
+    Same shape as core.verification.get_os_observed_files."""
+    cur = await db.execute(
+        "SELECT path, detail FROM events WHERE session_id = ? AND event_type IN ('file_write', 'file_create')",
+        (session_id,),
+    )
+    rows = await cur.fetchall()
+    paths: set[str] = set()
+    for row in rows:
+        detail = json.loads(row["detail"]) if row["detail"] else {}
+        detail_paths = detail.get("paths")
+        if detail_paths:
+            paths.update(detail_paths)
+        elif row["path"]:
+            paths.add(row["path"])
+    return sorted(paths)
+
+
+async def _get_unique_network_destinations(db, session_id: str) -> list[str]:
+    cur = await db.execute(
+        "SELECT DISTINCT path FROM events WHERE session_id = ? AND event_type = 'net_connect' AND path IS NOT NULL",
+        (session_id,),
+    )
+    rows = await cur.fetchall()
+    return sorted(r["path"] for r in rows)
+
+
+async def _build_session_report(session_id: str) -> dict:
+    """Assembles every data point the PDF/JSON session report needs, in one
+    place, so the /report and /report/preview endpoints stay in sync."""
+    db = await get_db()
+
+    cur = await db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
+    session = await cur.fetchone()
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    cur = await db.execute("SELECT name FROM agents WHERE id = ?", (session["agent_id"],))
+    agent = await cur.fetchone()
+    agent_name = agent["name"] if agent else "unidentified_agent"
+
+    started_at = session["started_at"]
+    ended_at = session["ended_at"]
+    duration_minutes = None
+    if started_at:
+        start_dt = datetime.fromisoformat(started_at.replace(" ", "T"))
+        end_dt = datetime.fromisoformat(ended_at.replace(" ", "T")) if ended_at else datetime.utcnow()
+        duration_minutes = round((end_dt - start_dt).total_seconds() / 60, 1)
+
+    file_paths = await _get_unique_file_paths(db, session_id)
+    net_destinations = await _get_unique_network_destinations(db, session_id)
+    approved_destinations = set(await _get_policy_list(db, "approved_network_destinations"))
+
+    cur = await db.execute(
+        "SELECT COUNT(*) c FROM events WHERE session_id = ? AND event_type = 'proc_spawn'",
+        (session_id,),
+    )
+    process_spawns = (await cur.fetchone())["c"]
+
+    cur = await db.execute(
+        """
+        SELECT al.* FROM alerts al
+        LEFT JOIN events e ON e.id = al.event_id
+        WHERE al.severity IN ('high', 'critical')
+          AND (al.session_id = ? OR e.session_id = ?)
+        ORDER BY al.created_at ASC
+        """,
+        (session_id, session_id),
+    )
+    alerts = [dict(r) for r in await cur.fetchall()]
+
+    files_touched = [
+        {
+            "path": p,
+            "outside_workdir": _is_outside_workdir(p),
+            "is_credential": touches_credential_path(p),
+        }
+        for p in file_paths
+    ]
+    network_connections = [
+        {"destination": d, "approved": d in approved_destinations}
+        for d in net_destinations
+    ]
+
+    return {
+        "session_id": session_id,
+        "agent_name": agent_name,
+        "start_time": started_at,
+        "end_time": ended_at,
+        "duration_minutes": duration_minutes,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "files_touched": files_touched,
+        "files_touched_count": len(files_touched),
+        "network_connections": network_connections,
+        "network_connections_count": len(network_connections),
+        "process_spawns": process_spawns,
+        "red_lines": alerts,
+        "red_lines_count": len(alerts),
+    }
+
+
+@router.get("/sessions/{session_id}/report/preview")
+async def get_session_report_preview(session_id: str):
+    """JSON preview of the PDF report, for the frontend to render before
+    the user downloads the actual file."""
+    report = await _build_session_report(session_id)
+    events = (
+        [{"kind": "file", **f} for f in report["files_touched"]]
+        + [{"kind": "network", **n} for n in report["network_connections"]]
+    )
+    return {
+        "session_id": report["session_id"],
+        "agent_name": report["agent_name"],
+        "start_time": report["start_time"],
+        "duration_minutes": report["duration_minutes"],
+        "files_touched": report["files_touched_count"],
+        "network_connections": report["network_connections_count"],
+        "process_spawns": report["process_spawns"],
+        "red_lines": report["red_lines_count"],
+        "events": events,
+        "alerts": report["red_lines"],
+    }
+
+
+@router.get("/sessions/{session_id}/report")
+async def get_session_report_pdf(session_id: str):
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.pdfgen import canvas
+
+    report = await _build_session_report(session_id)
+
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+    margin = 0.75 * inch
+
+    def new_page():
+        c.showPage()
+        c.setFont("Helvetica", 9)
+        return height - margin
+
+    y = height - margin
+
+    # HEADER
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(margin, y, "Vigil — AI Session Monitor")
+    y -= 0.28 * inch
+
+    c.setFont("Helvetica", 10)
+    c.setFillColor(colors.black)
+    c.drawString(margin, y, f"Session: {session_id[:8]}    Agent: {report['agent_name']}")
+    y -= 0.2 * inch
+    duration_str = f"{report['duration_minutes']} min" if report["duration_minutes"] is not None else "n/a"
+    c.drawString(margin, y, f"Started: {report['start_time']}    Duration: {duration_str}")
+    y -= 0.2 * inch
+    c.drawString(margin, y, f"Generated: {report['generated_at']}")
+    y -= 0.35 * inch
+
+    c.setStrokeColor(colors.HexColor("#cccccc"))
+    c.line(margin, y, width - margin, y)
+    y -= 0.3 * inch
+
+    # SUMMARY ROW
+    box_labels = [
+        ("Files Touched", report["files_touched_count"]),
+        ("Network Connections", report["network_connections_count"]),
+        ("Process Spawns", report["process_spawns"]),
+        ("Red Lines", report["red_lines_count"]),
+    ]
+    box_w = (width - 2 * margin - 3 * 0.15 * inch) / 4
+    box_h = 0.7 * inch
+    x = margin
+    for label, value in box_labels:
+        is_red_lines = label == "Red Lines"
+        c.setFillColor(colors.HexColor("#fdeaea") if is_red_lines and value else colors.HexColor("#f2f2f2"))
+        c.roundRect(x, y - box_h, box_w, box_h, 4, stroke=0, fill=1)
+        c.setFillColor(colors.HexColor("#b00020") if is_red_lines and value else colors.black)
+        c.setFont("Helvetica-Bold", 16)
+        c.drawCentredString(x + box_w / 2, y - box_h + 0.4 * inch, str(value))
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica", 8)
+        c.drawCentredString(x + box_w / 2, y - box_h + 0.18 * inch, label)
+        x += box_w + 0.15 * inch
+    y -= box_h + 0.35 * inch
+
+    # FILES TOUCHED
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(margin, y, f"Files Touched ({report['files_touched_count']})")
+    y -= 0.22 * inch
+    c.setFont("Helvetica", 9)
+    if not report["files_touched"]:
+        c.drawString(margin, y, "(none)")
+        y -= 0.2 * inch
+    for f in report["files_touched"]:
+        if y < margin:
+            y = new_page()
+        marker = ""
+        if f["is_credential"]:
+            marker = "[CRED] "
+            c.setFillColor(colors.HexColor("#b00020"))
+        elif f["outside_workdir"]:
+            marker = "[!] "
+            c.setFillColor(colors.HexColor("#b25900"))
+        else:
+            c.setFillColor(colors.black)
+        c.drawString(margin, y, (marker + f["path"])[:120])
+        c.setFillColor(colors.black)
+        y -= 0.18 * inch
+    y -= 0.2 * inch
+
+    # NETWORK CONNECTIONS
+    if y < margin:
+        y = new_page()
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(margin, y, f"Network Connections ({report['network_connections_count']})")
+    y -= 0.22 * inch
+    c.setFont("Helvetica", 9)
+    if not report["network_connections"]:
+        c.drawString(margin, y, "(none)")
+        y -= 0.2 * inch
+    for n in report["network_connections"]:
+        if y < margin:
+            y = new_page()
+        if n["approved"]:
+            marker = "[OK] "
+            c.setFillColor(colors.HexColor("#1a7a3c"))
+        else:
+            marker = "[X] "
+            c.setFillColor(colors.HexColor("#b00020"))
+        c.drawString(margin, y, (marker + n["destination"])[:120])
+        c.setFillColor(colors.black)
+        y -= 0.18 * inch
+    y -= 0.2 * inch
+
+    # RED LINES (only if any fired)
+    if report["red_lines"]:
+        if y < margin:
+            y = new_page()
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(margin, y, f"Red Lines ({report['red_lines_count']})")
+        y -= 0.24 * inch
+
+        for alert in report["red_lines"]:
+            if y < margin + 0.6 * inch:
+                y = new_page()
+            is_critical = alert["severity"] == "critical"
+            c.setFont("Helvetica-Bold", 10)
+            c.setFillColor(colors.HexColor("#b00020") if is_critical else colors.black)
+            c.drawString(margin, y, f"[{alert['severity'].upper()}] {alert['title']}"[:110])
+            y -= 0.18 * inch
+            c.setFont("Helvetica", 8)
+            c.setFillColor(colors.HexColor("#666666"))
+            c.drawString(margin, y, alert["created_at"] or "")
+            y -= 0.16 * inch
+            c.setFillColor(colors.black)
+            c.setFont("Helvetica", 9)
+            for line in _wrap_text(alert["description"], 100):
+                if y < margin:
+                    y = new_page()
+                c.drawString(margin, y, line)
+                y -= 0.16 * inch
+            y -= 0.12 * inch
+
+    # FOOTER
+    c.setFont("Helvetica-Oblique", 8)
+    c.setFillColor(colors.HexColor("#888888"))
+    c.drawString(margin, margin - 0.35 * inch, "Generated by Vigil — Independent OS-level observer")
+    c.drawString(margin, margin - 0.5 * inch, "Evidence is captured independently of agent self-reporting")
+
+    c.save()
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=vigil-session-{session_id[:8]}.pdf"},
+    )
+
+
+def _wrap_text(text: str, width: int) -> list[str]:
+    """Naive word-wrap for PDF body text — good enough for alert
+    descriptions, which are short, plain-English sentences."""
+    if not text:
+        return []
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) > width:
+            if current:
+                lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
