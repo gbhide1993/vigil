@@ -181,6 +181,15 @@ async def _get_unique_network_destinations(db, session_id: str) -> list[str]:
     return sorted(r["path"] for r in rows)
 
 
+def _format_local(ts: str | None) -> str | None:
+    """DB timestamps are stored as naive UTC strings. Parse as UTC, convert
+    to the system's local timezone, and format for display."""
+    if not ts:
+        return ts
+    dt = datetime.fromisoformat(ts.replace(" ", "T")).replace(tzinfo=timezone.utc).astimezone()
+    return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
 async def _build_session_report(session_id: str) -> dict:
     """Assembles every data point the PDF/JSON session report needs, in one
     place, so the /report and /report/preview endpoints stay in sync."""
@@ -224,6 +233,8 @@ async def _build_session_report(session_id: str) -> dict:
         (session_id, session_id),
     )
     alerts = [dict(r) for r in await cur.fetchall()]
+    for alert in alerts:
+        alert["created_at"] = _format_local(alert["created_at"])
 
     files_touched = [
         {
@@ -238,13 +249,15 @@ async def _build_session_report(session_id: str) -> dict:
         for d in net_destinations
     ]
 
+    now_local = datetime.now(timezone.utc).astimezone()
+
     return {
         "session_id": session_id,
         "agent_name": agent_name,
-        "start_time": started_at,
-        "end_time": ended_at,
+        "start_time": _format_local(started_at),
+        "end_time": _format_local(ended_at),
         "duration_minutes": duration_minutes,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": now_local.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "files_touched": files_touched,
         "files_touched_count": len(files_touched),
         "network_connections": network_connections,
@@ -352,15 +365,15 @@ async def get_session_report_pdf(session_id: str):
     for f in report["files_touched"]:
         if y < margin:
             y = new_page()
-        marker = ""
         if f["is_credential"]:
-            marker = "[CRED] "
+            marker = "[CREDENTIAL PATH] "
             c.setFillColor(colors.HexColor("#b00020"))
         elif f["outside_workdir"]:
-            marker = "[!] "
+            marker = "[OUTSIDE SCOPE] "
             c.setFillColor(colors.HexColor("#b25900"))
         else:
-            c.setFillColor(colors.black)
+            marker = "[OK] "
+            c.setFillColor(colors.HexColor("#1a7a3c"))
         c.drawString(margin, y, (marker + f["path"])[:120])
         c.setFillColor(colors.black)
         y -= 0.18 * inch
@@ -380,11 +393,11 @@ async def get_session_report_pdf(session_id: str):
         if y < margin:
             y = new_page()
         if n["approved"]:
-            marker = "[OK] "
+            marker = "[APPROVED] "
             c.setFillColor(colors.HexColor("#1a7a3c"))
         else:
-            marker = "[X] "
-            c.setFillColor(colors.HexColor("#b00020"))
+            marker = "[NOT IN POLICY] "
+            c.setFillColor(colors.HexColor("#b25900"))
         c.drawString(margin, y, (marker + n["destination"])[:120])
         c.setFillColor(colors.black)
         y -= 0.18 * inch
@@ -418,6 +431,38 @@ async def get_session_report_pdf(session_id: str):
                 c.drawString(margin, y, line)
                 y -= 0.16 * inch
             y -= 0.12 * inch
+
+    # LEGEND
+    legend_lines = [
+        "[APPROVED] — destination is in your approved policy list",
+        "[NOT IN POLICY] — destination not reviewed; verify if expected",
+        "[OK] — file within expected working directory",
+        "[OUTSIDE SCOPE] — file accessed outside working directory",
+        "[CREDENTIAL PATH] — sensitive credential file accessed",
+        "[CRITICAL] — immediate action required",
+        "[HIGH] — review recommended",
+        "[MEDIUM] — informational",
+    ]
+    legend_height = 0.22 * inch + len(legend_lines) * 0.13 * inch
+    if y - legend_height < margin:
+        y = new_page()
+
+    c.setStrokeColor(colors.HexColor("#cccccc"))
+    c.line(margin, y, width - margin, y)
+    y -= 0.2 * inch
+
+    c.setFont("Helvetica-Bold", 7)
+    c.setFillColor(colors.HexColor("#888888"))
+    c.drawString(margin, y, "Legend:")
+    y -= 0.15 * inch
+
+    c.setFont("Helvetica", 7)
+    for line in legend_lines:
+        if y < margin:
+            y = new_page()
+        c.drawString(margin, y, line)
+        y -= 0.13 * inch
+    c.setFillColor(colors.black)
 
     # FOOTER
     c.setFont("Helvetica-Oblique", 8)

@@ -30,6 +30,7 @@ export interface FrictionFinding {
 
 const REQUEST_TIMEOUT_MS = 3000;
 const HEALTH_CHECK_TIMEOUT_MS = 10000;
+const REPORT_TIMEOUT_MS = 15000;
 
 export class VigilAPI {
   constructor(private port: number) {}
@@ -201,5 +202,25 @@ export class VigilAPI {
     const body = await this.getJson(`/mcp/sessions?n=${n}`);
     const result = body?.result;
     return Array.isArray(result) ? result : [];
+  }
+
+  /** Fetches the PDF evidence report for a session as raw bytes. Throws on
+   * a non-2xx response or network failure — unlike getJson/mcpCall, the
+   * caller needs to distinguish "no report" from "couldn't reach Vigil" to
+   * show the right error message. */
+  async downloadSessionReport(sessionId: string): Promise<Uint8Array> {
+    const url = `${this.baseUrl()}/api/sessions/${encodeURIComponent(sessionId)}/report`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REPORT_TIMEOUT_MS);
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const buffer = await response.arrayBuffer();
+      return new Uint8Array(buffer);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }

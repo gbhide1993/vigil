@@ -36,6 +36,8 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
+const os = __importStar(require("os"));
+const path = __importStar(require("path"));
 const api_1 = require("./api");
 const backendManager_1 = require("./backendManager");
 const statusBar_1 = require("./statusBar");
@@ -106,6 +108,36 @@ async function activate(context) {
     }));
     context.subscriptions.push(vscode.commands.registerCommand('vigil.refresh', async () => {
         await refreshAll();
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('vigil.downloadSessionReport', async (sessionId) => {
+        if (!sessionId) {
+            vscode.window.showInformationMessage('No active session to report');
+            return;
+        }
+        let bytes;
+        try {
+            bytes = await api.downloadSessionReport(sessionId);
+        }
+        catch (err) {
+            vscode.window.showErrorMessage(`Vigil: failed to download session report (${err?.message ?? 'unknown error'})`);
+            return;
+        }
+        const defaultFileName = `vigil-session-${sessionId.slice(0, 8)}.pdf`;
+        const saveUri = await vscode.window.showSaveDialog({
+            defaultUri: vscode.Uri.file(path.join(os.homedir(), defaultFileName)),
+            filters: { 'PDF': ['pdf'] }
+        });
+        if (!saveUri) {
+            return; // user cancelled — silently do nothing
+        }
+        try {
+            await vscode.workspace.fs.writeFile(saveUri, bytes);
+        }
+        catch (err) {
+            vscode.window.showErrorMessage(`Vigil: failed to save session report (${err?.message ?? 'unknown error'})`);
+            return;
+        }
+        await vscode.env.openExternal(saveUri);
     }));
     context.subscriptions.push(vscode.commands.registerCommand('vigil.copyEvidenceHash', async () => {
         const summary = await api.getEvidenceSummary();

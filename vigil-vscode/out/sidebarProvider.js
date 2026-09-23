@@ -47,6 +47,9 @@ class VigilTreeItem extends vscode.TreeItem {
         if (options?.iconPath) {
             this.iconPath = options.iconPath;
         }
+        if (options?.command) {
+            this.command = options.command;
+        }
         this.children = options?.children;
     }
 }
@@ -108,7 +111,7 @@ class SessionTreeProvider extends BaseTreeProvider {
     }
     buildSessionItems(session) {
         const fileChildren = session.files_touched.map((f) => new VigilTreeItem(f, vscode.TreeItemCollapsibleState.None, { iconPath: new vscode.ThemeIcon('file') }));
-        return [
+        const items = [
             new VigilTreeItem('Agent', vscode.TreeItemCollapsibleState.None, {
                 description: session.agent ?? 'Unknown',
                 iconPath: new vscode.ThemeIcon('robot')
@@ -133,6 +136,20 @@ class SessionTreeProvider extends BaseTreeProvider {
                 iconPath: new vscode.ThemeIcon('alert')
             })
         ];
+        // Only offered once a session_id exists — an active session can
+        // briefly precede attribution assigning it one.
+        if (session.session_id) {
+            items.push(new VigilTreeItem('Download Session Report (PDF)', vscode.TreeItemCollapsibleState.None, {
+                tooltip: 'Download a PDF evidence report for this session',
+                iconPath: new vscode.ThemeIcon('cloud-download'),
+                command: {
+                    command: 'vigil.downloadSessionReport',
+                    title: 'Download Session Report (PDF)',
+                    arguments: [session.session_id]
+                }
+            }));
+        }
+        return items;
     }
 }
 exports.SessionTreeProvider = SessionTreeProvider;

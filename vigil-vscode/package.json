@@ -2,7 +2,7 @@
   "name": "vigil-ai-monitor",
   "displayName": "Vigil: Verify Coding Agent",
   "description": "Independent OS-level evidence of what your coding agent actually does.",
-  "version": "0.2.22",
+  "version": "0.2.23",
   "publisher": "vvault",
   "repository": {
     "type": "git",
@@ -35,9 +35,10 @@
       ]
     },
     "commands": [
-      { "command": "vigil.openDashboard",    "title": "Vigil: Open Dashboard" },
-      { "command": "vigil.refresh",          "title": "Vigil: Refresh" },
-      { "command": "vigil.copyEvidenceHash", "title": "Vigil: Copy Evidence Hash" }
+      { "command": "vigil.openDashboard",         "title": "Vigil: Open Dashboard" },
+      { "command": "vigil.refresh",               "title": "Vigil: Refresh" },
+      { "command": "vigil.copyEvidenceHash",      "title": "Vigil: Copy Evidence Hash" },
+      { "command": "vigil.downloadSessionReport", "title": "Vigil: Download Session Report (PDF)" }
     ],
     "configuration": {
       "title": "Vigil",
