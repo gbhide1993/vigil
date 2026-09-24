@@ -87,6 +87,12 @@ CACHE_SEED_EVENT_IDS = {TASK_NAME_CREATE, TASK_CREATE}
 
 SUBSCRIBED_EVENT_IDS = sorted(set(EVENT_ID_TO_TYPE) | CACHE_SEED_EVENT_IDS)
 
+# Frozenset version for O(1) membership test in _process_event (see below).
+# ETW-level event_ids() filtering was removed because it triggers E_INVALIDARG
+# (0x80070057) from EnableTraceEx2 on this Windows configuration — this set
+# restores the same filter in Python at negligible cost.
+_SUBSCRIBED_IDS_FAST: frozenset[int] = frozenset(SUBSCRIBED_EVENT_IDS)
+
 # Checked in priority order against each event (see module docstring, point 1).
 PATH_PROPERTY_CANDIDATES = ("FileName", "OpenPath", "TargetFileName", "FilePath")
 FILEOBJECT_PROPERTY = "FileObject"
@@ -180,7 +186,15 @@ class ETWFileWatcher:
 
     def _run(self) -> None:
         try:
-            provider = pyetwkit.FileProvider.kernel().event_ids(SUBSCRIBED_EVENT_IDS)
+            # Do NOT call .event_ids(SUBSCRIBED_EVENT_IDS) here.
+            # Passing an EVENT_FILTER_TYPE_EVENT_ID descriptor to
+            # EnableTraceEx2 for the Microsoft-Windows-Kernel-File provider
+            # returns E_INVALIDARG (0x80070057 / -2147024809) on this Windows
+            # configuration — the parameter is silently rejected even though
+            # the event IDs themselves are valid.  The same filter is applied
+            # in Python inside _process_event via _SUBSCRIBED_IDS_FAST, which
+            # has identical effect with negligible overhead.
+            provider = pyetwkit.FileProvider.kernel()
             self._listener = pyetwkit.EtwListener(providers=[provider], name="vlaw-kernel-file")
             self._listener.start()
         except Exception as e:
@@ -212,6 +226,15 @@ class ETWFileWatcher:
     def _process_event(self, event) -> None:
         try:
             event_id = event.event_id
+
+            # Fast exit: skip Read, DirEnum, Flush, QueryInformation and all
+            # other events that ETW-level event_ids() filtering used to drop
+            # before the call reached Python.  Now that we subscribe to the
+            # full provider (see _run()), this is where those events are
+            # filtered out instead.
+            if event_id not in _SUBSCRIBED_IDS_FAST:
+                return
+
             file_object = event.get_u64(FILEOBJECT_PROPERTY)
 
             if event_id in CACHE_SEED_EVENT_IDS:
