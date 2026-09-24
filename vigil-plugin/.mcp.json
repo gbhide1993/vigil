@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "vigil": {
+      "type": "http",
+      "url": "http://127.0.0.1:7422/mcp",
+      "description": "Vigil backend — provides tools to query the current agent session, list monitored events, and generate PDF audit reports. Requires the Vigil desktop backend to be running (download from getvvault.com)."
+    }
+  }
+}
