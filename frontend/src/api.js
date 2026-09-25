@@ -50,6 +50,8 @@ export const api = {
   exportJsonUrl: (date) => `${BASE}/export/json?date=${date}`,
   exportPdfUrl: (date) => `${BASE}/export/pdf?date=${date}`,
   getAnalyticsSummary: () => request('/analytics/summary'),
+  getEvidence: () => request('/evidence'),
+  getEvidenceIncidents: () => request('/incidents'),
   trackEvent: (event, properties = {}) => {
     // Fire and forget — never await this, never let it throw.
     fetch(`${BASE}/analytics/track`, {

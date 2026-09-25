@@ -493,6 +493,85 @@ a {
   margin-top: 10px;
 }
 
+/* ---- Evidence incidents (core.evidence-backed, GET /incidents) ---- */
+
+.evidence-incidents-section {
+  margin-bottom: 24px;
+}
+
+.evidence-incidents-heading {
+  font-family: var(--font-sans);
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-navy-muted);
+  margin-bottom: 10px;
+}
+
+.evidence-incident-card {
+  border: 1px solid var(--card-border);
+  border-left: 4px solid var(--critical);
+  border-radius: var(--card-radius);
+  background: #fff;
+  padding: var(--card-padding);
+  margin-bottom: 12px;
+}
+
+.evidence-incident-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.evidence-incident-rule {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--color-navy-muted);
+}
+
+.evidence-incident-what {
+  font-family: var(--font-sans);
+  font-weight: 700;
+  font-size: 14px;
+  margin-top: 8px;
+}
+
+.evidence-incident-fields {
+  margin-top: 10px;
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.evidence-incident-label {
+  display: inline-block;
+  min-width: 56px;
+  font-weight: 700;
+  color: var(--color-navy-muted);
+  letter-spacing: 0.03em;
+}
+
+.evidence-incident-toggle {
+  margin-top: 10px;
+}
+
+.evidence-incident-expanded {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--card-border);
+  font-size: 12px;
+}
+
+.evidence-incident-chain-step {
+  padding: 2px 0;
+}
+
+.evidence-incident-detail {
+  margin-top: 6px;
+  color: var(--color-navy-muted);
+}
+
 .story-timeline {
   padding: 16px 0;
   position: relative;

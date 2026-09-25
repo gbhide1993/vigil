@@ -17,7 +17,18 @@ import fnmatch
 import json
 import os
 import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
 
+from core.evidence import (
+    AttributionChain,
+    AttributionConfidence,
+    EvidenceSource,
+    PolicyMatch,
+    RawEvidence,
+    VigilEvidence,
+)
 from db.database import get_db
 
 SEVERITIES = ("low", "medium", "high", "critical")
@@ -150,9 +161,16 @@ class Alerter:
 
     async def check_credential_access(
         self, agent_id: int, path: str, event_id: int | None = None, session_id: str | None = None,
-    ) -> None:
+        pid: int | None = None, parent_pid: int | None = None, process_path: str | None = None,
+    ) -> Optional[VigilEvidence]:
         """HIGH: credential path accessed. MEDIUM instead for .env
-        specifically, per the severity table."""
+        specifically, per the severity table.
+
+        Additionally builds and returns a VigilEvidence record (core.evidence)
+        for this access, alongside the Alert this method has always created.
+        pid/parent_pid/process_path are optional context from the caller's
+        process attribution (see watchers/file_watcher.py) — purely additive,
+        existing callers that don't pass them still work exactly as before."""
         is_dotenv = os.path.basename(path) == ".env"
         severity = "medium" if is_dotenv else "high"
         await self.fire_alert(
@@ -166,6 +184,84 @@ class Alerter:
             target=path,
             session_id=session_id,
         )
+
+        return await self._build_credential_access_evidence(
+            agent_id, path, session_id=session_id, pid=pid, parent_pid=parent_pid, process_path=process_path,
+        )
+
+    async def _build_credential_access_evidence(
+        self, agent_id: int, path: str, session_id: str | None,
+        pid: int | None, parent_pid: int | None, process_path: str | None,
+    ) -> VigilEvidence:
+        """RL1 (credential file access) evidence construction — see
+        core.evidence for the schema. Attribution confidence: HIGH when the
+        agent has a known (non-"unidentified_agent") name, MEDIUM when only
+        a process PID is known, UNKNOWN when neither is available."""
+        db = await get_db()
+        agent_name = await self._get_agent_name(db, agent_id)
+        known_agent = agent_name is not None and agent_name != "unidentified_agent"
+
+        filename = Path(path).name
+        chain: list[str] = []
+
+        if known_agent:
+            confidence = AttributionConfidence.HIGH
+            attributed_agent = agent_name
+            chain.append(f"{agent_name} PID {pid}" if pid is not None else agent_name)
+            basis = f"Process identity resolved to a known agent ({agent_name})" + (
+                f" via PID {pid}." if pid is not None else "."
+            )
+        elif pid is not None:
+            confidence = AttributionConfidence.MEDIUM
+            attributed_agent = None
+            chain.append(f"PID {pid}")
+            basis = f"Only a process PID ({pid}) was observed; it did not resolve to a known agent name."
+        else:
+            confidence = AttributionConfidence.UNKNOWN
+            attributed_agent = None
+            basis = "Neither a known agent name nor a process PID was available for this event."
+
+        if parent_pid is not None:
+            chain.append(f"parent PID {parent_pid}")
+        chain.append(f"FILE_READ {filename}")
+
+        raw = None
+        if pid is not None:
+            raw = RawEvidence(
+                source=EvidenceSource.ETW,
+                observed_at=datetime.now(timezone.utc),
+                pid=pid,
+                parent_pid=parent_pid,
+                process_path=process_path,
+                action="FILE_READ",
+                target=path,
+                details={"rule": "RL1"},
+            )
+
+        return VigilEvidence(
+            what=f"Read {filename}",
+            when=datetime.now(timezone.utc),
+            raw=raw,
+            attribution=AttributionChain(
+                confidence=confidence,
+                chain=chain,
+                basis=basis,
+                attributed_agent=attributed_agent,
+                agent_pid=pid,
+                session_id=session_id,
+            ),
+            policy=PolicyMatch(
+                rule_id="RL1",
+                rule_name="Credential File Access",
+                why=".env and credential files are outside the agent's permitted scope",
+                severity="critical",
+            ),
+        )
+
+    async def _get_agent_name(self, db, agent_id: int) -> str | None:
+        cur = await db.execute("SELECT name FROM agents WHERE id = ?", (agent_id,))
+        row = await cur.fetchone()
+        return row["name"] if row else None
 
     async def check_out_of_scope_access(
         self, agent_id: int, path: str, event_id: int | None = None, session_id: str | None = None,

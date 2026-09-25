@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.alerter import Alerter
+from core.evidence_store import evidence_store
 from db.database import get_db
 
 logger = logging.getLogger("vlaw")
@@ -534,9 +535,12 @@ class Aggregator:
             return cur.lastrowid
 
         event_id = await self.enqueue(_write)
-        await self.alerter.check_credential_access(
+        evidence = await self.alerter.check_credential_access(
             event["agent_id"], event["path"], event_id=event_id, session_id=event["session_id"],
+            pid=pid,
         )
+        if evidence:
+            evidence_store.add_evidence(evidence)
 
     async def _write_realtime_file_event(self, event: dict) -> None:
         """Direct-write fallback for a real-time file event, kept for

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
+import EvidenceIncidents from './EvidenceIncidents'
 import IncidentList from './IncidentList'
 import SessionInsightCard from './SessionInsightCard'
 
@@ -35,6 +36,8 @@ export default function Incidents({ onNavigate }) {
       </div>
 
       <SessionInsightCard />
+
+      <EvidenceIncidents />
 
       <div className="alerts-filter-bar">
         <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>

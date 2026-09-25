@@ -59,7 +59,7 @@ from fastapi import FastAPI, APIRouter
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from api import agents, alerts, analytics_api, config_api, digest_api, events, export, git_routes, mcp_routes, platform_routes, sessions
+from api import agents, alerts, analytics_api, config_api, digest_api, events, evidence, export, git_routes, mcp_routes, platform_routes, sessions
 from config.policy import load_policy
 from core.aggregator import Aggregator
 from core.attributor import Attributor
@@ -108,6 +108,71 @@ DEFAULT_POLICY = {
     "exceptions": [],
     "risk_acceptance": [],
 }
+
+
+def build_watch_paths(policy: dict) -> tuple[list[str], list[str]]:
+    """Builds (watch_paths, red_line_non_recursive_dirs) for the file
+    watcher. Extracted out of the lifespan startup sequence so it can be
+    unit tested without booting the full app — see
+    tests/test_watch_paths.py. Behavior is otherwise unchanged from what
+    used to be inlined in lifespan() below.
+
+    VLAW_HOST_ROOT is set to /host in docker-compose.yml, where the
+    read-only host filesystem is mounted. Policy paths are defined from
+    the host's perspective (e.g. /src), so they need that prefix to
+    resolve inside the container. Empty by default for native (non-Docker)
+    runs, where policy paths already resolve directly.
+    """
+    host_root = os.environ.get("VLAW_HOST_ROOT", "")
+    scope_directories = policy.get("scope_directories", [])
+    scope_dirs = [host_root + p for p in scope_directories]
+    credential_paths = policy.get("credential_paths", [])
+    credential_dirs = [
+        p for p in credential_paths
+        if p.endswith("/") or p.endswith("\\") or p.startswith("~")
+    ]
+    # Flat credential file patterns (".env", "*.pem", "*.key", ...) have no
+    # directory component, so the filter above never turns them into a
+    # watched directory — a policy of credential_paths=[".env"] would
+    # otherwise never cause anything to be watched at all, and a .env
+    # modification in the project would silently never reach the
+    # credential-access pipeline. When credential_paths has any entries
+    # (there's something to match against), also watch the project root
+    # (SESSION_LAUNCH_DIR) and every configured scope directory, so a flat
+    # pattern still has somewhere to fire from. Appended here in their
+    # pre-host_root form (matching how scope_directories/SESSION_LAUNCH_DIR
+    # are expressed everywhere else in this function) since host_root is
+    # applied once, below, to the whole credential_dirs list — prefixing it
+    # here too would double it under Docker (VLAW_HOST_ROOT set).
+    if credential_paths:
+        credential_dirs.append(str(SESSION_LAUNCH_DIR))
+        credential_dirs.extend(scope_directories)
+
+    # Red Line rules 1 and 3 (SSH directory access, Claude hidden cache
+    # writes) must fire regardless of policy configuration, so their
+    # directories are always watched — independent of whatever the user
+    # has set in credential_paths/scope_directories. RL7b (project config
+    # execution, CVE-2025-59536 pattern) needs the active project's own
+    # .claude/.cursor/.vscode config dirs watched too — these live under
+    # the session's launch directory (core.red_lines.SESSION_LAUNCH_DIR),
+    # not under the user's home dir like the other red-line paths.
+    red_line_dirs = [
+        host_root + os.path.expanduser("~/.ssh/"),
+        host_root + os.path.expanduser("~/.claude/file-history/"),
+        host_root + str(SESSION_LAUNCH_DIR / ".claude"),
+        host_root + str(SESSION_LAUNCH_DIR / ".cursor"),
+        host_root + str(SESSION_LAUNCH_DIR / ".vscode"),
+    ]
+    # RL8 (MCP auto-approval, CVE-2026-21852 pattern) needs .mcp.json writes
+    # at the project root — watched non-recursively so this doesn't balloon
+    # into watching the entire project tree just to catch one root-level file.
+    # SESSION_LAUNCH_DIR is now also covered recursively above (via
+    # credential_dirs, when credential_paths is non-empty) so .env/*.key
+    # files in subdirectories of the project root are caught too — this
+    # non-recursive entry stays for RL8's own narrower purpose.
+    red_line_non_recursive_dirs = [host_root + str(SESSION_LAUNCH_DIR)]
+    watch_paths = scope_dirs + [host_root + p for p in credential_dirs] + red_line_dirs
+    return watch_paths, red_line_non_recursive_dirs
 
 
 def _ensure_default_policy() -> None:
@@ -205,38 +270,7 @@ async def lifespan(app: FastAPI):
     _state["baseline"] = baseline
 
     # 4. File watcher (PollingObserver — Docker/Windows safe)
-    # VLAW_HOST_ROOT is set to /host in docker-compose.yml, where the
-    # read-only host filesystem is mounted. Policy paths are defined from
-    # the host's perspective (e.g. /src), so they need that prefix to
-    # resolve inside the container. Empty by default for native (non-Docker)
-    # runs, where policy paths already resolve directly.
-    host_root = os.environ.get("VLAW_HOST_ROOT", "")
-    scope_dirs = [host_root + p for p in policy.get("scope_directories", [])]
-    credential_paths = policy.get("credential_paths", [])
-    credential_dirs = [
-        p for p in credential_paths
-        if p.endswith("/") or p.endswith("\\") or p.startswith("~")
-    ]
-    # Red Line rules 1 and 3 (SSH directory access, Claude hidden cache
-    # writes) must fire regardless of policy configuration, so their
-    # directories are always watched — independent of whatever the user
-    # has set in credential_paths/scope_directories. RL7b (project config
-    # execution, CVE-2025-59536 pattern) needs the active project's own
-    # .claude/.cursor/.vscode config dirs watched too — these live under
-    # the session's launch directory (core.red_lines.SESSION_LAUNCH_DIR),
-    # not under the user's home dir like the other red-line paths.
-    red_line_dirs = [
-        host_root + os.path.expanduser("~/.ssh/"),
-        host_root + os.path.expanduser("~/.claude/file-history/"),
-        host_root + str(SESSION_LAUNCH_DIR / ".claude"),
-        host_root + str(SESSION_LAUNCH_DIR / ".cursor"),
-        host_root + str(SESSION_LAUNCH_DIR / ".vscode"),
-    ]
-    # RL8 (MCP auto-approval, CVE-2026-21852 pattern) needs .mcp.json writes
-    # at the project root — watched non-recursively so this doesn't balloon
-    # into watching the entire project tree just to catch one root-level file.
-    red_line_non_recursive_dirs = [host_root + str(SESSION_LAUNCH_DIR)]
-    watch_paths = scope_dirs + [host_root + p for p in credential_dirs] + red_line_dirs
+    watch_paths, red_line_non_recursive_dirs = build_watch_paths(policy)
     observer = start_file_watcher(attributor, aggregator, watch_paths, red_line_non_recursive_dirs)
     _state["observer"] = observer
     logger.info("file watcher started, watching %d paths", len(watch_paths) + len(red_line_non_recursive_dirs))
@@ -309,6 +343,7 @@ app.include_router(analytics_api.router)
 app.include_router(mcp_routes.router)
 app.include_router(platform_routes.router)
 app.include_router(git_routes.router)
+app.include_router(evidence.router)
 
 # The built frontend calls /api/* (see frontend/src/api.js). In dev, Vite's
 # proxy strips that prefix before forwarding to the backend; in production
@@ -321,6 +356,7 @@ app.include_router(digest_api.router, prefix="/api")
 app.include_router(sessions.router, prefix="/api")
 app.include_router(config_api.router, prefix="/api")
 app.include_router(analytics_api.router, prefix="/api")
+app.include_router(evidence.router, prefix="/api")
 
 
 @app.get("/stats")
