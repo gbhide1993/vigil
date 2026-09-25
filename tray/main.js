@@ -233,9 +233,11 @@ function httpRequest(method, urlPath, body) {
 }
 
 function isQualifyingAlert(alert) {
-  const severity = alert.severity === 'critical'
-  const redLine = typeof alert.rule_type === 'string' && alert.rule_type.includes('red_line')
-  return severity || redLine
+  if (alert.severity === 'critical') return true
+  if (typeof alert.rule_type === 'string' && alert.rule_type.includes('red_line')) {
+    return alert.severity === 'high' || alert.severity === 'critical'
+  }
+  return false
 }
 
 function truncateAction(str) {
