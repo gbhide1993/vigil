@@ -112,7 +112,12 @@ class McpWatcher:
         return candidates
 
     async def _log_mcp_connection(self, db, pid: int, endpoint: str) -> None:
-        agent_name = self.attributor.get_agent_for_pid(pid)
+        # get_agent_for_pid can fall through to Attributor._score_behaviour,
+        # which opens a synchronous sqlite3 connection (see its docstring) —
+        # unlike ProcessWatcher/NetworkWatcher, this call wasn't already
+        # wrapped in run_in_executor/to_thread, so it was blocking the event
+        # loop directly on every MCP connection this method logs.
+        agent_name = await asyncio.to_thread(self.attributor.get_agent_for_pid, pid)
         if agent_name is None:
             return  # not under a known agent — not our concern
 

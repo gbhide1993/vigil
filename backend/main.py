@@ -54,6 +54,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
+from apscheduler.executors.pool import ThreadPoolExecutor as APSchedulerThreadPoolExecutor
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, APIRouter
 from fastapi.staticfiles import StaticFiles
@@ -283,7 +284,15 @@ async def lifespan(app: FastAPI):
     # "what's changed" state fresh from the OS every poll (see e.g.
     # ProcessWatcher._known_pids), so collapsing missed runs doesn't drop any
     # detection — there's no queued-event backlog to lose.
-    scheduler = AsyncIOScheduler()
+    # Default APScheduler threadpool is 10 workers; bumped to 20 here for
+    # headroom. Note: every job registered below is a coroutine function
+    # (async def) — AsyncIOScheduler runs those as native asyncio tasks on
+    # the event loop directly, not through this executor's thread pool, so
+    # this pool is only exercised by a plain (non-async) job or by
+    # APScheduler's own internals. It's applied regardless since a
+    # future non-async job would otherwise silently share the smaller
+    # default pool with everything else.
+    scheduler = AsyncIOScheduler(executors={"default": APSchedulerThreadPoolExecutor(20)})
     scheduler.add_job(process_watcher.poll, "interval", seconds=30, id="process_watcher", max_instances=1, coalesce=True)
     scheduler.add_job(network_watcher.poll, "interval", seconds=30, id="network_watcher", max_instances=1, coalesce=True)
     scheduler.add_job(mcp_watcher.poll, "interval", seconds=30, id="mcp_watcher", max_instances=1, coalesce=True)

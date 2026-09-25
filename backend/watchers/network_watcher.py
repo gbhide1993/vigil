@@ -20,20 +20,32 @@ from core.red_lines import RedLines
 from db.database import get_db
 
 POLL_INTERVAL_SECONDS = 5
+DNS_RESOLVE_TIMEOUT_SECONDS = 20
 
 
 def _resolve_known_destination_ips() -> dict[str, str]:
     """Forward-resolve each known hostname to its IP(s) once at startup.
     Returns {ip: hostname}. Best-effort — a hostname that fails to
-    resolve is simply skipped, not retried per-poll."""
+    resolve is simply skipped, not retried per-poll.
+
+    socket.gethostbyname_ex has no per-call timeout parameter, so the
+    only way to bound it is the process-wide default socket timeout —
+    set here just for the duration of this resolution pass and always
+    restored afterward, so it doesn't leak into unrelated socket use
+    elsewhere in the process."""
     ip_to_host: dict[str, str] = {}
-    for hostname in KNOWN_DESTINATIONS:
-        try:
-            _, _, ip_list = socket.gethostbyname_ex(hostname)
-        except (socket.gaierror, OSError):
-            continue
-        for ip in ip_list:
-            ip_to_host[ip] = hostname
+    previous_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(DNS_RESOLVE_TIMEOUT_SECONDS)
+    try:
+        for hostname in KNOWN_DESTINATIONS:
+            try:
+                _, _, ip_list = socket.gethostbyname_ex(hostname)
+            except (socket.gaierror, OSError):
+                continue
+            for ip in ip_list:
+                ip_to_host[ip] = hostname
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
     return ip_to_host
 
 
