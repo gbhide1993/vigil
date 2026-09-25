@@ -125,6 +125,25 @@ DANGEROUS_INLINE_PATTERNS = ["python -c", "python3 -c", "powershell -enc", "powe
 # concept and must not be relied on for a floor rule.
 SESSION_LAUNCH_DIR = Path.cwd().resolve()
 
+_agent_workspace_dirs: dict[int, Path] = {}
+
+
+def register_agent_workspace(agent_id: int, path: str | Path) -> None:
+    """Idempotent — only stores on first call per agent."""
+    if agent_id in _agent_workspace_dirs:
+        return
+    try:
+        p = Path(path).resolve()
+        directory = p.parent if not p.is_dir() else p
+        git_root = _find_git_root(directory)
+        _agent_workspace_dirs[agent_id] = git_root if git_root is not None else directory
+    except (OSError, ValueError):
+        pass
+
+
+def get_agent_workspace_dir(agent_id: int) -> Path:
+    return _agent_workspace_dirs.get(agent_id, SESSION_LAUNCH_DIR)
+
 
 def is_ssh_path(path: str) -> bool:
     return bool(SSH_DIR_PATTERN.search(path))
@@ -138,14 +157,15 @@ def _is_relative_to(child: Path, parent: Path) -> bool:
         return False
 
 
-def is_env_outside_workspace(path: str) -> bool:
+def is_env_outside_workspace(path: str, workspace_dir: Path | None = None) -> bool:
     if os.path.basename(path) != ".env":
         return False
     try:
         directory = Path(path).resolve().parent
     except (OSError, ValueError):
         return False
-    return not _is_relative_to(directory, SESSION_LAUNCH_DIR)
+    effective_workspace = workspace_dir if workspace_dir is not None else SESSION_LAUNCH_DIR
+    return not _is_relative_to(directory, effective_workspace)
 
 
 def is_claude_cache_write(path: str) -> bool:
@@ -202,7 +222,7 @@ def _find_git_root(path: Path) -> Path | None:
     return None
 
 
-def is_cross_project_read(path: str) -> bool:
+def is_cross_project_read(path: str, workspace_dir: Path | None = None) -> bool:
     try:
         directory = Path(path).resolve().parent
     except (OSError, ValueError):
@@ -212,7 +232,8 @@ def is_cross_project_read(path: str) -> bool:
     if file_git_root is None:
         return False
 
-    session_git_root = _find_git_root(SESSION_LAUNCH_DIR)
+    effective_workspace = workspace_dir if workspace_dir is not None else SESSION_LAUNCH_DIR
+    session_git_root = _find_git_root(effective_workspace)
     return session_git_root is not None and file_git_root != session_git_root
 
 
@@ -377,7 +398,7 @@ class RedLines:
         )
 
     async def check_env_outside_workspace(self, agent_id: int, agent_name: str, path: str, session_id: str | None = None) -> None:
-        if not is_env_outside_workspace(path):
+        if not is_env_outside_workspace(path, get_agent_workspace_dir(agent_id)):
             return
         await self._fire(
             agent_id, "env_outside_workspace", "high",
@@ -465,7 +486,7 @@ class RedLines:
         )
 
     async def check_cross_project_read(self, agent_id: int, agent_name: str, path: str, session_id: str | None = None) -> None:
-        if not is_cross_project_read(path):
+        if not is_cross_project_read(path, get_agent_workspace_dir(agent_id)):
             return
         await self._fire(
             agent_id, "cross_project_read", "medium",

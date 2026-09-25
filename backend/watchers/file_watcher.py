@@ -36,7 +36,7 @@ from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 
 from core.attributor import Attributor
-from core.red_lines import RedLines, is_agent_config_path, is_mcp_config_path
+from core.red_lines import RedLines, is_agent_config_path, is_mcp_config_path, register_agent_workspace
 from db.database import get_db
 from watchers.etw_file_watcher import ETWFileWatcher
 
@@ -311,6 +311,8 @@ class VlawFileHandler(FileSystemEventHandler):
         event (the aggregator's check_out_of_scope_access/
         check_credential_access run later, either immediately or on
         flush)."""
+        register_agent_workspace(agent_id, path)
+
         is_write = event_type in ("file_write", "file_delete")
 
         await self.red_lines.check_ssh_access(agent_id, agent_name, path, session_id=session_id)

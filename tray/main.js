@@ -41,7 +41,7 @@ let tooltipPollTimer = null
 let currentAlert = null
 let qualifyingCount = 0
 let consecutiveFailures = 0
-let lastNotifiedAlertId = undefined // undefined = not yet primed by first poll
+let notifiedAlertIds = null // null = not yet primed by first poll
 
 const FAILURE_THRESHOLD = 3
 
@@ -327,7 +327,7 @@ async function pollAlerts() {
     if (alerts.length === 0) {
       currentAlert = null
       qualifyingCount = 0
-      if (lastNotifiedAlertId === undefined) lastNotifiedAlertId = null
+      if (notifiedAlertIds === null) notifiedAlertIds = new Set()
       setTrayState('idle')
       applyFlyoutState('idle', null)
       return
@@ -338,7 +338,7 @@ async function pollAlerts() {
     currentAlert = alerts[0]
     setTrayState('alert')
     applyFlyoutState('alert', currentAlert)
-    maybeNotifyNewAlert(currentAlert)
+    maybeNotifyNewAlerts(alerts)
   } catch (err) {
     console.error('poll failed:', err.message)
     consecutiveFailures += 1
@@ -348,17 +348,21 @@ async function pollAlerts() {
   }
 }
 
-function maybeNotifyNewAlert(alert) {
-  if (!alert) return
-  if (lastNotifiedAlertId === undefined) {
-    // first poll since launch — prime silently, don't toast for alerts
-    // that were already open before the app started
-    lastNotifiedAlertId = alert.id
+function maybeNotifyNewAlerts(alerts) {
+  if (!alerts || alerts.length === 0) return
+  if (notifiedAlertIds === null) {
+    notifiedAlertIds = new Set(alerts.map((a) => a.id))
     return
   }
-  if (alert.id === lastNotifiedAlertId) return
-  lastNotifiedAlertId = alert.id
+  for (const alert of alerts) {
+    if (!notifiedAlertIds.has(alert.id)) {
+      notifiedAlertIds.add(alert.id)
+      showAlertNotification(alert)
+    }
+  }
+}
 
+function showAlertNotification(alert) {
   const isRedLine = typeof alert.rule_type === 'string' && alert.rule_type.includes('red_line')
   const title = isRedLine ? 'Vigil — RED LINE' : 'Vigil — CRITICAL'
   const body = (alert.title || '').slice(0, 80)

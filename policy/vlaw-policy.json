@@ -25,7 +25,11 @@
     "*.pem",
     "*.key"
   ],
-  "approved_mcp_servers": [],
+  "approved_mcp_servers": [
+    "stdio:gk.exe",
+    "stdio:gk_3_1_75.exe",
+    "stdio:gitkraken"
+  ],
   "approved_network_destinations": [
     "api.anthropic.com", "statsig.anthropic.com", "sentry.io",
     "update.googleapis.com", "clients2.google.com",
