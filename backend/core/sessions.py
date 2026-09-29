@@ -3,6 +3,8 @@ attributed activity, closed after a period of inactivity. Session stat
 columns (file_reads, file_writes, ...) are rolled up from the events
 table when a session closes, then handed to baseline.update_from_session()."""
 
+import asyncio
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -12,7 +14,10 @@ from core.layer2a import score_session_2a
 from core.layer2b import score_session_2b
 from db.database import get_db
 
+logger = logging.getLogger("vlaw")
+
 SESSION_IDLE_TIMEOUT_SECONDS = 300  # close a session after 5 minutes of no activity
+CLOSE_IDLE_SESSIONS_TIMEOUT_SECONDS = 8
 
 
 class SessionManager:
@@ -49,34 +54,55 @@ class SessionManager:
         """Called periodically by the scheduler. Closes any session whose
         agent has been inactive past the idle timeout, rolls up its stat
         columns from the events table, and feeds it to baseline. Returns
-        the list of closed session_ids."""
-        db = await get_db()
-        now = datetime.now(timezone.utc)
+        the list of closed session_ids.
+
+        Every DB call in this method and everything it calls into
+        (_roll_up_session_stats, _write_summary, _score_layer2a/2b,
+        _check_cross_agent, baseline.update_from_session) already goes
+        through aiosqlite's `await db.execute`/`await db.commit` — there is
+        no synchronous sqlite3 call anywhere in this call chain to move to
+        a thread. What this loop can still do is take a while in real wall-
+        clock time: it's a sequential run of several awaited DB round trips
+        per idle agent (more than one agent going idle at once multiplies
+        that), and _check_cross_agent in particular scans across the whole
+        events table, not just this session. asyncio.timeout(8) bounds the
+        whole method so a slow cycle cancels cleanly instead of running
+        indefinitely; sessions already closed (committed) before the
+        timeout fires stay closed — closed[] just stops growing."""
         closed: list[str] = []
+        try:
+            async with asyncio.timeout(CLOSE_IDLE_SESSIONS_TIMEOUT_SECONDS):
+                db = await get_db()
+                now = datetime.now(timezone.utc)
 
-        idle_agent_ids = [
-            agent_id
-            for agent_id, info in self._active.items()
-            if (now - info["last_activity"]).total_seconds() >= SESSION_IDLE_TIMEOUT_SECONDS
-        ]
+                idle_agent_ids = [
+                    agent_id
+                    for agent_id, info in self._active.items()
+                    if (now - info["last_activity"]).total_seconds() >= SESSION_IDLE_TIMEOUT_SECONDS
+                ]
 
-        for agent_id in idle_agent_ids:
-            info = self._active.pop(agent_id)
-            session_id = info["session_id"]
+                for agent_id in idle_agent_ids:
+                    info = self._active.pop(agent_id)
+                    session_id = info["session_id"]
 
-            await self._roll_up_session_stats(db, session_id, agent_id)
-            await db.execute(
-                "UPDATE sessions SET ended_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (session_id,),
+                    await self._roll_up_session_stats(db, session_id, agent_id)
+                    await db.execute(
+                        "UPDATE sessions SET ended_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (session_id,),
+                    )
+                    await db.commit()
+
+                    await baseline.update_from_session(session_id)
+                    await self._write_summary(db, session_id, agent_id)
+                    await self._score_layer2a(db, session_id, agent_id)
+                    await self._score_layer2b(db, session_id, agent_id)
+                    await self._check_cross_agent(db)
+                    closed.append(session_id)
+        except TimeoutError:
+            logger.warning(
+                "SessionManager.close_idle_sessions timed out after %ds -- %d session(s) closed before timeout",
+                CLOSE_IDLE_SESSIONS_TIMEOUT_SECONDS, len(closed),
             )
-            await db.commit()
-
-            await baseline.update_from_session(session_id)
-            await self._write_summary(db, session_id, agent_id)
-            await self._score_layer2a(db, session_id, agent_id)
-            await self._score_layer2b(db, session_id, agent_id)
-            await self._check_cross_agent(db)
-            closed.append(session_id)
 
         return closed
 

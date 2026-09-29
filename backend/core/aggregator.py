@@ -5,12 +5,18 @@ and process spawns bypass aggregation entirely and are written immediately.
 
 All of Aggregator's own writes (flush_buffers, _write_credential_event) are
 funneled through a single internal asyncio.Queue + writer coroutine (see
-enqueue/start_writer/stop_writer below), so this class is the sole writer
-for the events it owns. Other modules (watchers, Attributor, SessionManager,
-Alerter) still call db.database.get_db() directly for their own writes —
-their callers depend on synchronous read-your-own-write results (lastrowid,
-agent_id, session_id) that a queued/deferred write can't provide without a
-much larger refactor of those call chains."""
+enqueue/start_writer/stop_writer below). ProcessWatcher's batched proc_spawn
+INSERT (its one write big enough to meaningfully contend with Aggregator's
+own writes under SQLite WAL's single-writer-at-a-time rule) is also routed
+through enqueue() as of the fix below -- see ProcessWatcher._poll_write_body
+-- so this queue is now the sole path for every write large/frequent enough
+to matter for contention. Other modules (Attributor, SessionManager, RedLines,
+Alerter, and ProcessWatcher's smaller per-PID calls into those) still call
+db.database.get_db() directly for their own writes — their callers depend on
+synchronous read-your-own-write results (lastrowid, agent_id, session_id)
+that a queued/deferred write can't provide without a much larger refactor of
+those call chains, and those writes are individually small enough that they
+were not the source of the contention this fix addresses."""
 
 import asyncio
 import logging
@@ -20,9 +26,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import aiosqlite
+
 from core.alerter import Alerter
 from core.evidence_store import evidence_store
-from db.database import get_db
+from db.database import get_db, get_read_db, DB_PATH
 
 logger = logging.getLogger("vlaw")
 
@@ -80,16 +88,11 @@ class Aggregator:
         self._write_queue: asyncio.Queue = asyncio.Queue()
         self._writer_task: asyncio.Task | None = None
 
-        # PRAGMA wal_checkpoint(PASSIVE) used to run on every flush_buffers
-        # call (every 15s) -- passive checkpoints wait for readers to clear
-        # rather than blocking them, but under sustained real-time file
-        # activity a checkpoint was frequently landing mid-read and losing
-        # the race to "database table is locked" anyway. Since flush_buffers
-        # already durably drains both buffers into SQLite every cycle
-        # regardless of whether a checkpoint runs, there's no correctness
-        # reason to checkpoint that often -- only WAL file size. Throttling
-        # to every 10th flush (~150s) cuts checkpoint frequency 10x while
-        # still bounding WAL growth.
+        # PRAGMA wal_checkpoint(PASSIVE) runs periodically (every 10th
+        # flush, ~150s) on its own dedicated connection -- see
+        # _checkpoint() -- never through enqueue() / the shared writer
+        # queue, so a slow checkpoint can't block Aggregator/
+        # ProcessWatcher/VlawFileHandler writes that share that queue.
         self._flush_count = 0
         self._checkpoint_every = 10
 
@@ -119,9 +122,8 @@ class Aggregator:
                 # connection sitting in an open, uncommitted transaction --
                 # nothing here ever called commit() for it, and Python's
                 # sqlite3 doesn't auto-rollback a failed statement. Every
-                # later operation on this same connection (including the
-                # periodic wal_checkpoint below) then hits "table is
-                # locked" against that stuck transaction, permanently,
+                # later operation on this same connection then hits "table
+                # is locked" against that stuck transaction, permanently,
                 # until the process restarts. Rolling back here is what
                 # actually prevents one bad write from poisoning every
                 # write after it for the rest of the process's life.
@@ -437,11 +439,49 @@ class Aggregator:
 
         self._flush_count += 1
         if self._flush_count % self._checkpoint_every == 0:
-            async def _checkpoint():
-                db = await get_db()
-                await db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            await self._checkpoint()
+        if self._flush_count % 20 == 0:
+            await self._log_events_row_count()
 
-            await self.enqueue(_checkpoint)
+    async def _checkpoint(self) -> None:
+        """Runs PRAGMA wal_checkpoint(PASSIVE) on its own short-lived
+        connection, deliberately not the shared get_db() singleton and not
+        routed through enqueue() -- so it executes concurrently with the
+        single writer queue instead of through it, and a slow checkpoint
+        can never block Aggregator/ProcessWatcher/VlawFileHandler writes
+        that share that queue. Best-effort: any failure here is logged and
+        swallowed, never raised into flush_buffers."""
+        start = time.monotonic()
+        try:
+            conn = await aiosqlite.connect(DB_PATH)
+            try:
+                await conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            finally:
+                await conn.close()
+        except Exception:
+            logger.exception("aggregator: dedicated-connection WAL checkpoint failed")
+        finally:
+            elapsed = time.monotonic() - start
+            logger.info(f"[TIMING] checkpoint took {elapsed:.2f}s")
+
+    async def _log_events_row_count(self) -> None:
+        """Cheap diagnostic: how large the events table has grown, logged
+        every 20th flush. Uses get_read_db() -- a short-lived read-only
+        connection, same pattern API handlers already use -- rather than
+        get_db()/enqueue(), so this never competes with the writer queue
+        either. Best-effort: any failure here is logged and swallowed,
+        never raised into flush_buffers."""
+        try:
+            conn = await get_read_db()
+            try:
+                cur = await conn.execute("SELECT COUNT(*) AS n FROM events")
+                row = await cur.fetchone()
+                count = row["n"] if row else None
+            finally:
+                await conn.close()
+            logger.info(f"[TIMING] events table row count: {count}")
+        except Exception:
+            logger.exception("aggregator: events row count check failed")
 
     async def _flush_file_event_buffer(self) -> None:
         """Drains file_event_buffer in one batched INSERT + one commit,
@@ -462,24 +502,29 @@ class Aggregator:
             batch = list(self.file_event_buffer)
 
         async def _write_batch(batch=batch):
-            db = await get_db()
-            await db.executemany(
-                """
-                INSERT INTO events
-                    (agent_id, session_id, event_type, path, detail, severity, pid, event_source, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        e["agent_id"], e["session_id"], e["event_type"], e["path"],
-                        json.dumps(e.get("detail") or {}), e.get("severity", "low"),
-                        e.get("pid"), e.get("event_source"),
-                        _format_created_at(e.get("timestamp")),
-                    )
-                    for e in batch
-                ],
-            )
-            await db.commit()
+            start = time.monotonic()
+            try:
+                db = await get_db()
+                await db.executemany(
+                    """
+                    INSERT INTO events
+                        (agent_id, session_id, event_type, path, detail, severity, pid, event_source, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            e["agent_id"], e["session_id"], e["event_type"], e["path"],
+                            json.dumps(e.get("detail") or {}), e.get("severity", "low"),
+                            e.get("pid"), e.get("event_source"),
+                            _format_created_at(e.get("timestamp")),
+                        )
+                        for e in batch
+                    ],
+                )
+                await db.commit()
+            finally:
+                elapsed = time.monotonic() - start
+                logger.info(f"[TIMING] write_batch took {elapsed:.2f}s, n_events={len(batch)}")
 
         try:
             await self.enqueue(_write_batch)

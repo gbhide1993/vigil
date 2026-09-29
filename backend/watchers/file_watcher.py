@@ -29,6 +29,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime, timezone
 
 import psutil
 from watchdog.events import FileSystemEventHandler
@@ -36,9 +37,20 @@ from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 
 from core.attributor import Attributor
+from core.burst_detector import BurstDetector
+from core.correlation_engine import CorrelationEngine
+from core.evidence import AttributionChain, AttributionConfidence, VigilEvidence
+from core.evidence_store import evidence_store
 from core.red_lines import RedLines, is_agent_config_path, is_mcp_config_path, register_agent_workspace
 from db.database import get_db
 from watchers.etw_file_watcher import ETWFileWatcher
+
+_CONFIDENCE_BY_NAME = {
+    "HIGH": AttributionConfidence.HIGH,
+    "MEDIUM": AttributionConfidence.MEDIUM,
+    "LOW": AttributionConfidence.LOW,
+    "UNKNOWN": AttributionConfidence.UNKNOWN,
+}
 
 logger = logging.getLogger("vlaw")
 
@@ -190,6 +202,8 @@ class VlawFileHandler(FileSystemEventHandler):
         loop: asyncio.AbstractEventLoop,
         pid_cache: "_AgentPidCache | None",
         use_pid_heuristic: bool = False,
+        process_watcher=None,
+        network_watcher=None,
     ):
         super().__init__()
         self.attributor = attributor
@@ -201,6 +215,15 @@ class VlawFileHandler(FileSystemEventHandler):
         # _find_owning_agent_pid's docstring for why the polling tier skips
         # the open-handle refinement.
         self.use_pid_heuristic = use_pid_heuristic
+        # WHO confidence, Stage 1: independent of any single event's own
+        # pid-guess attribution above. process_watcher/network_watcher are
+        # optional (None when this handler isn't wired into main.py's
+        # scheduler, e.g. in isolated tests) — check_burst() is a no-op
+        # without them.
+        self.process_watcher = process_watcher
+        self.network_watcher = network_watcher
+        self._burst_detector = BurstDetector()
+        self._correlation_engine = CorrelationEngine()
 
     def on_any_event(self, event):
         """Tiers 2/3 entry point — native Observer and PollingObserver both
@@ -247,6 +270,13 @@ class VlawFileHandler(FileSystemEventHandler):
         confidence: str,
         timestamp: float | None = None,
     ) -> None:
+        # Recorded regardless of whether this specific event resolves to a
+        # known agent below — burst+correlation (check_burst) is a second,
+        # independent attribution path meant to catch activity the
+        # per-event pid-guess above can't, so it needs every file change,
+        # not just the ones this path already attributed.
+        await self._burst_detector.record_event(path, event_type)
+
         agent_name = self.attributor.get_agent_for_pid(pid) if pid else None
 
         if agent_name is None:
@@ -281,6 +311,38 @@ class VlawFileHandler(FileSystemEventHandler):
             # start_file_watcher), so this path is not expected to run in
             # practice. Writes directly, bypassing buffering entirely.
             await self._write_direct(event_dict)
+
+    async def check_burst(self) -> None:
+        """Scheduled every 30s (see main.py) — independent of
+        handle_file_event's own per-event pid-guess attribution. Correlates
+        a burst of file changes against recent network connections (LLM API
+        domains) and the current process table via CorrelationEngine; only
+        produces evidence when at least one of those independent layers
+        actually corroborates, per compute_confidence's own gating."""
+        burst = await self._burst_detector.flush_burst()
+        if burst is None:
+            return
+        if self.process_watcher is None or self.network_watcher is None:
+            logger.warning("check_burst: process_watcher/network_watcher not wired in -- dropping burst")
+            return
+
+        result = self._correlation_engine.compute_confidence(
+            burst,
+            self.network_watcher.get_recent_events(window_secs=90),
+            self.process_watcher.get_snapshot(),
+        )
+
+        evidence = VigilEvidence(
+            what=f"{burst['event_count']} files modified",
+            when=datetime.fromtimestamp(burst["start_time"], tz=timezone.utc),
+            attribution=AttributionChain(
+                confidence=_CONFIDENCE_BY_NAME[result["who_confidence"]],
+                chain=result["observation_layers"],
+                basis="; ".join(result["attribution_basis"]) or "No corroborating signals observed.",
+                attributed_agent=result["who"],
+            ),
+        )
+        evidence_store.add_evidence(evidence)
 
     async def _write_direct(self, event: dict) -> None:
         """Last-resort direct write used only when self.aggregator is None
@@ -384,19 +446,31 @@ def _schedule_paths(observer, handler: VlawFileHandler, watch_paths: list[str], 
 
 def start_file_watcher(
     attributor: Attributor, aggregator, watch_paths: list[str], non_recursive_paths: list[str] | None = None,
+    process_watcher=None, network_watcher=None,
 ):
     """Starts the highest-priority file-watching tier that will come up
-    (see module docstring) and returns it. The return value always exposes
-    .stop() / .join(timeout) / .is_alive() regardless of which tier it is —
-    main.py's shutdown sequence and /health endpoint treat it uniformly and
-    need no changes for any of this."""
+    (see module docstring) and returns (watcher, handler). The watcher half
+    always exposes .stop() / .join(timeout) / .is_alive() regardless of
+    which tier it is — main.py's shutdown sequence and /health endpoint
+    treat it uniformly and need no changes for any of this. The handler
+    half is returned so main.py can schedule its check_burst() method
+    (Stage 1 burst+correlation) periodically, the same way it schedules the
+    other watchers' poll() — that scheduler doesn't exist yet at the point
+    in main.py's startup sequence where this function is called.
+
+    process_watcher/network_watcher are threaded through to the handler
+    (see VlawFileHandler.check_burst) purely so it can read their
+    get_snapshot()/get_recent_events() — nothing here calls into them."""
     loop = asyncio.get_event_loop()
 
     etw_watcher = ETWFileWatcher(attributor)
-    etw_handler = VlawFileHandler(attributor, aggregator, loop, pid_cache=None)
+    etw_handler = VlawFileHandler(
+        attributor, aggregator, loop, pid_cache=None,
+        process_watcher=process_watcher, network_watcher=network_watcher,
+    )
     etw_watcher.set_callback(etw_handler.handle_etw_event)
     if etw_watcher.start():
-        return etw_watcher
+        return etw_watcher, etw_handler
 
     # Only built for tiers 2/3 (ETW never guesses a pid, so never needs
     # this) -- starts its own background refresh thread, see _AgentPidCache.
@@ -414,17 +488,23 @@ def start_file_watcher(
     if use_native:
         try:
             candidate = Observer()
-            handler = VlawFileHandler(attributor, aggregator, loop, pid_cache, use_pid_heuristic=True)
+            handler = VlawFileHandler(
+                attributor, aggregator, loop, pid_cache, use_pid_heuristic=True,
+                process_watcher=process_watcher, network_watcher=network_watcher,
+            )
             _schedule_paths(candidate, handler, watch_paths, non_recursive_paths)
             candidate.start()
             logger.info("file watcher: using native real-time observer (ReadDirectoryChangesW)")
-            return candidate
+            return candidate, handler
         except Exception:
             logger.exception("file watcher: native observer failed to start, falling back to polling")
 
     observer = PollingObserver(timeout=POLL_INTERVAL_SECONDS)
-    handler = VlawFileHandler(attributor, aggregator, loop, pid_cache, use_pid_heuristic=False)
+    handler = VlawFileHandler(
+        attributor, aggregator, loop, pid_cache, use_pid_heuristic=False,
+        process_watcher=process_watcher, network_watcher=network_watcher,
+    )
     _schedule_paths(observer, handler, watch_paths, non_recursive_paths)
     observer.start()
     logger.info("file watcher: using polling observer")
-    return observer
+    return observer, handler

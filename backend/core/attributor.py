@@ -108,7 +108,7 @@ class Attributor:
         self.sessions = SessionManager()
         self.behaviour_detector = BehaviourDetector()
 
-    def get_agent_for_pid(self, pid: int) -> str | None:
+    def get_agent_for_pid(self, pid: int, pid_snapshot: dict[int, dict] | None = None) -> str | None:
         """Match a PID to a known agent by process name, walking up the
         parent chain if the direct process isn't a known agent binary. If
         that fails, falls back to scoring the PID's recent OS-level
@@ -116,6 +116,18 @@ class Attributor:
         KNOWN_AGENTS recognizes but that behaves like an agent (rapid,
         clustered file/process activity) is attributed to
         "unidentified_agent" instead of being missed entirely.
+
+        `pid_snapshot` is an optional {pid: {"name", "ppid", ...}} dict
+        (see _walk_parent_chain) built once per poll from a single
+        psutil.process_iter() pass — when given, the parent-chain walk
+        resolves entirely from this in-memory dict instead of opening a
+        fresh OS process handle (psutil.Process(pid).parent()) per level,
+        which on Windows can stall unpredictably against a single
+        AV-protected or otherwise slow-to-open process. Callers that poll
+        many PIDs per cycle (ProcessWatcher) should build one snapshot per
+        poll and pass it here; callers resolving a single already-of-interest
+        pid (NetworkWatcher, file_watcher) can omit it and fall back to the
+        live per-PID walk.
 
         Cached per-PID (see _agent_attribution_cache above) since a PID's
         parent chain and name are immutable for the process's lifetime —
@@ -131,7 +143,7 @@ class Attributor:
             if now - cached_at < ATTRIBUTION_CACHE_TTL_SECONDS:
                 return agent
 
-        agent = self._walk_parent_chain(pid)
+        agent = self._walk_parent_chain(pid, pid_snapshot)
         score = None
         if agent is None:
             agent, score = self._score_behaviour(pid)
@@ -139,7 +151,7 @@ class Attributor:
         _agent_attribution_cache[pid] = (agent, score, now)
         return agent
 
-    def get_named_agent_for_pid(self, pid: int) -> str | None:
+    def get_named_agent_for_pid(self, pid: int, pid_snapshot: dict[int, dict] | None = None) -> str | None:
         """Like get_agent_for_pid, but never triggers the behavioural
         fallback (_score_behaviour) — name-match only, via the cache or
         _walk_parent_chain. For broad sweeps over most/all of the system's
@@ -167,7 +179,7 @@ class Attributor:
             if time.time() - cached_at < ATTRIBUTION_CACHE_TTL_SECONDS:
                 return agent
 
-        return self._walk_parent_chain(pid)
+        return self._walk_parent_chain(pid, pid_snapshot)
 
     def get_behaviour_score_for_pid(self, pid: int) -> float | None:
         """The behaviour-detector confidence score behind a cached
@@ -208,7 +220,10 @@ class Attributor:
             return "unidentified_agent", score
         return None, score
 
-    def _walk_parent_chain(self, pid: int) -> str | None:
+    def _walk_parent_chain(self, pid: int, pid_snapshot: dict[int, dict] | None = None) -> str | None:
+        if pid_snapshot is not None:
+            return self._walk_parent_chain_from_snapshot(pid, pid_snapshot)
+
         try:
             proc = psutil.Process(pid)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -225,6 +240,37 @@ class Attributor:
                 current = current.parent()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 current = None
+            depth += 1
+
+        return None
+
+    @staticmethod
+    def _walk_parent_chain_from_snapshot(pid: int, pid_snapshot: dict[int, dict]) -> str | None:
+        """Same match logic as _walk_parent_chain, but resolves every level
+        of the chain from a pre-built {pid: {"name", "ppid"}} dict (one
+        psutil.process_iter() pass per poll) instead of opening a fresh OS
+        process handle per level via psutil.Process(pid).parent() — that
+        per-level handle open is what stalls unpredictably on Windows
+        against a single AV-protected or otherwise slow-to-open process.
+        Zero psutil calls in this method."""
+        current_pid = pid
+        visited: set[int] = set()
+        depth = 0
+        while current_pid is not None and current_pid not in visited and depth < 10:
+            visited.add(current_pid)
+            info = pid_snapshot.get(current_pid)
+            if info is None:
+                return None
+
+            name = info.get("name") or ""
+            for agent_key, process_names in KNOWN_AGENTS.items():
+                if any(pn.lower() in name.lower() for pn in process_names):
+                    return agent_key
+
+            ppid = info.get("ppid")
+            if not ppid or ppid == current_pid:
+                break
+            current_pid = ppid
             depth += 1
 
         return None

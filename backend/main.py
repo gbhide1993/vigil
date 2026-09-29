@@ -51,10 +51,11 @@ os.environ.setdefault("VLAW_POLICY_FILE", os.path.join(BASE_DIR, "policy", "vlaw
 os.environ.setdefault("VLAW_LICENSE_FILE", os.path.join(BASE_DIR, ".vlaw-license"))
 
 import asyncio
+import concurrent.futures
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 
-from apscheduler.executors.pool import ThreadPoolExecutor as APSchedulerThreadPoolExecutor
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, APIRouter
 from fastapi.staticfiles import StaticFiles
@@ -262,8 +263,18 @@ async def lifespan(app: FastAPI):
     aggregator._writer_task = asyncio.create_task(
         aggregator.start_writer(), name="vigil_db_writer"
     )
+    # start_writer() runs unsupervised otherwise -- nothing else awaits this
+    # task or checks .done() on it, so if it ever dies (an exception escaping
+    # somewhere other than the per-write try/except inside start_writer(),
+    # e.g. a CancelledError landing mid coro_factory()), every future
+    # Aggregator.enqueue() call hangs forever awaiting a future nothing will
+    # ever resolve, with no trace in the log. This makes that loud instead.
+    aggregator._writer_task.add_done_callback(
+        lambda t: logger.error(f"writer task ended unexpectedly: {t.exception()}")
+        if not t.cancelled() and t.exception() else None
+    )
     baseline = Baseline()
-    process_watcher = ProcessWatcher(attributor)
+    process_watcher = ProcessWatcher(attributor, aggregator)
     network_watcher = NetworkWatcher(attributor, aggregator)
     mcp_watcher = McpWatcher(attributor)
 
@@ -272,11 +283,38 @@ async def lifespan(app: FastAPI):
 
     # 4. File watcher (PollingObserver — Docker/Windows safe)
     watch_paths, red_line_non_recursive_dirs = build_watch_paths(policy)
-    observer = start_file_watcher(attributor, aggregator, watch_paths, red_line_non_recursive_dirs)
+    observer, file_handler = start_file_watcher(
+        attributor, aggregator, watch_paths, red_line_non_recursive_dirs,
+        process_watcher=process_watcher, network_watcher=network_watcher,
+    )
     _state["observer"] = observer
     logger.info("file watcher started, watching %d paths", len(watch_paths) + len(red_line_non_recursive_dirs))
 
     # 5. APScheduler jobs
+    # Several watchers dispatch onto the loop's *default* executor (not
+    # their own dedicated ones) -- asyncio.to_thread always does, and
+    # file_watcher.py's _find_owning_agent_pid explicitly passes
+    # executor=None to run_in_executor. Python's own default size
+    # (min(32, cpu_count+4)) can be exhausted by enough concurrent
+    # to_thread dispatches (e.g. many agent-named PIDs at once on
+    # ProcessWatcher's cold start), after which anything else waiting on
+    # the default executor queues behind them. Raised here, once, before
+    # any watcher starts making default-executor calls.
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=50))
+
+    logger.info("Pre-warming PowerShell subprocess cache...")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'powershell', '-NoProfile', '-NonInteractive', '-Command', 'exit',
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await asyncio.wait_for(proc.wait(), timeout=30)
+        logger.info("PowerShell pre-warm complete")
+    except Exception as e:
+        logger.warning("PowerShell pre-warm failed (non-fatal): %s", e)
+
     # max_instances=1 (APScheduler's own default, made explicit here) stops
     # a slow poll from piling up overlapping runs of itself; coalesce=True
     # collapses any runs missed while the loop was busy into a single catch-up
@@ -284,29 +322,48 @@ async def lifespan(app: FastAPI):
     # "what's changed" state fresh from the OS every poll (see e.g.
     # ProcessWatcher._known_pids), so collapsing missed runs doesn't drop any
     # detection — there's no queued-event backlog to lose.
-    # Default APScheduler threadpool is 10 workers; bumped to 20 here for
-    # headroom. Note: every job registered below is a coroutine function
-    # (async def) — AsyncIOScheduler runs those as native asyncio tasks on
-    # the event loop directly, not through this executor's thread pool, so
-    # this pool is only exercised by a plain (non-async) job or by
-    # APScheduler's own internals. It's applied regardless since a
-    # future non-async job would otherwise silently share the smaller
-    # default pool with everything else.
-    scheduler = AsyncIOScheduler(executors={"default": APSchedulerThreadPoolExecutor(20)})
-    scheduler.add_job(process_watcher.poll, "interval", seconds=30, id="process_watcher", max_instances=1, coalesce=True)
-    scheduler.add_job(network_watcher.poll, "interval", seconds=30, id="network_watcher", max_instances=1, coalesce=True)
-    scheduler.add_job(mcp_watcher.poll, "interval", seconds=30, id="mcp_watcher", max_instances=1, coalesce=True)
-    scheduler.add_job(aggregator.flush_buffers, "interval", seconds=15, id="aggregator_flush", max_instances=1, coalesce=True)
-    scheduler.add_job(_baseline_tick, "interval", hours=1, id="baseline_update", args=[baseline], max_instances=1, coalesce=True)
+    scheduler = AsyncIOScheduler()
+
+    # Staggered next_run_time (5s/15s/25s from startup) so the three
+    # watchers' 30s intervals never re-align to fire in the same instant —
+    # each watcher's own 25s asyncio.timeout can otherwise expire at the
+    # same moment as the other two, all three subprocess scans/DB work
+    # landing on the event loop together and visibly delaying unrelated
+    # requests (e.g. /health) for several seconds. A 10s gap spreads that
+    # load across the cycle instead of bursting it.
+    _now = datetime.now(scheduler.timezone)
     scheduler.add_job(
-        attributor.sessions.close_idle_sessions,
-        "interval",
-        seconds=60,
-        id="session_idle_check",
-        args=[baseline],
-        max_instances=1,
-        coalesce=True,
+        process_watcher.poll, "interval", seconds=30, id="process_watcher",
+        max_instances=1, coalesce=True, replace_existing=True,
+        next_run_time=_now + timedelta(seconds=5),
     )
+    # NetworkWatcher disabled pending event-loop audit — resolution phase contains blocking I/O.
+    # scheduler.add_job(
+    #     network_watcher.poll, "interval", seconds=30, id="network_watcher",
+    #     max_instances=1, coalesce=True, replace_existing=True,
+    #     next_run_time=_now + timedelta(seconds=15),
+    # )
+    # McpWatcher disabled pending async subprocess refactor — WMI contention with ProcessWatcher.
+    # scheduler.add_job(
+    #     mcp_watcher.poll, "interval", seconds=30, id="mcp_watcher",
+    #     max_instances=1, coalesce=True, replace_existing=True,
+    #     next_run_time=_now + timedelta(seconds=25),
+    # )
+    scheduler.add_job(aggregator.flush_buffers, "interval", seconds=15, id="aggregator_flush", max_instances=1, coalesce=True)
+    # Stage 1 burst+correlation (see watchers/file_watcher.py::check_burst) —
+    # independent of any single file event's own pid-guess attribution.
+    scheduler.add_job(file_handler.check_burst, "interval", seconds=30, id="file_burst_check", max_instances=1, coalesce=True)
+    scheduler.add_job(_baseline_tick, "interval", hours=1, id="baseline_update", args=[baseline], max_instances=1, coalesce=True)
+    # SessionManager.close_idle_sessions disabled pending event-loop audit.
+    # scheduler.add_job(
+    #     attributor.sessions.close_idle_sessions,
+    #     "interval",
+    #     seconds=60,
+    #     id="session_idle_check",
+    #     args=[baseline],
+    #     max_instances=1,
+    #     coalesce=True,
+    # )
     scheduler.start()
     _state["scheduler"] = scheduler
     logger.info("scheduler started")

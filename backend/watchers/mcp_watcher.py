@@ -4,25 +4,123 @@ best-effort: localhost connections in that port range, plus processes
 whose command line mentions "mcp"."""
 
 import asyncio
+import concurrent.futures
+import csv
+import io
 import json
+import logging
+import subprocess
 import time
-
-import psutil
 
 from core.alerter import Alerter
 from core.attributor import Attributor
 from core.red_lines import RedLines
 from db.database import get_db
 
+logger = logging.getLogger("vlaw")
+
 POLL_INTERVAL_SECONDS = 5
 
 MCP_PORT_RANGE = range(8000, 9001)
 LOCALHOST_IPS = {"127.0.0.1", "::1", "localhost"}
 
+# Bound on the two per-poll asyncio.to_thread(get_agent_for_pid) dispatches
+# in _log_mcp_connection — that call can fall through to
+# Attributor._score_behaviour's synchronous sqlite3 connection (see its
+# docstring), and to_thread itself has no timeout of its own.
+_AGENT_LOOKUP_TIMEOUT_SECONDS = 10
+
 
 def _is_mcp_process(cmdline: str, name: str) -> bool:
     lowered = (cmdline + " " + name).lower()
     return "mcp" in lowered
+
+
+def _get_connections_powershell() -> list[dict]:
+    """Established-TCP-connection enumeration via Get-NetTCPConnection —
+    single WMI-backed query instead of psutil.net_connections()'s
+    per-connection OS lookups. Mirrors
+    watchers/network_watcher.py::_get_network_connections_powershell
+    (kept as its own copy here rather than a cross-module import, matching
+    this codebase's existing pattern of each watcher owning its own small
+    enumeration helpers).
+
+    30s timeout covers a measured ~21s worst-case cold start. No psutil
+    fallback: a fallback here would run psutil.net_connections()
+    unbounded on the same thread that just waited out this timeout, which
+    is exactly the "PowerShell times out, falls back to an unbounded
+    psutil call" failure mode that caused this watcher to stall for 60+
+    seconds. poll()'s asyncio.timeout(35) is the sole remaining safety net
+    for a call that still doesn't return in time."""
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-NonInteractive', '-Command',
+             'Get-NetTCPConnection -State Established | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,OwningProcess | ConvertTo-Csv -NoTypeInformation'],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            logger.warning(
+                "McpWatcher: Get-NetTCPConnection returned no output (returncode=%s)",
+                result.returncode,
+            )
+            return []
+        connections = []
+        reader = csv.DictReader(io.StringIO(result.stdout))
+        for row in reader:
+            try:
+                connections.append({
+                    'remote_addr': row.get('RemoteAddress', '').strip().strip('"'),
+                    'remote_port': int(row.get('RemotePort', '0').strip().strip('"') or 0),
+                    'pid': int(row.get('OwningProcess', '0').strip().strip('"') or 0),
+                })
+            except (ValueError, KeyError):
+                continue
+        return connections
+    except Exception as e:
+        logger.warning("McpWatcher: Get-NetTCPConnection failed: %s", e)
+        return []
+
+
+def _get_process_list_with_cmdline_powershell() -> list[dict]:
+    """Single Get-CimInstance Win32_Process query returning {pid, name,
+    cmdline} for every process — replaces psutil.process_iter() plus a
+    proc.cmdline() call for every single process (the same per-process
+    OpenProcess cost watchers/_process_scan_worker.py exists to isolate for
+    ProcessWatcher, just needed here across every process rather than a
+    narrow agent-candidate subset, since any process's command line might
+    mention "mcp"). CommandLine is already a single string from WMI, unlike
+    psutil's cmdline() (a list of args) — matches what _is_mcp_process
+    expects directly, no join needed.
+
+    30s timeout + no psutil fallback, same reasoning as
+    _get_connections_powershell above."""
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-NonInteractive', '-Command',
+             'Get-CimInstance Win32_Process | Select-Object ProcessId,Name,CommandLine | ConvertTo-Csv -NoTypeInformation'],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            logger.warning(
+                "McpWatcher: Get-CimInstance Win32_Process returned no output (returncode=%s)",
+                result.returncode,
+            )
+            return []
+        procs = []
+        reader = csv.DictReader(io.StringIO(result.stdout))
+        for row in reader:
+            try:
+                pid = int(row.get('ProcessId', '').strip().strip('"'))
+            except (ValueError, KeyError):
+                continue
+            name = (row.get('Name') or '').strip().strip('"')
+            cmdline = (row.get('CommandLine') or '').strip().strip('"')
+            if pid:
+                procs.append({'pid': pid, 'name': name, 'cmdline': cmdline})
+        return procs
+    except Exception as e:
+        logger.warning("McpWatcher: Get-CimInstance Win32_Process failed: %s", e)
+        return []
 
 
 class McpWatcher:
@@ -31,22 +129,43 @@ class McpWatcher:
         self.alerter = Alerter()
         self.red_lines = RedLines()
         self._seen_connections: set[tuple] = set()
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="mcp-watcher")
+
+    def stop(self) -> None:
+        self._executor.shutdown(wait=False)
 
     async def poll(self) -> None:
-        """psutil.net_connections()/process_iter() are synchronous and
-        OS-bound. Run directly inside this async def, they block the single
-        asyncio event loop that also serves HTTP and runs the scheduler —
-        same failure mode already fixed in ProcessWatcher.poll/
-        NetworkWatcher.poll (see those methods' docstrings). Both scans are
-        offloaded to the thread pool executor via run_in_executor; only DB
-        writes and alert firing (already async) stay on the loop."""
+        """Both scans (_gather_port_candidates/_gather_process_candidates)
+        are bounded by their own PowerShell query's
+        subprocess.run(timeout=30) (_get_connections_powershell/
+        _get_process_list_with_cmdline_powershell) — no psutil fallback
+        (see those functions' docstrings for why). Still dispatched via
+        this watcher's own dedicated thread pool executor (self._executor),
+        not the loop's shared default executor, so a stuck call here can't
+        starve ProcessWatcher, NetworkWatcher, or Aggregator.
+        _log_mcp_connection's get_agent_for_pid lookup is separately
+        bounded by asyncio.wait_for(..., timeout=_AGENT_LOOKUP_TIMEOUT_SECONDS).
+
+        This asyncio.timeout(35) is a second, independent safety net: it
+        can't stop a subprocess.run call already in flight in self._executor
+        (a timed-out await doesn't kill the thread beneath it), but it does
+        stop a single stuck cycle from blocking this watcher's own
+        scheduling indefinitely, and bounds how long a cycle can appear
+        stuck to callers like /health."""
+        try:
+            async with asyncio.timeout(35):
+                await self._poll_body()
+        except TimeoutError:
+            logger.warning("McpWatcher.poll timed out after 35s -- skipping cycle")
+
+    async def _poll_body(self) -> None:
         db = await get_db()
         current_keys: set[tuple] = set()
 
         loop = asyncio.get_event_loop()
 
         # 1. Localhost connections in the MCP port range
-        port_candidates = await loop.run_in_executor(None, self._gather_port_candidates)
+        port_candidates = await loop.run_in_executor(self._executor, self._gather_port_candidates)
         for pid, port in port_candidates:
             key = ("port", pid, port)
             current_keys.add(key)
@@ -57,7 +176,7 @@ class McpWatcher:
 
         # 2. Processes with "mcp" in their command line (stdio transport,
         #    or servers not yet in an ESTABLISHED connection state)
-        proc_candidates = await loop.run_in_executor(None, self._gather_process_candidates)
+        proc_candidates = await loop.run_in_executor(self._executor, self._gather_process_candidates)
         for pid, name in proc_candidates:
             key = ("proc", pid)
             current_keys.add(key)
@@ -73,51 +192,48 @@ class McpWatcher:
     def _gather_port_candidates() -> list[tuple[int, int]]:
         """Synchronous — runs in the thread pool executor via poll(). Returns
         (pid, port) pairs for established localhost connections in the MCP
-        port range, so the caller's async loop over the results never
-        touches psutil directly."""
-        try:
-            connections = psutil.net_connections(kind="inet")
-        except (psutil.AccessDenied, PermissionError):
-            return []
-
-        candidates = []
-        for conn in connections:
-            if conn.status != psutil.CONN_ESTABLISHED or conn.raddr is None:
-                continue
-            if conn.raddr.ip not in LOCALHOST_IPS:
-                continue
-            if conn.raddr.port not in MCP_PORT_RANGE:
-                continue
-            if conn.pid is None:
-                continue
-            candidates.append((conn.pid, conn.raddr.port))
-        return candidates
+        port range. No psutil fallback — see _get_connections_powershell's
+        docstring for why; an empty/failed call just means no candidates
+        this cycle."""
+        raw = _get_connections_powershell()
+        return [
+            (c["pid"], c["remote_port"])
+            for c in raw
+            if c["pid"] and c["remote_addr"] in LOCALHOST_IPS and c["remote_port"] in MCP_PORT_RANGE
+        ]
 
     @staticmethod
     def _gather_process_candidates() -> list[tuple[int, str]]:
         """Synchronous — runs in the thread pool executor via poll(). Returns
-        (pid, name) pairs for processes whose command line mentions "mcp"."""
-        candidates = []
-        for proc in psutil.process_iter(["pid", "name"]):
-            try:
-                cmdline = " ".join(proc.cmdline())
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-
-            name = proc.info["name"] or ""
-            if not _is_mcp_process(cmdline, name):
-                continue
-
-            candidates.append((proc.info["pid"], name))
-        return candidates
+        (pid, name) pairs for processes whose command line mentions "mcp".
+        No psutil fallback — see _get_process_list_with_cmdline_powershell's
+        docstring for why; an empty/failed call just means no candidates
+        this cycle."""
+        procs = _get_process_list_with_cmdline_powershell()
+        return [
+            (p["pid"], p["name"])
+            for p in procs
+            if _is_mcp_process(p["cmdline"], p["name"])
+        ]
 
     async def _log_mcp_connection(self, db, pid: int, endpoint: str) -> None:
         # get_agent_for_pid can fall through to Attributor._score_behaviour,
-        # which opens a synchronous sqlite3 connection (see its docstring) —
-        # unlike ProcessWatcher/NetworkWatcher, this call wasn't already
-        # wrapped in run_in_executor/to_thread, so it was blocking the event
-        # loop directly on every MCP connection this method logs.
-        agent_name = await asyncio.to_thread(self.attributor.get_agent_for_pid, pid)
+        # which opens a synchronous sqlite3 connection (see its docstring).
+        # asyncio.to_thread keeps that off the event loop, but has no
+        # timeout of its own -- wait_for bounds how long this specific
+        # lookup can hold up this method, tighter than poll()'s own outer
+        # asyncio.timeout(35) safety net. A timeout here doesn't kill the
+        # underlying thread (not forcibly killable), just stops awaiting
+        # it, matching the same tradeoff already accepted elsewhere in this
+        # codebase for the same underlying call.
+        try:
+            agent_name = await asyncio.wait_for(
+                asyncio.to_thread(self.attributor.get_agent_for_pid, pid),
+                timeout=_AGENT_LOOKUP_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("McpWatcher: get_agent_for_pid timed out for pid=%d -- skipping this connection", pid)
+            return
         if agent_name is None:
             return  # not under a known agent — not our concern
 
