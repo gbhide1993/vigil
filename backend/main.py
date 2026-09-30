@@ -274,6 +274,25 @@ async def lifespan(app: FastAPI):
         if not t.cancelled() and t.exception() else None
     )
     baseline = Baseline()
+
+    # Session recovery: a session whose process died before
+    # close_idle_sessions closed it (self._active is in-memory only, so it
+    # doesn't survive a restart) is left with ended_at NULL forever --
+    # never rolled up, scored, or summarized -- unless recovered here.
+    # Needs `baseline` (just constructed above, see recover_orphaned_
+    # sessions' scoring pass), so this can't run any earlier in startup.
+    # Wrapped so a recovery failure can never stop the backend from
+    # starting -- recover_orphaned_sessions already isolates one bad
+    # session from the rest, this is the outer belt-and-suspenders in
+    # case something fails before that per-session isolation even begins
+    # (e.g. the initial SELECT itself).
+    try:
+        recovered = await attributor.sessions.recover_orphaned_sessions(baseline)
+        if recovered:
+            logger.info("session recovery: closed %d orphaned session(s) from a previous run", recovered)
+    except Exception:
+        logger.exception("session recovery failed -- continuing startup without it")
+
     process_watcher = ProcessWatcher(attributor, aggregator)
     network_watcher = NetworkWatcher(attributor, aggregator)
     mcp_watcher = McpWatcher(attributor)

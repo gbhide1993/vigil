@@ -27,10 +27,10 @@ async def commit_summary(lookback_minutes: int = Query(default=60, ge=1, le=1440
         SELECT s.*, a.name as agent_name
         FROM sessions s
         LEFT JOIN agents a ON a.id = s.agent_id
-        WHERE s.started_at > datetime('now', ?)
+        WHERE s.started_at > datetime('now', ?) OR s.ended_at IS NULL OR s.ended_at > datetime('now', ?)
         ORDER BY s.started_at DESC
         """,
-        (since_clause,),
+        (since_clause, since_clause),
     )
     session_rows = await cur.fetchall()
     session_ids = [row["id"] for row in session_rows]

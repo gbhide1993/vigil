@@ -1,7 +1,7 @@
 import io
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from db.database import get_db
@@ -13,7 +13,10 @@ def _date_bounds(date: str) -> tuple[str, str]:
     if date == "today":
         day = datetime.now(timezone.utc).date()
     else:
-        day = datetime.fromisoformat(date).date()
+        try:
+            day = datetime.fromisoformat(date).date()
+        except ValueError:
+            raise HTTPException(400, "date must be 'today' or YYYY-MM-DD")
     start = f"{day.isoformat()} 00:00:00"
     end = f"{day.isoformat()} 23:59:59"
     return start, end

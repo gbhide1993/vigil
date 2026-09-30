@@ -65,14 +65,18 @@ class LicenseService:
         self._trial_marker_path = LICENSE_FILE.parent / ".vlaw-trial-started"
 
     def get_status(self) -> LicenseStatus:
+        status = None
         if LICENSE_FILE.exists():
             status = self._validate_license_file()
-            if status is not None:
+            if status is not None and status.valid:
                 return status
-            # invalid/corrupt license file — fall through to trial so
-            # the app still starts, but the reason is preserved for /health
+            # invalid/corrupt/expired license file — fall through to trial
+            # so the app still starts, but the reason is preserved for /health
 
-        return self._get_trial_status()
+        trial = self._get_trial_status()
+        if status is not None:
+            trial.reason = status.reason
+        return trial
 
     def _validate_license_file(self) -> LicenseStatus | None:
         try:
@@ -112,9 +116,13 @@ class LicenseService:
 
         node_count = int(payload.get("node_count", 1))
 
+        now = datetime.now(timezone.utc)
+        expired = bool(expires_at and now > expires_at)
+        valid = not expired
+
         status = LicenseStatus(
-            valid=True, plan=plan, node_count=node_count, expires_at=expires_at,
-            is_trial=(plan == "trial"), reason="ok",
+            valid=valid, plan=plan, node_count=node_count, expires_at=expires_at,
+            is_trial=(plan == "trial"), reason="expired" if expired else "ok",
         )
         return status
 
@@ -141,9 +149,11 @@ class LicenseService:
     def _get_trial_status(self) -> LicenseStatus:
         trial_started_at = self._get_or_set_trial_start()
         expires_at = trial_started_at + timedelta(days=TRIAL_DAYS)
+        now = datetime.now(timezone.utc)
+        valid = now <= expires_at
 
         return LicenseStatus(
-            valid=True,
+            valid=valid,
             plan="trial",
             node_count=1,
             expires_at=expires_at,
@@ -159,8 +169,14 @@ class LicenseService:
         14-day window survives restarts and can't be reset by deleting
         just the DB."""
         if self._trial_marker_path.exists():
-            iso = self._trial_marker_path.read_text().strip()
-            return datetime.fromisoformat(iso)
+            try:
+                iso = self._trial_marker_path.read_text().strip()
+                started = datetime.fromisoformat(iso)
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                return started
+            except ValueError:
+                pass  # corrupt marker -- fall through and restart the trial
 
         now = datetime.now(timezone.utc)
         self._trial_marker_path.parent.mkdir(parents=True, exist_ok=True)

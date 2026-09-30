@@ -88,7 +88,7 @@ async def check_time_anomaly(session_id: str, agent_id: int, agent_name: str, se
     hour = start_dt.hour
     normal_start, normal_end = prior["normal_hours"]
 
-    if normal_start <= hour <= normal_end:
+    if normal_start <= hour < normal_end:
         return []
 
     hour12 = hour % 12 or 12
@@ -190,20 +190,28 @@ async def check_network_destinations(session_id: str, agent_id: int, agent_name:
     alert_ids: list[int] = []
     for row in rows:
         dest = row["path"]
-        if dest == "localhost" or dest.startswith("127.0.0.1"):
+        host = dest.rsplit(":", 1)[0] if dest.count(":") == 1 else dest
+        if host == "localhost" or host == "127.0.0.1":
             continue
-        if any(dest.endswith(k) for k in known):
+        if any(host == k or host.endswith("." + k) for k in known):
             continue
 
+        # {dest} is the last thing in the description (nothing follows it
+        # in that format string -- see the title/description built below),
+        # so an exact-suffix match is the reliable delimiter here: it's
+        # not just "contains dest" (a bare instr() would let a
+        # 'api.example.com' alert suppress a later 'api.example.com.evil.net'
+        # one, since the former is a substring/prefix of the latter's
+        # description), it's "the description ends with exactly dest".
         cur = await db.execute(
             """
             SELECT id FROM alerts
             WHERE agent_id = ? AND rule_type = 'unknown_destination'
-              AND description LIKE ?
+              AND substr(description, -length(?)) = ?
               AND created_at > datetime('now', '-24 hours')
             LIMIT 1
             """,
-            (agent_id, f"%{dest}%"),
+            (agent_id, dest, dest),
         )
         if await cur.fetchone() is not None:
             continue

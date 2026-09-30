@@ -92,11 +92,20 @@ class SessionManager:
                     )
                     await db.commit()
 
-                    await baseline.update_from_session(session_id)
-                    await self._write_summary(db, session_id, agent_id)
+                    try:
+                        await baseline.update_from_session(session_id)
+                    except Exception as e:
+                        print(f"baseline update failed for session {session_id}: {e}")
+
                     await self._score_layer2a(db, session_id, agent_id)
                     await self._score_layer2b(db, session_id, agent_id)
                     await self._check_cross_agent(db)
+                    # Alert-firing scoring above can add alerts that
+                    # _roll_up_session_stats' earlier count (taken before
+                    # scoring ran) couldn't see yet -- recount before writing
+                    # the summary so it reflects what actually got fired.
+                    await self._refresh_alert_count(db, session_id, agent_id)
+                    await self._write_summary(db, session_id, agent_id)
                     closed.append(session_id)
         except TimeoutError:
             logger.warning(
@@ -124,8 +133,11 @@ class SessionManager:
         stats = await cur.fetchone()
 
         cur = await db.execute(
-            "SELECT COUNT(*) c FROM alerts WHERE agent_id = ? AND event_id IN (SELECT id FROM events WHERE session_id = ?)",
-            (agent_id, session_id),
+            """
+            SELECT COUNT(*) c FROM alerts
+            WHERE agent_id = ? AND (session_id = ? OR event_id IN (SELECT id FROM events WHERE session_id = ?))
+            """,
+            (agent_id, session_id, session_id),
         )
         alert_count = (await cur.fetchone())["c"]
 
@@ -142,6 +154,26 @@ class SessionManager:
                 alert_count, session_id,
             ),
         )
+
+    async def _refresh_alert_count(self, db, session_id: str, agent_id: int) -> None:
+        """Recounts alerts for this session using the same WHERE clause as
+        _roll_up_session_stats, and persists it -- called after Layer 2a/2b/
+        cross-agent scoring has had a chance to fire alerts that the earlier
+        roll-up (taken before scoring ran) couldn't have counted yet."""
+        cur = await db.execute(
+            """
+            SELECT COUNT(*) c FROM alerts
+            WHERE agent_id = ? AND (session_id = ? OR event_id IN (SELECT id FROM events WHERE session_id = ?))
+            """,
+            (agent_id, session_id, session_id),
+        )
+        alert_count = (await cur.fetchone())["c"]
+
+        await db.execute(
+            "UPDATE sessions SET alert_count = ? WHERE id = ?",
+            (alert_count, session_id),
+        )
+        await db.commit()
 
     async def _write_summary(self, db, session_id: str, agent_id: int) -> None:
         cur = await db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
@@ -193,3 +225,58 @@ class SessionManager:
             await check_cross_agent_credential_access(db)
         except Exception as e:
             print(f"Cross-agent correlation check failed: {e}")
+
+    async def recover_orphaned_sessions(self, baseline) -> int:
+        """Startup-time recovery: a session whose process died before
+        close_idle_sessions ever got to it is left with ended_at NULL
+        forever (self._active is in-memory only, so it doesn't survive a
+        restart either) -- never rolled up, never scored, never
+        summarized. Call once at startup to close out every such session
+        from the previous run, running the same roll-up/scoring/summary
+        pipeline close_idle_sessions uses (baseline update, Layer 2a/2b,
+        alert-count refresh) so a recovered session isn't a second-class
+        citizen next to one that closed normally. _check_cross_agent runs
+        once after the loop, not per session -- it already scans the whole
+        events table, not just the session that just closed.
+
+        Each session is recovered independently: one bad row (a query
+        that fails, malformed data, whatever) is logged and skipped rather
+        than aborting the rest -- it's simply left with ended_at still
+        NULL and picked up again on the next startup. Returns the number
+        actually recovered, not the number of candidate rows."""
+        db = await get_db()
+        cur = await db.execute("SELECT id, agent_id FROM sessions WHERE ended_at IS NULL")
+        rows = await cur.fetchall()
+
+        recovered = 0
+        for row in rows:
+            session_id = row["id"]
+            agent_id = row["agent_id"]
+            try:
+                await self._roll_up_session_stats(db, session_id, agent_id)
+                await db.execute(
+                    """
+                    UPDATE sessions
+                    SET ended_at = COALESCE((SELECT MAX(created_at) FROM events WHERE session_id = ?), started_at)
+                    WHERE id = ?
+                    """,
+                    (session_id, session_id),
+                )
+                await db.commit()
+
+                try:
+                    await baseline.update_from_session(session_id)
+                except Exception as e:
+                    print(f"baseline update failed for session {session_id}: {e}")
+
+                await self._score_layer2a(db, session_id, agent_id)
+                await self._score_layer2b(db, session_id, agent_id)
+                await self._refresh_alert_count(db, session_id, agent_id)
+                await self._write_summary(db, session_id, agent_id)
+                recovered += 1
+            except Exception:
+                logger.exception("session recovery failed for session_id=%s -- left for next startup", session_id)
+
+        await self._check_cross_agent(db)
+
+        return recovered

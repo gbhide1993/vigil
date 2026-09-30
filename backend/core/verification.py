@@ -17,8 +17,6 @@ import os
 import re
 from pathlib import Path
 
-from db.database import get_db
-
 # File-path-bearing tool names in a Claude Code .jsonl transcript, and
 # which of their `input` keys hold the path(s) touched. Confirmed against
 # a real transcript (~/.claude/projects/.../<session>.jsonl) on 2026-07-14:
@@ -175,8 +173,6 @@ async def build_verification_report(session_id: str, agent_name: str, db) -> dic
             "reason": f"session log parsing is only implemented for claude_code, not {agent_name}",
         }
 
-    cur = await db.execute("SELECT started_at FROM sessions WHERE id = ?", (session_id,))
-    session_row = await cur.fetchone()
     project_cwd = os.getcwd()  # VLAW_HOST_ROOT/session-launch-dir equivalent; see core.red_lines.SESSION_LAUNCH_DIR
 
     log_path = find_session_log_path(session_id, project_cwd)

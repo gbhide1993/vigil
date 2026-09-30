@@ -92,6 +92,30 @@ async def _expand_file_event_paths(db, since_clause: str) -> list[dict]:
     return expanded
 
 
+async def _already_alerted(db, rule_type: str, path: str, window_clause: str, suffix: str) -> bool:
+    """Persisted dedup, independent of Alerter._last_fired's in-memory
+    cache (which resets on every restart): has an alert with this
+    rule_type already fired for this exact path within window_clause?
+
+    Matches path as a delimited token -- ' ' + path + suffix, where
+    `suffix` is the literal text that immediately follows {path} in the
+    calling check's own title format string (see check_cross_agent_
+    file_conflict/check_cross_agent_credential_access) -- not a bare
+    substring match. A plain instr(title, path) would let an alert on
+    /x/config suppress a later, genuinely different one on /x/config.bak,
+    since the shorter path is a substring of the longer one's title."""
+    cur = await db.execute(
+        f"""
+        SELECT 1 FROM alerts
+        WHERE rule_type = ? AND instr(title, ?) > 0
+          AND created_at > datetime('now', '{window_clause}')
+        LIMIT 1
+        """,
+        (rule_type, f" {path}{suffix}"),
+    )
+    return await cur.fetchone() is not None
+
+
 async def _agent_names(db, agent_ids: set[int]) -> dict[int, str]:
     if not agent_ids:
         return {}
@@ -138,12 +162,15 @@ async def check_cross_agent_file_conflict(db, window_minutes: int = 10) -> list[
             continue
         seen_pairs.add(pair_key)
 
+        if await _already_alerted(db, "cross_agent_conflict", path, f"-{window_minutes} minutes", " within"):
+            continue
+
         names = await _agent_names(db, {agent_a_touch["agent_id"], agent_b_touch["agent_id"]})
         agent_a_name = names.get(agent_a_touch["agent_id"], "unknown agent")
         agent_b_name = names.get(agent_b_touch["agent_id"], "unknown agent")
 
         severity = "high" if is_credential_path(path) else "medium"
-        title = f"{agent_a_name} and {agent_b_name} both touched {path} within {window_minutes} minutes — no commit between them"
+        title = f"{agent_a_name} and {agent_b_name} both touched {path} within {window_minutes} minutes — commit tracking unavailable"
 
         alert_id = await _alerter.fire_alert(
             agent_a_touch["agent_id"],
@@ -192,6 +219,9 @@ async def check_cross_agent_credential_access(db, window_hours: int = 24) -> lis
     for path, touches in by_path.items():
         distinct_agent_ids = sorted({t["agent_id"] for t in touches})
         if len(distinct_agent_ids) < 2:
+            continue
+
+        if await _already_alerted(db, "cross_agent_credential_pattern", path, f"-{window_hours} hours", " in"):
             continue
 
         names = await _agent_names(db, set(distinct_agent_ids))
