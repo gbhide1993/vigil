@@ -30,7 +30,7 @@ import aiosqlite
 
 from core.alerter import Alerter
 from core.evidence_store import evidence_store
-from db.database import get_db, get_read_db, DB_PATH
+from db.database import get_db, get_read_db, replace_db, DB_PATH
 
 logger = logging.getLogger("vlaw")
 
@@ -38,7 +38,26 @@ FILE_WINDOW_SECONDS = 5
 NET_WINDOW_SECONDS = 60
 FILE_EVENT_BUFFER_MAX = 1000
 
+# Write watchdog (see start_writer): how long a single queued write is
+# allowed to run before we try conn.interrupt() on it, and how much
+# longer after that before we give up and replace the connection
+# outright. Comfortably above normal write_batch latency (observed
+# 0.3-7s in practice) so this never fires on ordinary slow writes.
+WRITE_INTERRUPT_AFTER_SECONDS = 12
+WRITE_REPLACE_GRACE_SECONDS = 8
+# More than this many replacements in one process lifetime means the
+# wedging is recurring, not transient -- see _replace_wedged_connection.
+MAX_CONNECTION_REPLACEMENTS = 2
+
 CREDENTIAL_PATTERNS = [".env", ".ssh", ".aws", ".pem", ".key"]
+
+
+class ConnectionWedgedError(Exception):
+    """Raised on a queued write's future when the shared DB connection had
+    to be replaced out from under it -- see start_writer/_run_write_with_
+    watchdog. The write's actual outcome (did it commit before the
+    connection wedged?) is unknowable; callers should treat this exactly
+    like any other failed write."""
 
 
 def _is_credential_path(path: str) -> bool:
@@ -84,9 +103,24 @@ class Aggregator:
         # event as its own row, just batches the INSERTs.
         self.file_event_buffer: list[dict] = []
         self._buffer_lock = asyncio.Lock()
+        # Kept open across calls (see _append_crash_recovery_line) rather
+        # than opened and closed per event -- that per-event open+close was
+        # running synchronously on the event loop's own thread and, under
+        # sustained real-time file-event volume, was the confirmed cause of
+        # a sustained-CPU/scheduler-lag pattern (py-spy caught the event
+        # loop thread inside this exact call on every sample). Reset to
+        # None whenever the file needs to be reopened fresh (first use, or
+        # after _clear_crash_recovery_log closes and unlinks it).
+        self._crash_recovery_file = None
+        self._crash_recovery_dir_ensured = False
 
         self._write_queue: asyncio.Queue = asyncio.Queue()
         self._writer_task: asyncio.Task | None = None
+        # See _replace_wedged_connection -- counts how many times the
+        # shared connection has been abandoned-and-replaced this process
+        # lifetime, to escalate past MAX_CONNECTION_REPLACEMENTS instead
+        # of silently replacing forever.
+        self._connection_replace_count = 0
 
         # PRAGMA wal_checkpoint(PASSIVE) runs periodically (every 10th
         # flush, ~150s) on its own dedicated connection -- see
@@ -111,31 +145,226 @@ class Aggregator:
                 break
 
             try:
-                result = await coro_factory()
+                await self._run_write_with_watchdog(coro_factory, future)
+            except Exception:
+                # Final backstop. _run_write_with_watchdog and everything it
+                # calls (_try_interrupt, _replace_wedged_connection,
+                # _handle_write_exception) are expected to handle their own
+                # failures internally and never raise past this point -- but
+                # confirmed live: _replace_wedged_connection's replace_db()
+                # call can itself raise "database is locked" (the abandoned
+                # connection's thread can still be holding the WAL lock),
+                # and before this fix that exception had nowhere caught it,
+                # silently killing this whole loop. Every future enqueue()
+                # call then hangs forever while the rest of the process
+                # (including /health) keeps looking alive -- worse than a
+                # clean crash. Exit deliberately instead so the existing
+                # supervisor (tray app / VS Code extension) restarts the
+                # backend fresh rather than leaving a zombie writer.
+                logger.critical(
+                    "aggregator writer: unhandled exception escaped "
+                    "_run_write_with_watchdog -- exiting so the supervisor restarts "
+                    "the backend instead of leaving a zombie writer that hangs every "
+                    "future enqueue() call",
+                    exc_info=True,
+                )
                 if not future.done():
-                    future.set_result(result)
-            except Exception as e:
-                logger.error("aggregator writer error: %s", e)
-                # Root cause of the recurring "database table is locked"
-                # errors this was meant to fix: a failed write (constraint
-                # violation, bad param, ...) leaves the shared aiosqlite
-                # connection sitting in an open, uncommitted transaction --
-                # nothing here ever called commit() for it, and Python's
-                # sqlite3 doesn't auto-rollback a failed statement. Every
-                # later operation on this same connection then hits "table
-                # is locked" against that stuck transaction, permanently,
-                # until the process restarts. Rolling back here is what
-                # actually prevents one bad write from poisoning every
-                # write after it for the rest of the process's life.
-                try:
-                    db = await get_db()
-                    await db.rollback()
-                except Exception:
-                    logger.exception("aggregator writer: rollback after failed write also failed")
-                if not future.done():
-                    future.set_exception(e)
+                    future.set_exception(
+                        ConnectionWedgedError("aggregator writer crashed handling this write")
+                    )
+                os._exit(1)
             finally:
                 self._write_queue.task_done()
+
+    async def _run_write_with_watchdog(self, coro_factory, future) -> None:
+        """Runs one queued write guarded against a wedged shared
+        connection. aiosqlite.Connection is itself a background Thread
+        processing one queued SQLite call at a time (confirmed by reading
+        aiosqlite's own source) -- if that thread is stuck inside a single
+        slow/hung call, nothing else queued on that connection, from any
+        caller, ever completes, and there is no way to forcibly stop a
+        Python thread. asyncio.timeout/wait_for alone can't fix this: it
+        can only make the *caller* stop waiting, not free the thread the
+        call is actually blocked on.
+
+        Runs `coro_factory()` as its own task instead of awaiting it
+        directly, and shields that task from our own wait_for timeouts
+        below, so giving up on waiting for it never cancels it -- it just
+        keeps running (or stays stuck) in the background while we decide
+        what to do next.
+
+        Escalation, each step only reached if the previous one didn't
+        resolve the write:
+          1. Wait up to WRITE_INTERRUPT_AFTER_SECONDS normally.
+          2. Call conn.interrupt() (bypasses the stuck queue entirely --
+             see _try_interrupt) and wait up to WRITE_REPLACE_GRACE_SECONDS
+             more. This unblocks the write if the thread was stuck inside
+             SQLite's own VM step execution; it does nothing if the thread
+             is blocked in a lower-level OS call (fsync, a filesystem
+             filter-driver stall, ...) that SQLite's interrupt flag is
+             never checked during -- that's an accepted limitation, not a
+             bug, which is exactly why step 3 exists as the real guarantee.
+          3. Treat the connection as wedged: abandon it and replace it
+             (see _replace_wedged_connection), and resolve `future` with
+             ConnectionWedgedError so whoever's awaiting enqueue() doesn't
+             hang forever too."""
+        write_task = asyncio.ensure_future(coro_factory())
+
+        try:
+            result = await asyncio.wait_for(asyncio.shield(write_task), timeout=WRITE_INTERRUPT_AFTER_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:
+            await self._handle_write_exception(e, future)
+            return
+        else:
+            if not future.done():
+                future.set_result(result)
+            return
+
+        interrupted = await self._try_interrupt()
+        logger.warning(
+            "aggregator writer: write exceeded %ds -- called conn.interrupt() (dispatched=%s), "
+            "waiting up to %ds more before treating the connection as wedged",
+            WRITE_INTERRUPT_AFTER_SECONDS, interrupted, WRITE_REPLACE_GRACE_SECONDS,
+        )
+
+        try:
+            result = await asyncio.wait_for(asyncio.shield(write_task), timeout=WRITE_REPLACE_GRACE_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:
+            await self._handle_write_exception(e, future)
+            return
+        else:
+            if not future.done():
+                future.set_result(result)
+            logger.info("aggregator writer: write completed after interrupt -- connection was not actually wedged, just slow")
+            return
+
+        # Past both the threshold and the grace period: the underlying
+        # write_task is still suspended and interrupt() didn't free it.
+        # Its outcome (did it commit? partially? not at all?) is now
+        # unknowable -- it's abandoned along with the connection, not
+        # cancelled (cancelling it wouldn't do anything either).
+        await self._replace_wedged_connection()
+        if not future.done():
+            future.set_exception(
+                ConnectionWedgedError("shared DB connection was wedged; this write's outcome is unknown")
+            )
+
+    async def _try_interrupt(self) -> bool:
+        """Attempts to unstick a wedged write via sqlite3.Connection.
+        interrupt(), called from this watchdog -- never from the stuck
+        write_task itself. aiosqlite's own async interrupt() is exactly
+        `self._conn.interrupt()` (verified against the installed aiosqlite
+        source) with no queueing through self._tx at all, unlike close(),
+        so it can reach a connection whose queue is otherwise completely
+        stuck. sqlite3's interrupt() is documented as safe to call from a
+        different thread/task while another operation is in progress.
+
+        Returns whether interrupt() itself was successfully invoked (not
+        whether it actually unblocked the write -- the caller checks that
+        separately via write_task)."""
+        try:
+            db = await get_db()
+            await db.interrupt()
+            return True
+        except Exception:
+            logger.exception("aggregator writer: conn.interrupt() itself raised -- connection may already be unusable")
+            return False
+
+    async def _replace_wedged_connection(self) -> None:
+        """The shared connection is confirmed wedged (past both the
+        interrupt threshold and the grace period after attempting
+        conn.interrupt()). Does NOT call close() on it -- close() just
+        queues `self._conn.close` onto the same stuck background thread
+        (see aiosqlite's Connection.close()) and would hang exactly the
+        same way. Abandons it outright instead (its thread leaks until
+        process exit) and opens a fresh connection via db.database.
+        replace_db(), which every future get_db() call -- from this
+        writer, from ProcessWatcher, from any HTTP handler -- sees from
+        here on.
+
+        Escalates to a deliberate process exit once this has already
+        happened MAX_CONNECTION_REPLACEMENTS times in this process's
+        lifetime: repeated wedging points at a real, unrecoverable
+        storage problem, not a one-off, and exiting is what lets the
+        existing external supervisors (tray app / VS Code extension,
+        both of which already detect and respawn a dead backend process)
+        take over, instead of this process quietly leaking connections
+        forever.
+
+        replace_db() (-> init_db()) can itself raise -- confirmed live:
+        "database is locked", because the connection we just abandoned
+        above is never close()'d (see replace_db's own docstring for why)
+        and its background thread can still be holding the WAL write
+        lock at the exact moment the new connection's setup runs. That's
+        not a new silent-death case: a failed replacement attempt counts
+        against the same MAX_CONNECTION_REPLACEMENTS budget as a failed
+        write did, and either retries -- the stale lock is usually
+        transient, clearing once the abandoned thread's stuck call
+        finally finishes or the OS itself gives up on it -- or falls
+        through to the same deliberate-exit path above once the budget
+        is exhausted. Either way this never raises back to the caller;
+        start_writer()'s own try/except is only a final backstop for
+        anything unforeseen, not the intended path for this."""
+        while True:
+            self._connection_replace_count += 1
+
+            if self._connection_replace_count > MAX_CONNECTION_REPLACEMENTS:
+                logger.critical(
+                    "aggregator writer: shared DB connection has wedged/failed to replace "
+                    "%d times this process lifetime -- this points at a real storage "
+                    "problem, not a transient one. Exiting so the supervisor (tray app / "
+                    "VS Code extension) restarts the backend fresh instead of leaking "
+                    "connections indefinitely.",
+                    self._connection_replace_count,
+                )
+                os._exit(1)
+
+            logger.error(
+                "aggregator writer: shared DB connection wedged (interrupt did not unblock it "
+                "within %ds grace) -- abandoning it and opening a fresh connection "
+                "(replacement #%d of %d tolerated this process lifetime)",
+                WRITE_REPLACE_GRACE_SECONDS, self._connection_replace_count, MAX_CONNECTION_REPLACEMENTS,
+            )
+            try:
+                await replace_db()
+                return
+            except Exception:
+                logger.exception(
+                    "aggregator writer: replace_db() itself raised while replacing a "
+                    "wedged connection (the abandoned connection's thread may still be "
+                    "holding the WAL lock) -- treating this as another failed "
+                    "replacement attempt and retrying within budget"
+                )
+                await asyncio.sleep(1)
+
+    async def _handle_write_exception(self, e: Exception, future: asyncio.Future) -> None:
+        """Ordinary write failure (constraint violation, bad param, ...) --
+        distinct from a wedge, this is a fast, clean exception, not a
+        stuck call. Same rollback-then-propagate behavior this class has
+        always had."""
+        logger.error("aggregator writer error: %s", e)
+        # Root cause of the recurring "database table is locked"
+        # errors this was meant to fix: a failed write (constraint
+        # violation, bad param, ...) leaves the shared aiosqlite
+        # connection sitting in an open, uncommitted transaction --
+        # nothing here ever called commit() for it, and Python's
+        # sqlite3 doesn't auto-rollback a failed statement. Every
+        # later operation on this same connection then hits "table
+        # is locked" against that stuck transaction, permanently,
+        # until the process restarts. Rolling back here is what
+        # actually prevents one bad write from poisoning every
+        # write after it for the rest of the process's life.
+        try:
+            db = await get_db()
+            await db.rollback()
+        except Exception:
+            logger.exception("aggregator writer: rollback after failed write also failed")
+        if not future.done():
+            future.set_exception(e)
 
     async def enqueue(self, coro_factory):
         """coro_factory: zero-arg callable returning the write coroutine to
@@ -152,6 +381,10 @@ class Aggregator:
                 await self._writer_task
             except asyncio.CancelledError:
                 pass
+        # Aggregator's one shutdown hook (see main.py's lifespan) -- also
+        # where the persistent crash-recovery file handle gets closed;
+        # see _ensure_crash_recovery_file_open.
+        self._close_crash_recovery_file()
 
     async def ingest_file_event(self, event: dict) -> None:
         """event: {agent_id, session_id, path, event_type,
@@ -275,17 +508,61 @@ class Aggregator:
         swallowed. Note: this provides at-least-once durability, not
         exactly-once — see flush_buffers' docstring for the narrow window
         where a crash can still lose an event appended in the same instant
-        a flush clears the log."""
+        a flush clears the log.
+
+        Keeps the file open across calls (see _ensure_crash_recovery_file_
+        open) instead of a fresh open+close per line -- same file, same
+        JSON-line format, same at-least-once guarantee, just without the
+        repeated open/close syscall per real-time file event. flush()
+        after every write keeps the "safe if the process dies mid-write"
+        property: the line is durable on disk as soon as this call
+        returns, exactly as the old open-append-close version guaranteed,
+        even though the file descriptor itself now stays open longer."""
         try:
-            path = _crash_recovery_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(event, default=str) + "\n")
+            self._ensure_crash_recovery_file_open()
+            self._crash_recovery_file.write(json.dumps(event, default=str) + "\n")
+            self._crash_recovery_file.flush()
         except Exception:
             logger.exception("crash recovery: failed to append event, continuing without it")
+            # The handle itself may be the broken part (file moved/deleted
+            # out from under us, disk error, ...) -- drop it so the next
+            # call reopens fresh instead of repeatedly failing on the same
+            # broken handle.
+            self._close_crash_recovery_file()
+
+    def _ensure_crash_recovery_file_open(self) -> None:
+        """Opens the crash-recovery file once and keeps the handle for
+        reuse. The directory-exists check is likewise done at most once
+        per open, not per line -- both were real per-event syscalls before
+        this fix."""
+        if self._crash_recovery_file is not None:
+            return
+        path = _crash_recovery_path()
+        if not self._crash_recovery_dir_ensured:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._crash_recovery_dir_ensured = True
+        self._crash_recovery_file = open(path, "a", encoding="utf-8")
+
+    def _close_crash_recovery_file(self) -> None:
+        if self._crash_recovery_file is not None:
+            try:
+                self._crash_recovery_file.close()
+            except Exception:
+                logger.exception("crash recovery: failed to close file handle")
+            finally:
+                self._crash_recovery_file = None
 
     def _clear_crash_recovery_log(self) -> None:
+        """Closes the persistent handle before unlinking -- Windows won't
+        reliably delete a file that's still open under this process's own
+        handle, and even where it would, leaving the old (now-unlinked)
+        inode's handle open while _ensure_crash_recovery_file_open thinks
+        it already has a valid handle would silently write into a deleted
+        file instead of the fresh one anyone reading crash_recovery.log
+        next expects. The next _append_crash_recovery_line call reopens a
+        genuinely fresh file, same as before this change."""
         try:
+            self._close_crash_recovery_file()
             path = _crash_recovery_path()
             if path.exists():
                 path.unlink()

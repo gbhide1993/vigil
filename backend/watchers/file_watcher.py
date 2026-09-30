@@ -24,6 +24,7 @@ matching "use ETW if available, else fall back" from the feature spec.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -63,6 +64,21 @@ EVENT_TYPE_MAP = {
     "deleted": "file_delete",
 }
 
+# Dedicated pool for _find_owning_agent_pid's per-event open_files() calls
+# (see _handle_polled_event) -- deliberately NOT the loop's shared default
+# executor (main.py sets that to 50 workers for ProcessWatcher/NetworkWatcher
+# etc.). psutil.Process.open_files() is one of the more expensive psutil
+# calls on Windows (full handle-table enumeration); under sustained
+# real-time file-event volume it can keep every worker in a shared pool
+# busy, which delays *other* unrelated executor-dispatched work queued
+# behind it (a plausible contributor to scheduler-lag symptoms that have
+# nothing to do with file attribution). Isolating it here bounds its
+# blast radius to this one pool without changing what it computes or how
+# often it runs.
+_OPEN_HANDLE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix="vlaw-open-handle"
+)
+
 
 class _AgentPidCache:
     """Background-refreshed {pid: agent_name} snapshot of every currently
@@ -89,7 +105,20 @@ class _AgentPidCache:
     and letting it run for up to one more refresh cycle during shutdown is
     harmless)."""
 
-    REFRESH_INTERVAL_SECONDS = 3
+    # This class's own docstring above already documents the cost: a full
+    # refresh (psutil.process_iter() + get_named_agent_for_pid per process)
+    # measured 50-100ms per process, "15-20+ seconds for a full scan" on a
+    # real desktop (~375 processes). At the old 3s interval this thread was
+    # therefore doing another multi-second scan almost as soon as the
+    # previous one finished -- effectively always busy, not periodically
+    # refreshing -- which py-spy confirmed as a sustained-CPU contributor
+    # (thread caught mid-scan on every sample taken). 30s gives the scan
+    # comfortable headroom to actually finish with idle time in between,
+    # cutting this thread's busy fraction roughly in half to two-thirds,
+    # at the cost of the real-time-tier cache being up to 30s (not 3s)
+    # stale in the worst case -- the same order of staleness already
+    # accepted elsewhere (ProcessWatcher's own poll interval is 30s).
+    REFRESH_INTERVAL_SECONDS = 30
 
     def __init__(self, attributor: Attributor):
         self.attributor = attributor
@@ -242,14 +271,15 @@ class VlawFileHandler(FileSystemEventHandler):
     async def _handle_polled_event(self, path: str, event_type: str) -> None:
         # _find_owning_agent_pid itself is now just a cache read (see
         # _AgentPidCache) plus, for tier 2, a handful of per-candidate
-        # open_files() calls -- still offloaded via run_in_executor (same
-        # pattern as ProcessWatcher.poll/NetworkWatcher.poll) since
-        # open_files() is blocking I/O, but no longer the multi-second
-        # full-process-scan it used to be.
+        # open_files() calls -- offloaded via run_in_executor since
+        # open_files() is blocking I/O, but on _OPEN_HANDLE_EXECUTOR (its
+        # own small dedicated pool), not the loop's shared default executor
+        # ProcessWatcher/NetworkWatcher use -- see _OPEN_HANDLE_EXECUTOR's
+        # comment for why.
         loop = asyncio.get_event_loop()
         guess_path = path if self.use_pid_heuristic else None
         pid, confidence = await loop.run_in_executor(
-            None, _find_owning_agent_pid, self.pid_cache, guess_path
+            _OPEN_HANDLE_EXECUTOR, _find_owning_agent_pid, self.pid_cache, guess_path
         )
         event_source = "realtime_heuristic" if self.use_pid_heuristic else "poll"
         await self.handle_file_event(path, event_type, event_source, pid, confidence, time.time())

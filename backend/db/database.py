@@ -25,32 +25,45 @@ _db: aiosqlite.Connection | None = None
 
 async def init_db() -> aiosqlite.Connection:
     """Create the DB file, run schema.sql, and seed default policy.
-    Safe to call on every startup — all statements are idempotent."""
+    Safe to call on every startup — all statements are idempotent.
+
+    Builds and fully configures the connection in a local variable, and
+    only publishes it to the module-level _db as the very last step.
+    Publishing early (the previous shape: `_db = await aiosqlite.connect(...)`
+    followed by several more awaited setup steps before row_factory and the
+    rest were in place) left a real window where a concurrent get_db()
+    caller could observe a non-None _db that wasn't fully configured yet --
+    e.g. row_factory not set yet, so `row["col"]` raises TypeError: tuple
+    indices must be integers or slices, not str. Harmless while init_db()
+    only ever ran once at cold startup before any concurrent traffic
+    existed; reachable for real once replace_db() started re-running this
+    while the app is live and busy."""
     global _db
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    _db = await aiosqlite.connect(DB_PATH)
-    await _db.execute("PRAGMA busy_timeout = 5000")
-    await _db.execute("PRAGMA journal_mode=WAL")
-    await _db.execute("PRAGMA wal_autocheckpoint = 0")
-    _db.row_factory = aiosqlite.Row
-    await _db.execute("PRAGMA foreign_keys = ON")
+    conn = await aiosqlite.connect(DB_PATH)
+    await conn.execute("PRAGMA busy_timeout = 5000")
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA wal_autocheckpoint = 0")
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA foreign_keys = ON")
 
     schema_sql = SCHEMA_PATH.read_text()
-    await _db.executescript(schema_sql)
-    await _db.commit()
+    await conn.executescript(schema_sql)
+    await conn.commit()
 
-    cur = await _db.execute("PRAGMA user_version")
+    cur = await conn.execute("PRAGMA user_version")
     current_version = (await cur.fetchone())[0]
     if current_version < SCHEMA_VERSION:
-        await _db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        await _db.commit()
+        await conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        await conn.commit()
         logger.info("schema version updated %d -> %d", current_version, SCHEMA_VERSION)
 
-    await _migrate(_db)
-    await _seed_policy(_db)
+    await _migrate(conn)
+    await _seed_policy(conn)
 
+    _db = conn  # publish only now that every setup step above has completed
     return _db
 
 
@@ -114,6 +127,44 @@ async def get_db() -> aiosqlite.Connection:
     if _db is None:
         _db = await init_db()
     return _db
+
+
+async def replace_db() -> aiosqlite.Connection:
+    """Abandons the current shared connection and opens a fresh one in
+    its place. For use only when the current connection is confirmed
+    wedged (see core.aggregator's write watchdog) -- aiosqlite.Connection
+    is itself a background Thread processing one queued operation at a
+    time; if that thread is permanently stuck inside a single slow/hung
+    SQLite call, nothing queued behind it (on this connection) will ever
+    complete, and there is no way to forcibly stop a Python thread.
+
+    Deliberately does NOT call close() on the old connection first --
+    close() just queues `self._conn.close` onto the same stuck
+    background thread (see aiosqlite's Connection.close()) and would
+    hang exactly the same way. The old connection (and its thread) is
+    simply abandoned; the thread leaks until process exit, which is
+    cheap and acceptable next to a permanently wedged backend.
+
+    Every future get_db() call -- from Aggregator's writer, from
+    ProcessWatcher's direct writes, from any HTTP handler -- sees the new
+    connection from this point on. get_read_db() is unaffected: it never
+    shares state with this singleton in the first place.
+
+    Publishing here is just `_db = None` followed by delegating entirely
+    to init_db(), which (see its docstring) now only publishes _db as its
+    own last step once the new connection is fully configured -- so
+    nothing this function does exposes a partially-set-up connection to
+    another caller either. The `_db = None` window itself just means a
+    concurrent get_db() call during that window would race to build its
+    own connection via init_db() too; whichever finishes last wins and
+    becomes the final _db, the other is harmlessly discarded (leaked,
+    same as the old wedged connection) -- rare (this only runs after a
+    confirmed wedge) and never produces a broken/partial connection for
+    either caller, just a wasted extra connect on the rare unlucky
+    overlap."""
+    global _db
+    _db = None
+    return await init_db()
 
 
 async def close_db() -> None:
