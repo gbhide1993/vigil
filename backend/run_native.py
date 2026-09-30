@@ -13,13 +13,6 @@ and VLAW_HOST_ROOT is left unset so paths resolve as-is.
 
 import os
 
-import sys
-if sys.platform == 'win32':
-    import asyncio
-    asyncio.set_event_loop_policy(
-        asyncio.WindowsSelectorEventLoopPolicy()
-    )
-
 # Absolute and LOCALAPPDATA-anchored, not relative to cwd -- "../data"
 # only resolved correctly when launched with cwd=backend/; launched from
 # anywhere else (e.g. cwd=repo root) it silently wrote the DB outside the
