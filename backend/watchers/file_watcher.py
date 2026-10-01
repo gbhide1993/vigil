@@ -24,13 +24,14 @@ matching "use ETW if available, else fall back" from the feature spec.
 """
 
 import asyncio
-import concurrent.futures
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import psutil
 from watchdog.events import FileSystemEventHandler
@@ -64,20 +65,28 @@ EVENT_TYPE_MAP = {
     "deleted": "file_delete",
 }
 
-# Dedicated pool for _find_owning_agent_pid's per-event open_files() calls
-# (see _handle_polled_event) -- deliberately NOT the loop's shared default
-# executor (main.py sets that to 50 workers for ProcessWatcher/NetworkWatcher
-# etc.). psutil.Process.open_files() is one of the more expensive psutil
-# calls on Windows (full handle-table enumeration); under sustained
-# real-time file-event volume it can keep every worker in a shared pool
-# busy, which delays *other* unrelated executor-dispatched work queued
-# behind it (a plausible contributor to scheduler-lag symptoms that have
-# nothing to do with file attribution). Isolating it here bounds its
-# blast radius to this one pool without changing what it computes or how
-# often it runs.
-_OPEN_HANDLE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=8, thread_name_prefix="vlaw-open-handle"
-)
+# _refine_pid_by_open_handle's psutil.Process.open_files() calls run in a
+# disposable subprocess (watchers/_open_handle_worker.py), not in this
+# process at all -- not even on a dedicated thread pool, which is what an
+# earlier version of this fix used. That pool isolated the call's *blast
+# radius* within this process, but not the underlying risk: on Windows,
+# open_files()'s C extension does not release the GIL around
+# NtQueryObject, which has a documented bug where querying a handle tied
+# to a pending synchronous I/O operation (e.g. a named pipe) can hang
+# indefinitely -- and since the GIL is held, that freezes the *entire*
+# process, not just the thread that called it. Confirmed live via py-spy:
+# every thread in that dedicated pool was simultaneously stuck here during
+# a real multi-minute app freeze. A subprocess has its own GIL, so a hang
+# there can never block this process's event loop, and it can be
+# hard-killed (proc.kill()) out from under a stuck call -- something no
+# amount of same-process thread-pool restructuring can do. See
+# _refine_pid_by_open_handle and watchers.process_watcher._run_process_scan
+# (the same pattern, used for the same reason, for a different psutil call).
+_OPEN_HANDLE_WORKER_PATH = str(Path(__file__).parent / "_open_handle_worker.py")
+# Short and deliberately much tighter than process_watcher's 18s scan
+# timeout -- this runs on the real-time file-event path and must fail fast
+# rather than add visible lag to every event while an agent is active.
+_OPEN_HANDLE_TIMEOUT_SECONDS = 2.5
 
 
 class _AgentPidCache:
@@ -155,7 +164,7 @@ class _AgentPidCache:
             logger.exception("agent pid cache refresh failed, keeping previous snapshot")
 
 
-def _find_owning_agent_pid(pid_cache: _AgentPidCache, path: str | None = None) -> tuple[int | None, str]:
+async def _find_owning_agent_pid(pid_cache: _AgentPidCache, path: str | None = None) -> tuple[int | None, str]:
     """Best-effort: pick from the currently-cached known-agent processes
     (see _AgentPidCache) — refined, when `path` is given (tier 2 only, see
     module docstring), by checking which of those candidate processes
@@ -170,8 +179,10 @@ def _find_owning_agent_pid(pid_cache: _AgentPidCache, path: str | None = None) -
 
     Returns (pid, confidence). If more than one distinct known agent is
     running concurrently and the open-handle refinement didn't narrow it
-    down to exactly one, we still pick the first match but flag confidence
-    as "low" so it's auditable rather than silently presented as certain."""
+    down to exactly one (including on a subprocess timeout/failure -- see
+    _refine_pid_by_open_handle), we still pick the first match but flag
+    confidence as "low" so it's auditable rather than silently presented
+    as certain."""
     agent_map = pid_cache.snapshot()
     if not agent_map:
         return None, "high"
@@ -180,7 +191,7 @@ def _find_owning_agent_pid(pid_cache: _AgentPidCache, path: str | None = None) -
     seen_agents = set(agent_map.values())
 
     if path is not None and len(matches) > 1:
-        refined = _refine_pid_by_open_handle(matches, path)
+        refined = await _refine_pid_by_open_handle(matches, path)
         if refined is not None:
             return refined, "high"
 
@@ -188,25 +199,93 @@ def _find_owning_agent_pid(pid_cache: _AgentPidCache, path: str | None = None) -
     return matches[0], confidence
 
 
-def _refine_pid_by_open_handle(candidate_pids: list[int], path: str) -> int | None:
+async def _refine_pid_by_open_handle(candidate_pids: list[int], path: str) -> int | None:
     """Checks each candidate agent PID's currently-open file handles for
     `path`, returning the one PID that actually has it open, if exactly one
     does. Best-effort, not exact: a fast open-write-close can already have
     closed the handle by the time this runs (psutil.Process.open_files()
     reflects live handles only), and a process with the file open for an
-    unrelated reason would false-positive. Never raises — a process that
-    has since exited or denies access is just skipped, not reported."""
-    normalized_target = os.path.normcase(os.path.abspath(path))
-    found: list[int] = []
-    for pid in candidate_pids:
-        try:
-            for f in psutil.Process(pid).open_files():
-                if os.path.normcase(os.path.abspath(f.path)) == normalized_target:
-                    found.append(pid)
-                    break
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            continue
-    return found[0] if len(found) == 1 else None
+    unrelated reason would false-positive.
+
+    Runs the actual psutil call in a disposable subprocess (see
+    _OPEN_HANDLE_WORKER_PATH's module docstring for why: the GIL-holding
+    NtQueryObject hang risk on Windows means this can't safely run even on
+    a dedicated same-process thread). Never raises, never blocks the
+    caller beyond _OPEN_HANDLE_TIMEOUT_SECONDS -- a timed-out or failed
+    subprocess just returns None, same as "couldn't narrow it down",
+    which _find_owning_agent_pid already treats as a low-confidence first
+    match rather than an error."""
+    return await _run_open_handle_subprocess(candidate_pids, path)
+
+
+async def _run_open_handle_subprocess(candidate_pids: list[int], path: str) -> int | None:
+    """Does the actual spawn/wait/parse for _refine_pid_by_open_handle --
+    split out so the semaphore-holding caller can rely on this never
+    returning until the subprocess is confirmed gone, on every exit path.
+
+    Wraps subprocess creation *and* communicate() in the same timeout, not
+    just communicate(): under real contention (confirmed by testing),
+    create_subprocess_exec() itself can be the slow part -- a 2.5s-only
+    bound around communicate() still lets total wall-clock time blow past
+    the budget whenever spawning itself is what's slow. If the timeout
+    fires before `proc` even gets assigned, there is genuinely nothing to
+    kill yet -- an unavoidable gap given asyncio's API, not a different
+    bug -- but every other case (proc assigned, anything after) is always
+    kill()-ed and wait()-ed before returning."""
+    if getattr(sys, "frozen", False):
+        args = [sys.executable, "--open-handle-worker"]
+    else:
+        args = [sys.executable, _OPEN_HANDLE_WORKER_PATH]
+    args.append(path)
+    args.append(",".join(str(p) for p in candidate_pids))
+
+    proc: "asyncio.subprocess.Process | None" = None
+
+    async def _spawn_and_communicate():
+        nonlocal proc
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        return await proc.communicate()
+
+    try:
+        stdout, _stderr = await asyncio.wait_for(
+            _spawn_and_communicate(), timeout=_OPEN_HANDLE_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        if proc is not None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+        logger.warning(
+            "open-handle check timed out after %.1fs and was killed -- "
+            "falling back to first-match/low-confidence attribution",
+            _OPEN_HANDLE_TIMEOUT_SECONDS,
+        )
+        return None
+    except Exception:
+        if proc is not None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+        logger.exception("open-handle check subprocess failed -- falling back to first-match/low-confidence attribution")
+        return None
+
+    try:
+        result = json.loads(stdout.decode("utf-8", errors="replace"))
+    except Exception:
+        logger.warning("open-handle worker returned unparseable output")
+        return None
+    if result.get("error"):
+        logger.warning("open-handle worker error: %s", result["error"])
+    matched = result.get("matched_pid")
+    return int(matched) if matched is not None else None
 
 
 def _log_dispatch_exception(future: "asyncio.Future", path: str) -> None:
@@ -270,17 +349,12 @@ class VlawFileHandler(FileSystemEventHandler):
 
     async def _handle_polled_event(self, path: str, event_type: str) -> None:
         # _find_owning_agent_pid itself is now just a cache read (see
-        # _AgentPidCache) plus, for tier 2, a handful of per-candidate
-        # open_files() calls -- offloaded via run_in_executor since
-        # open_files() is blocking I/O, but on _OPEN_HANDLE_EXECUTOR (its
-        # own small dedicated pool), not the loop's shared default executor
-        # ProcessWatcher/NetworkWatcher use -- see _OPEN_HANDLE_EXECUTOR's
-        # comment for why.
-        loop = asyncio.get_event_loop()
+        # _AgentPidCache) plus, for tier 2, a possible subprocess call for
+        # open-handle refinement -- see _refine_pid_by_open_handle and
+        # _OPEN_HANDLE_WORKER_PATH's comment for why that runs in a
+        # disposable subprocess rather than on any same-process thread.
         guess_path = path if self.use_pid_heuristic else None
-        pid, confidence = await loop.run_in_executor(
-            _OPEN_HANDLE_EXECUTOR, _find_owning_agent_pid, self.pid_cache, guess_path
-        )
+        pid, confidence = await _find_owning_agent_pid(self.pid_cache, guess_path)
         event_source = "realtime_heuristic" if self.use_pid_heuristic else "poll"
         await self.handle_file_event(path, event_type, event_source, pid, confidence, time.time())
 

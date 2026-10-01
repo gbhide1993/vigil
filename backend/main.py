@@ -12,27 +12,30 @@ import json
 import sys
 import os
 
-# Sentinel re-invocation for the process-scan worker (see
-# watchers.process_watcher._run_process_scan). In a frozen build,
-# sys.executable is this very exe, not a python.exe, and the worker's .py
-# file was never bundled as a loose file for a subprocess to exec -- so
-# process_watcher spawns [sys.executable, "--process-scan-worker"] instead,
+# Sentinel re-invocation for the process-scan and open-handle workers (see
+# watchers.process_watcher._run_process_scan and
+# watchers.file_watcher._refine_pid_by_open_handle). In a frozen build,
+# sys.executable is this very exe, not a python.exe, and neither worker's
+# .py file was ever bundled as a loose file for a subprocess to exec -- so
+# the callers spawn [sys.executable, "--<worker>-worker", ...] instead,
 # re-invoking this same exe. Handled here, before anything else (including
 # get_base_path()/BASE_DIR setup and the single-instance lock in lifespan()
 # further down) runs, since a second full app instance would otherwise just
 # hit that lock and exit without ever producing the JSON the parent expects.
-# Dev mode (python run_native.py) never passes this argument -- process_watcher
-# only uses it when sys.frozen is set -- so this is a no-op there.
+# Dev mode (python run_native.py) never passes these arguments -- both
+# callers only use them when sys.frozen is set -- so this is a no-op there.
 #
-# sys.argv[2:] (not [1:]) is passed through to the worker's main(): this
-# process's real argv is [exe, "--process-scan-worker", "<rest of the
-# args>"], so argv[1] itself is the sentinel, not the worker's own
-# arguments -- reading sys.argv[1] directly inside the worker (the
-# previous shape) silently parsed the sentinel string as the pid list,
-# always failed, and always fell back to an empty agent_pids.
+# sys.argv[2:] (not [1:]) is passed through to each worker's main(): this
+# process's real argv is [exe, "--<worker>-worker", "<rest of the args>"],
+# so argv[1] itself is the sentinel, not the worker's own arguments.
 if len(sys.argv) > 1 and sys.argv[1] == "--process-scan-worker":
     from watchers._process_scan_worker import main as _run_process_scan_worker
     _run_process_scan_worker(sys.argv[2:])
+    sys.exit(0)
+
+if len(sys.argv) > 1 and sys.argv[1] == "--open-handle-worker":
+    from watchers._open_handle_worker import main as _run_open_handle_worker
+    _run_open_handle_worker(sys.argv[2:])
     sys.exit(0)
 
 
