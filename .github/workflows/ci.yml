@@ -16,6 +16,14 @@ jobs:
   backend-tests:
     name: Backend regression suite
     runs-on: windows-latest
+    # Safety net, independent of the leaked-thread fix in test_bugfixes.py's
+    # test_db fixture (which is the actual root cause of this job hanging
+    # 40+ minutes after pytest itself had already finished and printed
+    # "35 passed" -- see that fixture's docstring). This bounds the whole
+    # job, including dependency install, in case any *future* leak or
+    # genuinely-slow step does the same thing -- without it, a hang here
+    # silently burns CI minutes for hours instead of failing loudly.
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: backend
@@ -31,8 +39,14 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
+      # --timeout=120 (pytest-timeout) is a second, finer-grained net on
+      # top of the job-level timeout-minutes above: it fails a single
+      # *test* that runs long (with a traceback showing exactly which one
+      # and where it was stuck) well before the 10-minute job budget is
+      # anywhere close to exhausted, rather than only ever finding out
+      # the job timed out with no indication of why.
       - name: Run regression suite
-        run: python -m pytest -q tests
+        run: python -m pytest -q tests --timeout=120
 
   backend-build:
     name: Backend frozen build + smoke test
