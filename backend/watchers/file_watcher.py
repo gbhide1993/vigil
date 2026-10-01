@@ -88,6 +88,54 @@ _OPEN_HANDLE_WORKER_PATH = str(Path(__file__).parent / "_open_handle_worker.py")
 # rather than add visible lag to every event while an agent is active.
 _OPEN_HANDLE_TIMEOUT_SECONDS = 2.5
 
+# Caps how many open-handle subprocess spawns can be in flight at once.
+# Confirmed necessary by testing, not theoretical: a burst of concurrent
+# real-time events with 2+ known agents live (e.g. heavy write activity
+# from two coding agents at once) spawned dozens of these concurrently,
+# which under real resource contention pushed individual spawn times as
+# high as 14s (measured), caused a pile-up of ~24 near-simultaneous
+# timeouts, a 3+ minute stall in this process's own scheduled-job
+# logging, and -- worst -- subprocesses that were still orphaned and
+# running minutes after the parent process had already exited (process
+# creation itself was so delayed under contention that the timeout-and-
+# kill logic had already given up and abandoned the handle before the OS
+# had even finished creating the process). Capping concurrency bounds all
+# of that: at most this many spawns/kills/reaps can be in progress at
+# once, so a burst degrades to queueing-then-fallback instead of
+# system-wide contention. See _refine_pid_by_open_handle for where the
+# semaphore is held and released.
+_OPEN_HANDLE_MAX_CONCURRENT = 2
+_OPEN_HANDLE_SEMAPHORE = asyncio.Semaphore(_OPEN_HANDLE_MAX_CONCURRENT)
+# A call that can't get a slot within this long gives up on the subprocess
+# entirely for this event and falls back to the existing low-confidence
+# heuristic -- this is a real-time attribution path, not a job queue, so
+# queueing indefinitely for a slot would just trade one kind of lag for
+# another.
+_OPEN_HANDLE_SEMAPHORE_WAIT_SECONDS = 1.0
+
+# Short-lived cache keyed by (normalized path, sorted candidate pids) --
+# secondary to the concurrency cap above, not a substitute for it: cuts
+# down how often a subprocess needs to spawn at all during a burst (the
+# same path is often re-checked by multiple near-simultaneous events for
+# the same write), rather than bounding the cost of each individual spawn.
+# TTL deliberately short -- this is a live open-handle check, not
+# something that should go stale across genuinely distinct events.
+_OPEN_HANDLE_CACHE_TTL_SECONDS = 0.4
+_open_handle_cache: dict[tuple[str, tuple[int, ...]], tuple[float, int | None]] = {}
+
+
+def _prune_open_handle_cache() -> None:
+    """Called after every write -- keeps this from growing unboundedly
+    over a long-running process. Cheap: entries are short-lived by design,
+    so this dict never holds more than a burst's worth at a time."""
+    now = time.monotonic()
+    expired = [
+        key for key, (ts, _result) in _open_handle_cache.items()
+        if now - ts >= _OPEN_HANDLE_CACHE_TTL_SECONDS
+    ]
+    for key in expired:
+        del _open_handle_cache[key]
+
 
 class _AgentPidCache:
     """Background-refreshed {pid: agent_name} snapshot of every currently
@@ -210,12 +258,47 @@ async def _refine_pid_by_open_handle(candidate_pids: list[int], path: str) -> in
     Runs the actual psutil call in a disposable subprocess (see
     _OPEN_HANDLE_WORKER_PATH's module docstring for why: the GIL-holding
     NtQueryObject hang risk on Windows means this can't safely run even on
-    a dedicated same-process thread). Never raises, never blocks the
-    caller beyond _OPEN_HANDLE_TIMEOUT_SECONDS -- a timed-out or failed
-    subprocess just returns None, same as "couldn't narrow it down",
-    which _find_owning_agent_pid already treats as a low-confidence first
-    match rather than an error."""
-    return await _run_open_handle_subprocess(candidate_pids, path)
+    a dedicated same-process thread) -- gated by a short-lived cache and a
+    concurrency cap (see _OPEN_HANDLE_CACHE_TTL_SECONDS/_OPEN_HANDLE_
+    SEMAPHORE's comments for why both are needed, confirmed by testing
+    under real burst load). Never raises, never blocks the caller beyond
+    _OPEN_HANDLE_SEMAPHORE_WAIT_SECONDS + _OPEN_HANDLE_TIMEOUT_SECONDS -- a
+    cache miss that can't get a slot, a timed-out subprocess, or any other
+    failure all just return None, same as "couldn't narrow it down", which
+    _find_owning_agent_pid already treats as a low-confidence first match
+    rather than an error."""
+    cache_key = (os.path.normcase(os.path.abspath(path)), tuple(sorted(candidate_pids)))
+    cached = _open_handle_cache.get(cache_key)
+    if cached is not None and time.monotonic() - cached[0] < _OPEN_HANDLE_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    try:
+        await asyncio.wait_for(
+            _OPEN_HANDLE_SEMAPHORE.acquire(), timeout=_OPEN_HANDLE_SEMAPHORE_WAIT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "open-handle check: all %d concurrent slot(s) busy after waiting %.1fs -- "
+            "skipping this event's subprocess, falling back to first-match/low-confidence attribution",
+            _OPEN_HANDLE_MAX_CONCURRENT, _OPEN_HANDLE_SEMAPHORE_WAIT_SECONDS,
+        )
+        return None
+
+    try:
+        result = await _run_open_handle_subprocess(candidate_pids, path)
+    finally:
+        # Only reached once _run_open_handle_subprocess has returned -- and
+        # it never returns until the subprocess is confirmed reaped (see
+        # its own docstring) on every exit path, success, timeout, or
+        # error. Releasing any earlier (e.g. right after wait_for on the
+        # communicate() call, before confirming the kill actually landed)
+        # is exactly the gap that let orphaned subprocesses slip through
+        # under contention during testing.
+        _OPEN_HANDLE_SEMAPHORE.release()
+
+    _open_handle_cache[cache_key] = (time.monotonic(), result)
+    _prune_open_handle_cache()
+    return result
 
 
 async def _run_open_handle_subprocess(candidate_pids: list[int], path: str) -> int | None:
