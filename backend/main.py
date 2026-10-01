@@ -12,6 +12,22 @@ import json
 import sys
 import os
 
+# Sentinel re-invocation for the process-scan worker (see
+# watchers.process_watcher._run_process_scan). In a frozen build,
+# sys.executable is this very exe, not a python.exe, and the worker's .py
+# file was never bundled as a loose file for a subprocess to exec -- so
+# process_watcher spawns [sys.executable, "--process-scan-worker"] instead,
+# re-invoking this same exe. Handled here, before anything else (including
+# get_base_path()/BASE_DIR setup and the single-instance lock in lifespan()
+# further down) runs, since a second full app instance would otherwise just
+# hit that lock and exit without ever producing the JSON the parent expects.
+# Dev mode (python run_native.py) never passes this argument -- process_watcher
+# only uses it when sys.frozen is set -- so this is a no-op there.
+if len(sys.argv) > 1 and sys.argv[1] == "--process-scan-worker":
+    from watchers._process_scan_worker import main as _run_process_scan_worker
+    _run_process_scan_worker()
+    sys.exit(0)
+
 
 def get_base_path() -> str:
     """Directory for user-writable files (db, policy, logs, license).

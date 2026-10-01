@@ -453,7 +453,19 @@ class ProcessWatcher:
         killed out from under a stuck call via proc.kill()."""
         empty_result = {"processes": [], "envs": {}, "cmdlines": {}}
         failed_result = {**empty_result, "failed": True}
-        args = [sys.executable, _WORKER_PATH]
+        # In a frozen (PyInstaller) build, sys.executable is this app's own
+        # exe, not a python.exe, and _WORKER_PATH's .py file was never
+        # bundled as a loose file for it to exec -- spawning
+        # [sys.executable, _WORKER_PATH] there just relaunches a second
+        # full copy of the app, which hits the single-instance lock and
+        # exits, leaving this parent to fail parsing its startup-banner
+        # text as JSON. Re-invoke the same exe with a sentinel argument
+        # instead (see main.py, handled before the instance lock); dev
+        # mode (unfrozen) keeps exec'ing the standalone worker script.
+        if getattr(sys, "frozen", False):
+            args = [sys.executable, "--process-scan-worker"]
+        else:
+            args = [sys.executable, _WORKER_PATH]
         if agent_pids:
             args.append(",".join(str(p) for p in agent_pids))
 
