@@ -142,19 +142,56 @@ function handleBackendCrash() {
   }, 3000)
 }
 
-async function waitForBackend(maxAttempts = 30, intervalMs = 1000) {
+// Slower cadence used only after the initial startup budget below is
+// exhausted (see waitForBackend) -- 1s polling makes sense while we
+// expect success within seconds, not while waiting indefinitely for a
+// backend that's already well past normal startup time.
+const SLOW_POLL_INTERVAL_MS = 5000
+
+async function waitForBackend(maxAttempts = 90, intervalMs = 1000) {
   // Guards against two overlapping poll loops — e.g. the initial
   // whenReady() call still polling while a slow-to-bind (not actually
   // dead) backend process trips the exit handler for an unrelated reason
   // and handleBackendCrash() starts a second retry loop. Without this,
   // the second loop's first failed health check could look like grounds
   // to call spawnBackend() again elsewhere, spawning a silent orphan next
-  // to the original process that was simply still starting up.
+  // to the original process that was simply still starting up. This also
+  // means the indefinite slow-poll phase below (once entered) blocks a
+  // concurrent "Restart Backend" click from starting a second wait loop --
+  // acceptable, since that click's own immediate "Restarting backend..."
+  // tooltip already gives feedback, and this loop will pick up the
+  // restarted process's health on its own once it responds.
   if (waitingForBackend) {
     console.log('Already waiting for backend, skipping duplicate wait loop')
     return
   }
   waitingForBackend = true
+  const startedAt = Date.now()
+
+  // Shared success path for both the fast initial loop and the indefinite
+  // slow-poll fallback below -- logs real elapsed wall-clock time (not a
+  // loop-iteration proxy, which only ever approximated it and didn't mean
+  // anything once a slow-poll phase with a different interval exists) so
+  // a startup-latency regression shows up directly in the log instead of
+  // only being inferable from timestamps.
+  const markReady = () => {
+    const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1)
+    console.log(`Backend ready after ${elapsedSec}s`)
+    backendReady = true
+    setTrayIdle()
+    pollAlerts()
+    pollTimer = setInterval(pollAlerts, POLL_INTERVAL_MS)
+    updateTrayTooltip()
+    tooltipPollTimer = setInterval(updateTrayTooltip, TOOLTIP_POLL_INTERVAL_MS)
+    // Only clear the failure count once the backend has stayed up for a
+    // while — a backend that passes the health check and then crashes a
+    // second later is still crash-looping, not recovered.
+    if (backendStableTimer) clearTimeout(backendStableTimer)
+    backendStableTimer = setTimeout(() => {
+      backendFailCount = 0
+      backendStableTimer = null
+    }, BACKEND_STABLE_MS)
+  }
 
   try {
     console.log('Waiting for backend to be ready...')
@@ -163,21 +200,7 @@ async function waitForBackend(maxAttempts = 30, intervalMs = 1000) {
       try {
         const res = await fetch(`${BACKEND_URL}/health`, { signal: AbortSignal.timeout(1000) })
         if (res.ok) {
-          console.log(`Backend ready after ${i + 1}s`)
-          backendReady = true
-          setTrayIdle()
-          pollAlerts()
-          pollTimer = setInterval(pollAlerts, POLL_INTERVAL_MS)
-          updateTrayTooltip()
-          tooltipPollTimer = setInterval(updateTrayTooltip, TOOLTIP_POLL_INTERVAL_MS)
-          // Only clear the failure count once the backend has stayed up for a
-          // while — a backend that passes the health check and then crashes a
-          // second later is still crash-looping, not recovered.
-          if (backendStableTimer) clearTimeout(backendStableTimer)
-          backendStableTimer = setTimeout(() => {
-            backendFailCount = 0
-            backendStableTimer = null
-          }, BACKEND_STABLE_MS)
+          markReady()
           return
         }
       } catch {
@@ -186,9 +209,32 @@ async function waitForBackend(maxAttempts = 30, intervalMs = 1000) {
       await new Promise((r) => setTimeout(r, intervalMs))
     }
 
-    console.error('Backend failed to start within 30 seconds')
+    // maxAttempts (90s) comfortably exceeds the 47-50s ETW-fallback delay
+    // measured on real restarts, so reaching here means something is
+    // genuinely slower than that, not just normal startup -- worth
+    // surfacing as a warning. But this used to be where the loop gave up
+    // permanently: no further health checks ever happened again until a
+    // human noticed the stale "failed to start" tooltip and manually
+    // clicked "Restart Backend", even if the backend finished starting
+    // and became healthy moments later on its own. Keep checking
+    // indefinitely instead, just at a slower interval, and self-heal the
+    // tray state the instant /health actually responds.
+    console.error(`Backend failed to start within ${maxAttempts} seconds -- will keep checking every ${SLOW_POLL_INTERVAL_MS / 1000}s`)
     setTrayWarning()
     tray.setToolTip('Vigil — Backend failed to start. Right-click → Restart Backend.')
+
+    while (true) {
+      await new Promise((r) => setTimeout(r, SLOW_POLL_INTERVAL_MS))
+      try {
+        const res = await fetch(`${BACKEND_URL}/health`, { signal: AbortSignal.timeout(1000) })
+        if (res.ok) {
+          markReady()
+          return
+        }
+      } catch {
+        // Still not ready — keep polling
+      }
+    }
   } finally {
     waitingForBackend = false
   }
