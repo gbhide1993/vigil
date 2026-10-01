@@ -119,11 +119,22 @@ def _gather_envs_and_cmdlines(agent_pids: set[int]) -> tuple[dict, dict]:
     return envs, cmdlines
 
 
-def main():
+def main(args=None):
+    """`args` defaults to sys.argv[1:] for standalone script invocation
+    (dev mode: [sys.executable, _WORKER_PATH, "<pids>"]). When called as a
+    plain function from main.py's frozen-mode sentinel dispatch, the
+    caller passes sys.argv[2:] explicitly instead -- the process's real
+    argv there is [exe, "--process-scan-worker", "<pids>"], so sys.argv[1]
+    itself is the sentinel, not the pid list, and reading it directly here
+    would silently parse the sentinel string as pids, fail, and always
+    fall back to an empty agent_pids (a real bug this signature avoids)."""
+    if args is None:
+        args = sys.argv[1:]
+
     agent_pids = set()
-    if len(sys.argv) > 1:
+    if args:
         try:
-            agent_pids = {int(p) for p in sys.argv[1].split(',') if p.strip()}
+            agent_pids = {int(p) for p in args[0].split(',') if p.strip()}
         except ValueError:
             pass
 

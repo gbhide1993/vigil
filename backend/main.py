@@ -23,9 +23,16 @@ import os
 # hit that lock and exit without ever producing the JSON the parent expects.
 # Dev mode (python run_native.py) never passes this argument -- process_watcher
 # only uses it when sys.frozen is set -- so this is a no-op there.
+#
+# sys.argv[2:] (not [1:]) is passed through to the worker's main(): this
+# process's real argv is [exe, "--process-scan-worker", "<rest of the
+# args>"], so argv[1] itself is the sentinel, not the worker's own
+# arguments -- reading sys.argv[1] directly inside the worker (the
+# previous shape) silently parsed the sentinel string as the pid list,
+# always failed, and always fell back to an empty agent_pids.
 if len(sys.argv) > 1 and sys.argv[1] == "--process-scan-worker":
     from watchers._process_scan_worker import main as _run_process_scan_worker
-    _run_process_scan_worker()
+    _run_process_scan_worker(sys.argv[2:])
     sys.exit(0)
 
 
