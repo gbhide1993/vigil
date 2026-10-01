@@ -42,10 +42,25 @@ async def test_db():
     connection created under a different, now-closed loop. The underlying
     DB *file* (VLAW_DATA_DIR, set in conftest.py) persists across tests in
     the same run; tests use unique agent names/session ids/paths so they
-    don't interfere with each other."""
+    don't interfere with each other.
+
+    Explicitly closes the connection on teardown -- aiosqlite.Connection
+    is itself a non-daemon background Thread (confirmed during today's
+    write-wedge work), so leaving this connection open just lets it get
+    silently overwritten by the next test's database._db = None without
+    ever stopping its thread. With ~13 DB-touching tests in this file,
+    that leaked one non-daemon thread per test -- harmless to the test
+    results themselves (all 35 still pass), but it means the pytest
+    process never exits on its own afterward, since Python won't exit
+    while any non-daemon thread is still alive. That's invisible
+    locally if nothing ever waits on the process exiting, but it's
+    exactly what hung CI: the regression-suite step kept running 40+
+    minutes after pytest had already printed "35 passed" and finished,
+    because the parent `python -m pytest` process itself never returned."""
     database._db = None
     db = await database.get_db()
     yield db
+    await database.close_db()
 
 
 async def _make_agent(db, name: str) -> int:

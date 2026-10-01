@@ -1,0 +1,173 @@
+name: CI
+
+# Catches the exact failure pattern that has bitten this project three
+# times: a backend change that works fine in dev mode (python run_native.py)
+# but silently breaks the packaged/frozen PyInstaller build -- e.g. the
+# sys.executable/sys.argv assumptions that only differ once frozen. The
+# frozen-mode smoke test job below is the one that actually guards against
+# that class of bug; the other jobs are the more conventional "does it
+# still work / does it still build" checks.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend-tests:
+    name: Backend regression suite
+    runs-on: windows-latest
+    # Safety net, independent of the leaked-thread fix in test_bugfixes.py's
+    # test_db fixture (which is the actual root cause of this job hanging
+    # 40+ minutes after pytest itself had already finished and printed
+    # "35 passed" -- see that fixture's docstring). This bounds the whole
+    # job, including dependency install, in case any *future* leak or
+    # genuinely-slow step does the same thing -- without it, a hang here
+    # silently burns CI minutes for hours instead of failing loudly.
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install backend dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      # --timeout=120 (pytest-timeout) is a second, finer-grained net on
+      # top of the job-level timeout-minutes above: it fails a single
+      # *test* that runs long (with a traceback showing exactly which one
+      # and where it was stuck) well before the 10-minute job budget is
+      # anywhere close to exhausted, rather than only ever finding out
+      # the job timed out with no indication of why.
+      - name: Run regression suite
+        run: python -m pytest -q tests --timeout=120
+
+  backend-build:
+    name: Backend frozen build + smoke test
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install backend dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+          pip install pyinstaller==6.21.0 pyinstaller-hooks-contrib
+
+      - name: Build frozen backend exe
+        run: pyinstaller vlaw-backend.spec --clean
+
+      - name: Confirm exe was produced
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\vlaw-backend.exe")) {
+            throw "Build reported success but dist\vlaw-backend.exe does not exist"
+          }
+          Get-Item "dist\vlaw-backend.exe" | Select-Object FullName, Length, LastWriteTime
+
+      # This is the check that actually guards against the failure pattern
+      # this workflow exists for. Each sentinel argument re-invokes the
+      # frozen exe itself (see main.py's sentinel dispatch) instead of
+      # exec'ing a loose .py file the way dev mode does -- a regression in
+      # that dispatch, or in sys.argv indexing across the sentinel
+      # boundary (exactly what broke silently for a full day last time),
+      # produces either a traceback, the wrong JSON shape, or the app's
+      # own startup banner instead of worker output. All three are caught
+      # here, non-interactively, on every push -- the only way this
+      # specific bug class got caught before was a manual spot-check that
+      # happened to get run.
+      - name: Smoke test -- frozen-mode sentinel workers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Test-WorkerJson {
+            param(
+              [string]$Name,
+              [string[]]$Arguments
+            )
+
+            $stdoutFile = New-TemporaryFile
+            $stderrFile = New-TemporaryFile
+            try {
+              $proc = Start-Process -FilePath "dist\vlaw-backend.exe" `
+                -ArgumentList $Arguments `
+                -NoNewWindow -PassThru -Wait `
+                -RedirectStandardOutput $stdoutFile `
+                -RedirectStandardError $stderrFile
+
+              $stdout = Get-Content $stdoutFile -Raw
+              $stderr = Get-Content $stderrFile -Raw
+
+              if ($proc.ExitCode -ne 0) {
+                throw "$Name exited with code $($proc.ExitCode).`nstderr:`n$stderr"
+              }
+              if ($stderr -match "Traceback") {
+                throw "$Name printed a traceback to stderr:`n$stderr"
+              }
+              if ([string]::IsNullOrWhiteSpace($stdout)) {
+                throw "$Name produced no stdout output"
+              }
+
+              try {
+                $parsed = $stdout | ConvertFrom-Json -ErrorAction Stop
+              } catch {
+                throw "$Name did not print valid JSON on stdout.`nstdout was:`n$stdout`nparse error: $_"
+              }
+
+              Write-Host "OK: $Name -> valid JSON, exit 0, no traceback"
+              return $parsed
+            } finally {
+              Remove-Item $stdoutFile, $stderrFile -ErrorAction SilentlyContinue
+            }
+          }
+
+          $scanResult = Test-WorkerJson -Name "--process-scan-worker" -Arguments @("--process-scan-worker")
+          Write-Host "  processes returned: $($scanResult.processes.Count)"
+
+          $handleResult = Test-WorkerJson -Name "--open-handle-worker" -Arguments @("--open-handle-worker", "nonexistent-ci-smoke-test.txt", "1,2")
+          Write-Host "  matched_pid: $($handleResult.matched_pid)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vlaw-backend-exe
+          path: backend/dist/vlaw-backend.exe
+          if-no-files-found: error
+
+  tray-build:
+    name: Tray app build
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: tray
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install tray dependencies
+        run: npm ci
+
+      - name: Build tray app
+        run: npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vigil-tray-win-unpacked
+          path: tray/dist/win-unpacked/
+          if-no-files-found: error
