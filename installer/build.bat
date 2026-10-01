@@ -30,7 +30,7 @@ echo Removed legacy V-LAW.exe
 echo Step 3: Copying artifacts to installer/build...
 cd ..\installer
 xcopy /E /Y /I ..\tray\dist\win-unpacked\* build\tray\
-xcopy /Y ..\backend\dist\vlaw-backend.exe build\backend\vigil-backend.exe
+copy /Y ..\backend\dist\vlaw-backend.exe build\backend\vigil-backend.exe
 xcopy /E /Y /I ..\tray\assets\* build\assets\
 xcopy /E /Y /I ..\frontend\dist\* build\frontend\
 
