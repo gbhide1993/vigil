@@ -63,7 +63,7 @@ Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: s
 
 ; Lets every client (VS Code extension, JetBrains plugin, CLI) find Vigil
 ; via one registry key instead of hardcoded paths.
-Root: HKCU; Subkey: "Software\Vigil"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Vigil"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletekey
 
 [Run]
 ; Launch Vigil after install
@@ -73,11 +73,6 @@ Filename: "{app}\tray\{#AppExeName}"; Description: "Launch {#AppName}"; Flags: n
 ; Kill both processes before uninstall
 Filename: "taskkill"; Parameters: "/F /IM {#AppExeName}"; Flags: runhidden waituntilterminated; RunOnceId: "KillTray"
 Filename: "taskkill"; Parameters: "/F /IM {#BackendExeName}"; Flags: runhidden waituntilterminated; RunOnceId: "KillBackend"
-
-[UninstallDelete]
-; Clean up user data directories (log, db) — ask first
-Type: filesandordirs; Name: "{app}\data"
-Type: filesandordirs; Name: "{app}\logs"
 
 [Code]
 // Port conflict check before install
@@ -98,4 +93,23 @@ end;
 function InitializeSetup(): Boolean;
 begin
   Result := CheckPort7422Free();
+end;
+
+// Vigil's entire purpose is preserving evidence (the {app}\data DB and
+// {app}\logs), so uninstall must never wipe it silently -- unlike
+// unconditional [UninstallDelete] entries, this asks explicitly and
+// defaults to "No" (IDYES is not the default button), so a reflexive
+// click-through uninstall leaves the evidence intact.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    if MsgBox('Delete Vigil''s stored evidence data and logs?' + #13#10 +
+              'This cannot be undone.',
+              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+    begin
+      DelTree(ExpandConstant('{app}\data'), True, True, True);
+      DelTree(ExpandConstant('{app}\logs'), True, True, True);
+    end;
+  end;
 end;
