@@ -83,7 +83,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
@@ -638,6 +638,15 @@ if os.path.isdir(FRONTEND_DIR):
 
     @app.get("/{full_path:path}")
     async def spa_fallback(full_path: str):
+        # Without this check, a typo'd or nonexistent /api/* path (nothing
+        # matched above -- every real API route is already registered
+        # earlier and would never reach here) falls through to this
+        # catch-all and gets served index.html with a 200, not a 404. The
+        # frontend's own api.js always calls through BASE = '/api', so a
+        # bad call there should fail loudly, not come back as HTML that
+        # res.json() then throws a cryptic SyntaxError trying to parse.
+        if full_path == "api" or full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="not found")
         index = os.path.join(FRONTEND_DIR, "index.html")
         return FileResponse(index)
 else:
