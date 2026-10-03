@@ -34,7 +34,7 @@ LICENSE_FILE = Path(os.environ.get("VLAW_LICENSE_FILE", "./.vlaw-license"))
 # held offline by V-LAW's license issuer — never shipped with the app.
 VLAW_PUBLIC_KEY_PEM = os.environ.get("VLAW_PUBLIC_KEY_PEM", "")
 
-TRIAL_DAYS = 14
+TRIAL_DAYS = 30
 TRIAL_AGENT_LIMIT = 1
 TRIAL_RETENTION_HOURS = 24
 
