@@ -3,6 +3,7 @@ import { api } from '../api'
 
 const NAV_ITEMS = [
   { key: 'status', label: 'Status' },
+  { key: 'agents', label: 'Agents' },
   { key: 'incidents', label: 'Incidents' },
   { key: 'history', label: 'History' },
   { key: 'settings', label: 'Settings' },
@@ -52,8 +53,8 @@ export default function Sidebar({ view, onNavigate, openAlertCount }) {
             onClick={() => onNavigate(item.key)}
           >
             <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              {item.key === 'status' && pendingCount > 0 && <span className="status-dot amber" />}
-              {item.key === 'status' && pendingCount > 0
+              {item.key === 'agents' && pendingCount > 0 && <span className="status-dot amber" />}
+              {item.key === 'agents' && pendingCount > 0
                 ? `${item.label} (${pendingCount} pending)`
                 : item.label}
             </span>
