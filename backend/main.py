@@ -443,18 +443,37 @@ async def _baseline_tick(baseline: Baseline) -> None:
 
 app = FastAPI(title="V-LAW", version=VERSION, lifespan=lifespan)
 
-app.include_router(events.router)
-app.include_router(agents.router)
-app.include_router(alerts.router)
-app.include_router(export.router)
-app.include_router(digest_api.router)
-app.include_router(sessions.router)
-app.include_router(config_api.router)
-app.include_router(analytics_api.router)
+# Unprefixed registration exists only for dev mode: the frontend always
+# calls /api/* (see frontend/src/api.js's BASE), but when it's run via
+# `npm run dev`, Vite's own dev server proxies /api/* to this backend and
+# strips the prefix before forwarding (see frontend/vite.config.js's
+# rewrite), so the backend receives these requests unprefixed in that one
+# workflow. The frozen build never has a Vite dev server in front of it, so
+# this registration served no purpose there -- and was actively harmful,
+# since several of these routers' own paths (/alerts, /agents, /incidents)
+# are also names of frontend-meaningful screens: an unprefixed GET to one
+# of them returned real API JSON instead of falling through to the SPA
+# catch-all (spa_fallback below), surprising anyone who tried e.g. /alerts
+# directly expecting the app shell.
+if not getattr(sys, "frozen", False):
+    app.include_router(events.router)
+    app.include_router(agents.router)
+    app.include_router(alerts.router)
+    app.include_router(export.router)
+    app.include_router(digest_api.router)
+    app.include_router(sessions.router)
+    app.include_router(config_api.router)
+    app.include_router(analytics_api.router)
+    app.include_router(evidence.router)
+
+# mcp_routes/platform_routes/git_routes have no /api-prefixed twin at all
+# (see below) -- the VS Code extension calls these directly, unprefixed,
+# in production too (vigil-vscode/src/api.ts calls {baseUrl}/mcp/call), so
+# unlike the routers above, this registration is load-bearing in the
+# frozen build and must stay unconditional.
 app.include_router(mcp_routes.router)
 app.include_router(platform_routes.router)
 app.include_router(git_routes.router)
-app.include_router(evidence.router)
 
 # The built frontend calls /api/* (see frontend/src/api.js). In dev, Vite's
 # proxy strips that prefix before forwarding to the backend; in production
