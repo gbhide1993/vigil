@@ -71,16 +71,54 @@ KNOWN_DESTINATIONS = {
 # still-running PID is wasted work, and was the dominant remaining cost
 # once ProcessWatcher.poll/NetworkWatcher.poll stopped blocking the event
 # loop directly (~4s for ~109 connections, measured on a real dev machine).
-# TTL is a memory-growth safeguard for dead PIDs, not a correctness window
-# — process identity itself doesn't expire. Same TTL + size-cap cleanup
-# shape as core.red_lines._purge_stale_pending_config_writes.
+#
+# Process identity DOES expire from under this cache, though: Windows
+# reuses PID numbers, and under heavy process churn (observed: Windows
+# Update servicing, another app's helper process starting/stopping) a
+# PID can be recycled for an unrelated process well inside the 30s TTL.
+# Without a liveness check, a cached agent_name from the PID's previous
+# owner gets handed out for the new process too, misattributing its
+# activity. The fourth tuple element (process start time, from
+# psutil.Process(pid).create_time()) guards against exactly that: it's
+# compared on a cache hit (see get_agent_for_pid/get_named_agent_for_pid),
+# and a mismatch — or the process no longer existing — is treated as a
+# miss, same as a TTL expiry. The TTL itself remains a memory-growth
+# safeguard for dead PIDs that are never looked up again, not the
+# correctness mechanism. Same TTL + size-cap cleanup shape as
+# core.red_lines._purge_stale_pending_config_writes.
+#
+# create_time() isn't re-read on literally every hit, though: it's an
+# OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + GetProcessTimes call
+# (confirmed against psutil's own Windows C source), and psutil doesn't
+# release the GIL around it -- normally sub-millisecond, but this
+# project has already hit real cases of OpenProcess stalling
+# unpredictably against an AV-intercepted handle open (see
+# process_watcher.py's docstring on why the process-scan/open-handle
+# checks moved to a subprocess), and get_agent_for_pid is called from
+# much hotter paths than those (every qualifying ETW file event, not
+# just once per poll). The fifth tuple element (last-verified-at) throttles
+# the re-check to once per ATTRIBUTION_VERIFY_INTERVAL_SECONDS per PID --
+# a PID reused fast enough to slip through within that window is an
+# accepted gap, not a goal of this cache.
 #
 # Third tuple element is the behaviour-detector confidence score behind a
 # cached "unidentified_agent" result (None otherwise) — see
 # Attributor._score_behaviour / get_behaviour_score_for_pid.
-_agent_attribution_cache: dict[int, tuple[str | None, float | None, float]] = {}
+_agent_attribution_cache: dict[int, tuple[str | None, float | None, float, float | None, float]] = {}
 ATTRIBUTION_CACHE_TTL_SECONDS = 30
 ATTRIBUTION_CACHE_MAX_ENTRIES = 2000
+ATTRIBUTION_VERIFY_INTERVAL_SECONDS = 1
+
+
+def _process_start_time(pid: int) -> float | None:
+    """psutil.Process(pid).create_time(), or None if the PID doesn't
+    resolve to a live process right now. Used to detect PID reuse (see
+    _agent_attribution_cache above) — never raises, since a dead/
+    inaccessible PID is an expected, routine case here, not a failure."""
+    try:
+        return psutil.Process(pid).create_time()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, OSError):
+        return None
 
 
 def _purge_stale_attribution_cache() -> None:
@@ -89,7 +127,7 @@ def _purge_stale_attribution_cache() -> None:
     session (many short-lived PIDs) without needing its own scheduler job."""
     now = time.time()
     stale_pids = [
-        pid for pid, (_, _score, cached_at) in list(_agent_attribution_cache.items())
+        pid for pid, (_, _score, cached_at, _start_time, _verified_at) in list(_agent_attribution_cache.items())
         if now - cached_at > ATTRIBUTION_CACHE_TTL_SECONDS
     ]
     for pid in stale_pids:
@@ -131,24 +169,42 @@ class Attributor:
 
         Cached per-PID (see _agent_attribution_cache above) since a PID's
         parent chain and name are immutable for the process's lifetime —
-        only the TTL bounds cache memory for PIDs that have since exited;
-        for a still-running PID the TTL just controls how often the
-        (cheap but non-free) behavioural fallback re-checks it."""
+        the TTL bounds cache memory for PIDs that have since exited, and
+        for a still-running PID also controls how often the (cheap but
+        non-free) behavioural fallback re-checks it. A cache hit is only
+        trusted if the PID's current process start time still matches
+        the one recorded at cache time, guarding against Windows having
+        reused the PID for an unrelated process since -- but that check
+        itself is throttled to once per ATTRIBUTION_VERIFY_INTERVAL_SECONDS
+        per PID (see _agent_attribution_cache above), so a hit well within
+        that window skips the create_time() call entirely."""
         _purge_stale_attribution_cache()
 
         now = time.time()
+        current_start_time = None
+        start_time_checked = False
+
         cached = _agent_attribution_cache.get(pid)
         if cached is not None:
-            agent, _score, cached_at = cached
+            agent, _score, cached_at, cached_start_time, last_verified_at = cached
             if now - cached_at < ATTRIBUTION_CACHE_TTL_SECONDS:
-                return agent
+                if now - last_verified_at < ATTRIBUTION_VERIFY_INTERVAL_SECONDS:
+                    return agent
+
+                current_start_time = _process_start_time(pid)
+                start_time_checked = True
+                if current_start_time is not None and current_start_time == cached_start_time:
+                    _agent_attribution_cache[pid] = (agent, _score, cached_at, cached_start_time, now)
+                    return agent
 
         agent = self._walk_parent_chain(pid, pid_snapshot)
         score = None
         if agent is None:
             agent, score = self._score_behaviour(pid)
 
-        _agent_attribution_cache[pid] = (agent, score, now)
+        if not start_time_checked:
+            current_start_time = _process_start_time(pid)
+        _agent_attribution_cache[pid] = (agent, score, now, current_start_time, now)
         return agent
 
     def get_named_agent_for_pid(self, pid: int, pid_snapshot: dict[int, dict] | None = None) -> str | None:
@@ -170,14 +226,27 @@ class Attributor:
         only get_agent_for_pid does that, since a cache hit is expected to
         mean "both the name check AND the behavioural check already ran for
         this pid". Caching a name-only "None" here under the same key would
-        wrongly suppress a later, real behavioural check for that pid."""
+        wrongly suppress a later, real behavioural check for that pid.
+
+        Same PID-reuse guard as get_agent_for_pid, including the same
+        once-per-ATTRIBUTION_VERIFY_INTERVAL_SECONDS throttle on the
+        create_time() re-check -- a cache hit is only trusted if the PID's
+        current process start time still matches the one recorded at
+        cache time."""
         _purge_stale_attribution_cache()
 
+        now = time.time()
         cached = _agent_attribution_cache.get(pid)
         if cached is not None:
-            agent, _score, cached_at = cached
-            if time.time() - cached_at < ATTRIBUTION_CACHE_TTL_SECONDS:
-                return agent
+            agent, score, cached_at, cached_start_time, last_verified_at = cached
+            if now - cached_at < ATTRIBUTION_CACHE_TTL_SECONDS:
+                if now - last_verified_at < ATTRIBUTION_VERIFY_INTERVAL_SECONDS:
+                    return agent
+
+                current_start_time = _process_start_time(pid)
+                if current_start_time is not None and current_start_time == cached_start_time:
+                    _agent_attribution_cache[pid] = (agent, score, cached_at, cached_start_time, now)
+                    return agent
 
         return self._walk_parent_chain(pid, pid_snapshot)
 
