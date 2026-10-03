@@ -95,11 +95,13 @@ begin
   Result := CheckPort7422Free();
 end;
 
-// Vigil's entire purpose is preserving evidence (the {app}\data DB and
-// {app}\logs), so uninstall must never wipe it silently -- unlike
-// unconditional [UninstallDelete] entries, this asks explicitly and
-// defaults to "No" (IDYES is not the default button), so a reflexive
-// click-through uninstall leaves the evidence intact.
+// Vigil's entire purpose is preserving evidence, so uninstall must never
+// wipe it silently -- this asks explicitly and defaults to "No" (IDYES is
+// not the default button), so a reflexive click-through uninstall leaves
+// the evidence intact. The real evidence store is %LOCALAPPDATA%\V-LAW
+// (see backend/main.py's get_base_path()), not {app} -- the backend is
+// spawned unelevated and {app} is under Program Files, which an unelevated
+// process can't write to, so it never puts data/logs there.
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
@@ -108,8 +110,8 @@ begin
               'This cannot be undone.',
               mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
     begin
-      DelTree(ExpandConstant('{app}\data'), True, True, True);
-      DelTree(ExpandConstant('{app}\logs'), True, True, True);
+      DelTree(ExpandConstant('{localappdata}\V-LAW\data'), True, True, True);
+      DelTree(ExpandConstant('{localappdata}\V-LAW\logs'), True, True, True);
     end;
   end;
 end;
