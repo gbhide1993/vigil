@@ -4,6 +4,9 @@
   - core/cross_agent.py   (persisted cross-agent alert dedup)
   - license/license_service.py (expiry-aware valid/reason, corrupt marker)
   - api/export.py         (bad ?date= returns 400 instead of 500)
+  - main.py               (unprefixed routers shadowing the SPA fallback
+                            in a frozen build -- /alerts, /agents,
+                            /incidents)
 
 See conftest.py for why VLAW_DATA_DIR is set there rather than here --
 this module (and anything it imports) must only ever touch that isolated
@@ -11,6 +14,7 @@ temp DB, never the real dev DB in backend/data/."""
 
 import asyncio
 import json
+import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -528,3 +532,85 @@ async def test_start_writer_backstop_exits_instead_of_dying_silently(test_db, mo
     # The in-flight write's caller must not be left hanging forever either.
     assert future.done()
     assert isinstance(future.exception(), ConnectionWedgedError)
+
+
+# ---------------------------------------- 9. unprefixed route / SPA shadowing
+
+def test_unprefixed_routers_gated_by_frozen_flag(monkeypatch, tmp_path):
+    """events/agents/alerts/.../evidence are registered twice in main.py:
+    once unprefixed (dev-only -- Vite's dev server proxies /api/* to this
+    backend and strips the prefix before forwarding, so the backend must
+    answer the unprefixed path in that one workflow) and once under /api
+    (always, since the built frontend itself always calls /api/*). Several
+    of these routers' own bare paths -- /alerts, /agents, /incidents --
+    also happen to be frontend screen names. Left registered unprefixed in
+    a frozen build (no Vite involved there at all), they silently shadowed
+    the SPA catch-all: a plain GET to /alerts returned real API JSON
+    instead of falling through to spa_fallback's index.html.
+
+    main.py's app object and its conditional include_router(...) calls run
+    once, at module import time, so the only way to exercise both states is
+    reloading the module with sys.frozen toggled -- nothing else in this
+    suite imports main's actual `app`, per the investigation that preceded
+    this fix, hence the reload/TestClient machinery below rather than a
+    simpler fixture.
+
+    A scratch {tmp_path}/frontend/index.html stands in for the real built
+    frontend, purely so the SPA fallback route itself registers (it only
+    does if FRONTEND_DIR exists on disk -- see main.py) and the frozen-case
+    assertion below can tell "fell through to the SPA shell" apart from
+    "no route matched at all". LOCALAPPDATA is also redirected to tmp_path
+    for the frozen reload so get_base_path() doesn't touch the real
+    %LOCALAPPDATA%\\V-LAW this machine actually uses."""
+    import importlib
+
+    from fastapi.testclient import TestClient
+
+    import main as main_module
+
+    frontend_dir = tmp_path / "frontend"
+    frontend_dir.mkdir()
+    (frontend_dir / "assets").mkdir()
+    (frontend_dir / "index.html").write_text("<html>spa shell</html>")
+    fake_exe = tmp_path / "backend" / "vlaw-backend.exe"
+    fake_exe.parent.mkdir()
+
+    def reload_as(frozen: bool):
+        if frozen:
+            monkeypatch.setattr(sys, "frozen", True, raising=False)
+            monkeypatch.setattr(sys, "executable", str(fake_exe))
+            monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        else:
+            monkeypatch.delattr(sys, "frozen", raising=False)
+        return importlib.reload(main_module)
+
+    try:
+        not_frozen = reload_as(frozen=False)
+        client = TestClient(not_frozen.app)
+        for path in ("/alerts", "/agents", "/incidents"):
+            resp = client.get(path)
+            assert resp.headers["content-type"].startswith("application/json"), (
+                f"dev mode (not frozen): {path} should hit the real unprefixed "
+                f"router (Vite's proxy needs it), got {resp.headers['content-type']}"
+            )
+
+        frozen = reload_as(frozen=True)
+        client = TestClient(frozen.app)
+        for path in ("/alerts", "/agents", "/incidents"):
+            resp = client.get(path)
+            assert resp.status_code == 200
+            assert resp.headers["content-type"].startswith("text/html"), (
+                f"frozen build: {path} should fall through to the SPA shell "
+                f"(no router should match it unprefixed), got {resp.headers['content-type']}"
+            )
+        for path in ("/api/alerts", "/api/agents", "/api/incidents"):
+            resp = client.get(path)
+            assert resp.headers["content-type"].startswith("application/json"), (
+                f"frozen build: {path} should still hit the real API route"
+            )
+    finally:
+        # main's app object is shared module state (sys.modules["main"]) --
+        # leave it reloaded back to the normal, non-frozen state regardless
+        # of the above, so no later test importing from main inherits the
+        # frozen reload's app/FRONTEND_DIR.
+        reload_as(frozen=False)
