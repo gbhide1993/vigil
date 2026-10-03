@@ -20,9 +20,8 @@ export default function SessionInsightCard() {
         const firstSession = sessions[sessions.length - 1]
         if (firstSession.ended_at == null) return // still in progress — nothing to summarise yet
 
-        // GET /alerts has no session_id filter param — fetch all and filter client-side.
-        const alertsData = await api.getAlerts()
-        const alerts = (alertsData.alerts || []).filter((a) => a.session_id === firstSession.id)
+        const alertsData = await api.getAlerts({ session_id: firstSession.id })
+        const alerts = alertsData.alerts || []
         const redLineFired = alerts.some((a) => a.rule_type === 'red_line')
 
         if (!cancelled) {
