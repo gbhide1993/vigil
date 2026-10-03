@@ -10,10 +10,10 @@ export default function Incidents({ onNavigate }) {
 
   async function load() {
     try {
-      const params = {}
+      const params = { severity: 'high,critical' }
       if (statusFilter) params.status = statusFilter
       const data = await api.getAlerts(params)
-      setAlerts(data.alerts.filter((a) => a.severity === 'high' || a.severity === 'critical'))
+      setAlerts(data.alerts)
     } catch {
       // ignore poll failures
     }

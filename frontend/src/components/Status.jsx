@@ -11,17 +11,16 @@ function formatStartDate(ts) {
   })
 }
 
-function computeOrbState(alerts, proofOfValue) {
-  const unresolved = alerts.filter((a) => a.status === 'open' || a.status === 'investigating')
-  const hasCritical = unresolved.some((a) => a.severity === 'high' || a.severity === 'critical')
+function computeOrbState(hasCritical, hasMinor, proofOfValue) {
   if (hasCritical) return 'red'
-  const hasMinor = unresolved.some((a) => a.severity === 'medium' || a.severity === 'low')
   if (hasMinor || (proofOfValue && proofOfValue.days_clean === 0)) return 'amber'
   return 'green'
 }
 
 export default function Status({ onNavigate }) {
-  const [alerts, setAlerts] = useState([])
+  const [criticalAlerts, setCriticalAlerts] = useState([])
+  const [criticalTotal, setCriticalTotal] = useState(0)
+  const [hasMinorAlerts, setHasMinorAlerts] = useState(false)
   const [agents, setAgents] = useState([])
   const [proofOfValue, setProofOfValue] = useState(null)
   const [recordingSince, setRecordingSince] = useState(null)
@@ -32,14 +31,25 @@ export default function Status({ onNavigate }) {
 
     async function load() {
       try {
-        const [alertsData, agentsData, sessionsData, proofOfValueData] = await Promise.all([
-          api.getAlerts({ status: 'open' }),
+        // Two separate calls, not one unfiltered fetch filtered client-side:
+        // the orb needs both "is there an open high/critical alert" (red)
+        // and "is there an open medium/low alert" (amber vs green), and
+        // filtering severity server-side for only one of those tiers would
+        // just move the same silent-miss bug this change is fixing onto
+        // the other tier. The medium/low call only needs `total` (an
+        // existence check), so it asks for limit: 1 rather than pulling
+        // rows nothing here renders.
+        const [criticalData, minorData, agentsData, sessionsData, proofOfValueData] = await Promise.all([
+          api.getAlerts({ status: 'open', severity: 'high,critical' }),
+          api.getAlerts({ status: 'open', severity: 'medium,low', limit: 1 }),
           api.getAgents(),
           api.getSessions(),
           api.getProofOfValue(),
         ])
         if (cancelled) return
-        setAlerts(alertsData.alerts)
+        setCriticalAlerts(criticalData.alerts)
+        setCriticalTotal(criticalData.total)
+        setHasMinorAlerts(minorData.total > 0)
         setAgents(agentsData.agents)
         setProofOfValue(proofOfValueData)
         if (sessionsData.sessions.length > 0) {
@@ -61,17 +71,14 @@ export default function Status({ onNavigate }) {
     }
   }, [])
 
-  const orbState = computeOrbState(alerts, proofOfValue)
+  const orbState = computeOrbState(criticalAlerts.length > 0, hasMinorAlerts, proofOfValue)
   const activeAgentNames = agents.filter((a) => a.approved !== 2).map((a) => a.name)
-  const criticalIncidents = alerts.filter(
-    (a) => (a.status === 'open' || a.status === 'investigating') && (a.severity === 'high' || a.severity === 'critical')
-  )
 
   let contextLine
   if (orbState === 'red') {
     contextLine = (
       <a href="#incident-list" className="status-context-link">
-        {criticalIncidents.length} incident{criticalIncidents.length !== 1 ? 's' : ''} need attention. Investigate →
+        {criticalTotal} incident{criticalTotal !== 1 ? 's' : ''} need attention. Investigate →
       </a>
     )
   } else if (orbState === 'amber') {
@@ -105,8 +112,11 @@ export default function Status({ onNavigate }) {
 
       {orbState === 'red' && (
         <div id="incident-list">
-          <IncidentList alerts={criticalIncidents} onNavigate={onNavigate} onResolved={() => {
-            api.getAlerts({ status: 'open' }).then((d) => setAlerts(d.alerts)).catch(() => {})
+          <IncidentList alerts={criticalAlerts} onNavigate={onNavigate} onResolved={() => {
+            api.getAlerts({ status: 'open', severity: 'high,critical' }).then((d) => {
+              setCriticalAlerts(d.alerts)
+              setCriticalTotal(d.total)
+            }).catch(() => {})
           }} />
         </div>
       )}

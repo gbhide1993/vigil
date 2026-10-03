@@ -4,6 +4,7 @@ import { api } from '../api'
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low']
 const SEVERITY_LABELS = { critical: 'CRITICAL', high: 'HIGH', medium: 'MEDIUM', low: 'LOW' }
 const DETAIL_TRUNCATE_LEN = 80
+const ALERTS_PAGE_SIZE = 50
 
 function formatRelative(ts) {
   if (!ts) return '—'
@@ -142,6 +143,9 @@ function AlertCard({ alert, onResolve, onNavigate }) {
 
 export default function Alerts({ onNavigate }) {
   const [alerts, setAlerts] = useState([])
+  const [total, setTotal] = useState(0)
+  const [hasMore, setHasMore] = useState(false)
+  const [page, setPage] = useState(0)
   const [statusFilter, setStatusFilter] = useState('open')
   const [severityFilter, setSeverityFilter] = useState('')
   const [agentFilter, setAgentFilter] = useState('')
@@ -150,23 +154,29 @@ export default function Alerts({ onNavigate }) {
 
   async function load() {
     try {
-      const params = {}
+      const params = { limit: ALERTS_PAGE_SIZE, offset: page * ALERTS_PAGE_SIZE }
       if (statusFilter) params.status = statusFilter
       if (severityFilter) params.severity = severityFilter
       if (agentFilter) params.agent = agentFilter
       const data = await api.getAlerts(params)
       setAlerts(data.alerts)
+      setTotal(data.total)
+      setHasMore(data.has_more)
     } catch {
       // ignore poll failures
     }
   }
 
+  // Each filter's own onChange resets page to 0 (see the <select>s below)
+  // rather than this effect deriving the reset from a filter change, so a
+  // filter change and the page reset land in the same render instead of
+  // this load firing once with the old page and once more right after.
   useEffect(() => {
     load()
     const id = setInterval(load, 3000)
     return () => clearInterval(id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [statusFilter, severityFilter, agentFilter])
+  }, [statusFilter, severityFilter, agentFilter, page])
 
   useEffect(() => {
     let cancelled = false
@@ -204,6 +214,9 @@ export default function Alerts({ onNavigate }) {
     alerts: alerts.filter((a) => a.severity === sev),
   })).filter((g) => g.alerts.length > 0)
 
+  const rangeStart = total === 0 ? 0 : page * ALERTS_PAGE_SIZE + 1
+  const rangeEnd = Math.min((page + 1) * ALERTS_PAGE_SIZE, total)
+
   return (
     <div>
       <div className="page-header">
@@ -214,7 +227,7 @@ export default function Alerts({ onNavigate }) {
       </div>
 
       <div className="alerts-filter-bar">
-        <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+        <select value={statusFilter} onChange={(e) => { setStatusFilter(e.target.value); setPage(0) }}>
           <option value="open">Open</option>
           <option value="investigating">Investigating</option>
           <option value="dismissed">Dismissed</option>
@@ -222,14 +235,14 @@ export default function Alerts({ onNavigate }) {
           <option value="risk_accepted">Risk Accepted</option>
           <option value="">All statuses</option>
         </select>
-        <select value={severityFilter} onChange={(e) => setSeverityFilter(e.target.value)}>
+        <select value={severityFilter} onChange={(e) => { setSeverityFilter(e.target.value); setPage(0) }}>
           <option value="">All severities</option>
           <option value="critical">Critical</option>
           <option value="high">High</option>
           <option value="medium">Medium</option>
           <option value="low">Low</option>
         </select>
-        <select value={agentFilter} onChange={(e) => setAgentFilter(e.target.value)}>
+        <select value={agentFilter} onChange={(e) => { setAgentFilter(e.target.value); setPage(0) }}>
           <option value="">All agents</option>
           {agents.map((a) => (
             <option key={a.id} value={a.id}>{a.name}</option>
@@ -257,6 +270,18 @@ export default function Alerts({ onNavigate }) {
           </div>
         ))
       )}
+
+      <div className="alerts-pagination">
+        <span className="alerts-pagination-range">
+          Showing {rangeStart}–{rangeEnd} of {total}
+        </span>
+        <button className="btn ghost" disabled={page === 0} onClick={() => setPage((p) => p - 1)}>
+          ← Prev
+        </button>
+        <button className="btn ghost" disabled={!hasMore} onClick={() => setPage((p) => p + 1)}>
+          Next →
+        </button>
+      </div>
     </div>
   )
 }

@@ -40,6 +40,9 @@ async def get_alerts(
     status: str | None = Query(default=None),
     severity: str | None = Query(default=None),
     agent: int | None = Query(default=None),
+    session_id: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ):
     db = await get_db()
 
@@ -49,13 +52,39 @@ async def get_alerts(
         clauses.append("al.status = ?")
         params.append(status)
     if severity is not None:
-        clauses.append("al.severity = ?")
-        params.append(severity)
+        # Comma-separated (severity=high,critical), not a repeated query
+        # param (?severity=high&severity=critical) -- the frontend's
+        # api.js builds query strings via new URLSearchParams(params) over
+        # a plain object, which has no clean way to emit the same key
+        # twice, whereas a CSV string needs no change there at all.
+        severities = [s.strip() for s in severity.split(",") if s.strip()]
+        if severities:
+            placeholders = ", ".join("?" * len(severities))
+            clauses.append(f"al.severity IN ({placeholders})")
+            params.extend(severities)
     if agent is not None:
         clauses.append("al.agent_id = ?")
         params.append(agent)
+    if session_id is not None:
+        clauses.append("COALESCE(al.session_id, e.session_id) = ?")
+        params.append(session_id)
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    # Same WHERE (and the same LEFT JOIN events e it depends on for the
+    # session_id filter) as the row query below, minus agents/sessions --
+    # those two joins only ever add SELECT-list columns, nothing any
+    # filter clause references, so COUNT(*) doesn't need them.
+    count_cur = await db.execute(
+        f"""
+        SELECT COUNT(*) as c
+        FROM alerts al
+        LEFT JOIN events e ON e.id = al.event_id
+        {where}
+        """,
+        params,
+    )
+    total = (await count_cur.fetchone())["c"]
 
     cur = await db.execute(
         f"""
@@ -70,11 +99,18 @@ async def get_alerts(
         LEFT JOIN sessions s ON s.id = COALESCE(al.session_id, e.session_id)
         {where}
         ORDER BY al.created_at DESC
+        LIMIT ? OFFSET ?
         """,
-        params,
+        params + [limit, offset],
     )
     rows = await cur.fetchall()
-    return {"alerts": [dict(r) for r in rows]}
+    return {
+        "alerts": [dict(r) for r in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + len(rows) < total,
+    }
 
 
 @router.post("/alerts/bulk-dismiss")
