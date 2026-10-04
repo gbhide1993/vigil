@@ -19,6 +19,7 @@ import time
 from core.aggregator import Aggregator
 from core.alerter import Alerter
 from core.attributor import KNOWN_DESTINATIONS, Attributor
+from core.feature_flags import CORE_ONLY
 from core.red_lines import RedLines
 from db.database import get_db
 
@@ -190,12 +191,13 @@ class NetworkWatcher:
 
             dest_label = known_hostname or ip
 
-            await self.red_lines.check_unknown_destination(agent_id, agent_name, dest_label, session_id=session_id)
+            if not CORE_ONLY:
+                await self.red_lines.check_unknown_destination(agent_id, agent_name, dest_label, session_id=session_id)
 
-            is_approved = await self._is_approved_destination(db, dest_label, ip)
+                is_approved = await self._is_approved_destination(db, dest_label, ip)
 
-            if known_hostname is None and not is_approved:
-                await self._fire_unapproved_destination_alert(db, agent_id, dest_label, port, session_id)
+                if known_hostname is None and not is_approved:
+                    await self._fire_unapproved_destination_alert(db, agent_id, dest_label, port, session_id)
 
             await self.aggregator.ingest_net_event({
                 "agent_id": agent_id,

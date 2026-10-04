@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 from core.cross_agent import check_cross_agent_credential_access, check_cross_agent_file_conflict
 from core.digest import generate_summary
+from core.feature_flags import CORE_ONLY
 from core.layer2a import score_session_2a
 from core.layer2b import score_session_2b
 from db.database import get_db
@@ -190,6 +191,8 @@ class SessionManager:
     async def _score_layer2a(self, db, session_id: str, agent_id: int) -> None:
         """Layer 2a: embedded-prior anomaly checks. Session close must
         never fail due to scoring, so any error here is swallowed."""
+        if CORE_ONLY:
+            return
         try:
             cur = await db.execute("SELECT started_at FROM sessions WHERE id = ?", (session_id,))
             session = await cur.fetchone()
@@ -205,6 +208,8 @@ class SessionManager:
     async def _score_layer2b(self, db, session_id: str, agent_id: int) -> None:
         """Layer 2b: rolling-window MAD anomaly checks. Session close
         must never fail due to scoring, so any error here is swallowed."""
+        if CORE_ONLY:
+            return
         try:
             cur = await db.execute("SELECT name FROM agents WHERE id = ?", (agent_id,))
             agent = await cur.fetchone()

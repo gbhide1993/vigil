@@ -12,6 +12,7 @@ from pathlib import Path
 
 from core.alerter import Alerter
 from core.attributor import KNOWN_AGENTS, Attributor
+from core.feature_flags import CORE_ONLY
 from core.red_lines import RedLines
 from db.database import get_db
 
@@ -261,9 +262,10 @@ class ProcessWatcher:
         for hit in env_redirect_hits:
             agent_id = await self.attributor.get_or_create_agent(hit["agent_name"], hit["pid"])
             session_id = await self.attributor.sessions.touch(agent_id)
-            await self.red_lines.check_env_var_redirect(
-                agent_id, hit["agent_name"], session_id, hit["agent_env"], pid=hit["pid"]
-            )
+            if not CORE_ONLY:
+                await self.red_lines.check_env_var_redirect(
+                    agent_id, hit["agent_name"], session_id, hit["agent_env"], pid=hit["pid"]
+                )
 
         if not new_pids:
             return
@@ -301,9 +303,10 @@ class ProcessWatcher:
             agent_id = await self.attributor.get_or_create_agent(agent_name, pid, confidence=confidence)
             session_id = await self.attributor.sessions.touch(agent_id)
 
-            await self.red_lines.check_dangerous_command(agent_id, agent_name, cmdline, exe_name, session_id=session_id)
+            if not CORE_ONLY:
+                await self.red_lines.check_dangerous_command(agent_id, agent_name, cmdline, exe_name, session_id=session_id)
 
-            await self._check_config_exec(agent_id, agent_name, exe_path or cmdline, session_id)
+                await self._check_config_exec(agent_id, agent_name, exe_path or cmdline, session_id)
 
             suspicious = _is_suspicious(cmdline, exe_name)
             # Behaviourally-flagged spawns are never "low" — being agent-like
