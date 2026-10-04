@@ -78,7 +78,7 @@ async def test_seal_creates_chain(test_db):
     for i in range(3):
         await _insert_event(test_db, agent_id, session_id, f"/tmp/file{i}.py")
 
-    sealed = await seal_new_events(test_db)
+    sealed = await seal_new_events()
     assert sealed == unsealed_before + 3
 
     cur = await test_db.execute("SELECT COUNT(*) c FROM event_chain")
@@ -111,7 +111,7 @@ async def test_verify_detects_tampering(test_db):
     event_id = await _insert_event(test_db, agent_id, session_id, "/tmp/original.py")
     await _insert_event(test_db, agent_id, session_id, "/tmp/other.py")
 
-    await seal_new_events(test_db)
+    await seal_new_events()
 
     await test_db.execute("UPDATE events SET path = ? WHERE id = ?", ("/tmp/tampered.py", event_id))
     await test_db.commit()
@@ -139,7 +139,7 @@ async def test_verify_detects_deletion(test_db):
     event_id = await _insert_event(test_db, agent_id, session_id, "/tmp/doomed.py")
     await _insert_event(test_db, agent_id, session_id, "/tmp/survivor.py")
 
-    await seal_new_events(test_db)
+    await seal_new_events()
 
     cur = await test_db.execute("SELECT * FROM events WHERE id = ?", (event_id,))
     original_row = dict(await cur.fetchone())
@@ -185,7 +185,7 @@ async def test_chain_persists_across_seal_calls(test_db):
     await _insert_event(test_db, agent_id, session_id, "/tmp/first.py")
     await _insert_event(test_db, agent_id, session_id, "/tmp/second.py")
 
-    first_sealed = await seal_new_events(test_db)
+    first_sealed = await seal_new_events()
     assert first_sealed == unsealed_before + 2
 
     head_after_first = await get_chain_head(test_db)
@@ -193,7 +193,7 @@ async def test_chain_persists_across_seal_calls(test_db):
     await _insert_event(test_db, agent_id, session_id, "/tmp/third.py")
     await _insert_event(test_db, agent_id, session_id, "/tmp/fourth.py")
 
-    second_sealed = await seal_new_events(test_db)
+    second_sealed = await seal_new_events()
     assert second_sealed == 2
 
     cur = await test_db.execute("SELECT id, event_id, prev_hash, row_hash FROM event_chain ORDER BY id ASC")

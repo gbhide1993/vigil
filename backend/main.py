@@ -447,9 +447,11 @@ async def _baseline_tick(baseline: Baseline) -> None:
 
 
 async def _seal_evidence_chain() -> None:
+    # seal_new_events() now opens its own dedicated connection internally
+    # (see core/evidence_chain.py) rather than taking the shared get_db()
+    # singleton -- no db handle needed here anymore.
     from core.evidence_chain import seal_new_events
-    db = await get_db()
-    await seal_new_events(db)
+    await seal_new_events()
 
 
 app = FastAPI(title="V-LAW", version=VERSION, lifespan=lifespan)

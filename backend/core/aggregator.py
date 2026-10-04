@@ -727,14 +727,42 @@ class Aggregator:
         single writer queue instead of through it, and a slow checkpoint
         can never block Aggregator/ProcessWatcher/VlawFileHandler writes
         that share that queue. Best-effort: any failure here is logged and
-        swallowed, never raised into flush_buffers."""
+        swallowed, never raised into flush_buffers.
+
+        PRAGMA wal_checkpoint(PASSIVE) returns a single row of
+        (busy, log, checkpointed): `busy` is 1 if something else held the
+        WAL and blocked a full checkpoint, `log` is the WAL's total frame
+        count, `checkpointed` is how many of those frames this call
+        actually checkpointed. Until now that row was never fetched --
+        `await conn.execute(...)` alone discards it -- so there was no way
+        to tell a checkpoint that ran but did nothing (busy=1,
+        checkpointed < log, under write contention -- the original WAL-
+        growth theory) apart from one that genuinely had nothing to do
+        (log==0). Logging that row, plus the actual .db-wal file size on
+        disk, turns "checkpoint took 0.46s" from a duration with no
+        meaning into a verifiable catch-up/falling-behind signal."""
         start = time.monotonic()
         try:
             conn = await aiosqlite.connect(DB_PATH)
             try:
-                await conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                cur = await conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                row = await cur.fetchone()
+                busy, log_frames, checkpointed_frames = row if row else (None, None, None)
             finally:
                 await conn.close()
+
+            wal_path = Path(f"{DB_PATH}-wal")
+            try:
+                wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+            except OSError:
+                wal_bytes = None
+
+            logger.info(
+                "[TIMING] checkpoint result: busy=%s log_frames=%s checkpointed_frames=%s "
+                "wal_bytes=%s wal_mb=%s",
+                busy, log_frames, checkpointed_frames, wal_bytes,
+                round(wal_bytes / (1024 * 1024), 2) if wal_bytes is not None else None,
+            )
         except Exception:
             logger.exception("aggregator: dedicated-connection WAL checkpoint failed")
         finally:

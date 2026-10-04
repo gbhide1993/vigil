@@ -14,8 +14,22 @@ treating the first row as a broken link.
 """
 
 import hashlib
+import logging
+
+import aiosqlite
+from db.database import DB_PATH
 
 GENESIS_HASH = "0" * 64
+
+# Caps how many backlogged events a single seal_new_events() call will seal.
+# Without this, a backlog (e.g. after a burst of activity, or after this job
+# itself falls behind) gets sealed in one unbounded loop -- observed taking
+# 54s for ~14k backlogged rows, during which every other caller sharing the
+# connection it ran on queued behind it. Capping the batch means a large
+# backlog drains incrementally across multiple 15s scheduler cycles instead
+# of blocking everything in one long run; the next cycle simply picks up
+# wherever this one left off (ORDER BY id ASC, resumed from MAX(event_id)).
+SEAL_BATCH_LIMIT = 500
 
 
 def _canonical_row_string(event_row: dict) -> str:
@@ -40,41 +54,60 @@ def compute_row_hash(event_row: dict, prev_hash: str) -> str:
     return hashlib.sha256((prev_hash + _canonical_row_string(event_row)).encode("utf-8")).hexdigest()
 
 
-async def seal_new_events(db) -> int:
-    """Called periodically (every 15s, see main.py's scheduler). Finds
-    every events row not yet in event_chain, in ascending id order, and
-    seals each one in turn. Returns how many rows were sealed this call.
+async def seal_new_events() -> int:
+    """Called periodically (every 15s, see main.py's scheduler). Finds up
+    to SEAL_BATCH_LIMIT events rows not yet in event_chain, in ascending
+    id order, and seals each one in turn. Returns how many rows were
+    sealed this call -- a return equal to SEAL_BATCH_LIMIT signals there
+    may be more backlog left for the next cycle to pick up.
+
+    Runs on its own dedicated connection, deliberately not the shared
+    get_db() singleton -- same reasoning as Aggregator._checkpoint():
+    this used to run on get_db() and, measured directly, a 14k-row
+    backlog took 54s to seal on that shared connection, during which
+    every other caller of get_db() (including plain health checks)
+    queued behind it since aiosqlite serializes all operations on a
+    connection through one background thread. A dedicated connection
+    plus the batch cap above means neither problem can recur: this job
+    can never block any other caller, and no single run can take longer
+    than SEAL_BATCH_LIMIT rows' worth of work regardless of connection.
+
     Must never raise -- scheduler jobs that raise get logged loudly by
     APScheduler but this must not take anything else down with it, so
-    wrap the body in try/except and log+return 0 on failure, matching
-    the pattern in core/sessions.py's _score_layer2a."""
-    import logging
+    the body is wrapped in try/except, logging and returning 0 on
+    failure, matching the pattern in core/sessions.py's _score_layer2a."""
     logger = logging.getLogger("vlaw")
     try:
-        cur = await db.execute("SELECT row_hash FROM event_chain ORDER BY id DESC LIMIT 1")
-        last = await cur.fetchone()
-        prev_hash = last["row_hash"] if last else GENESIS_HASH
+        conn = await aiosqlite.connect(DB_PATH)
+        conn.row_factory = aiosqlite.Row
+        try:
+            cur = await conn.execute("SELECT row_hash FROM event_chain ORDER BY id DESC LIMIT 1")
+            last = await cur.fetchone()
+            prev_hash = last["row_hash"] if last else GENESIS_HASH
 
-        cur = await db.execute("SELECT MAX(event_id) m FROM event_chain")
-        last_sealed_id = (await cur.fetchone())["m"] or 0
+            cur = await conn.execute("SELECT MAX(event_id) m FROM event_chain")
+            last_sealed_id = (await cur.fetchone())["m"] or 0
 
-        cur = await db.execute(
-            "SELECT * FROM events WHERE id > ? ORDER BY id ASC", (last_sealed_id,)
-        )
-        rows = await cur.fetchall()
-        sealed = 0
-        for row in rows:
-            row_dict = dict(row)
-            row_hash = compute_row_hash(row_dict, prev_hash)
-            await db.execute(
-                "INSERT INTO event_chain (event_id, row_hash, prev_hash) VALUES (?, ?, ?)",
-                (row_dict["id"], row_hash, prev_hash),
+            cur = await conn.execute(
+                "SELECT * FROM events WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (last_sealed_id, SEAL_BATCH_LIMIT),
             )
-            prev_hash = row_hash
-            sealed += 1
-        if sealed:
-            await db.commit()
-        return sealed
+            rows = await cur.fetchall()
+            sealed = 0
+            for row in rows:
+                row_dict = dict(row)
+                row_hash = compute_row_hash(row_dict, prev_hash)
+                await conn.execute(
+                    "INSERT INTO event_chain (event_id, row_hash, prev_hash) VALUES (?, ?, ?)",
+                    (row_dict["id"], row_hash, prev_hash),
+                )
+                prev_hash = row_hash
+                sealed += 1
+            if sealed:
+                await conn.commit()
+            return sealed
+        finally:
+            await conn.close()
     except Exception:
         logger.exception("evidence chain sealing failed")
         return 0

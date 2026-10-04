@@ -330,8 +330,8 @@ async function updateTrayTooltip() {
     // ordered newest-first, so slicing client-side after the fetch gives the
     // same "most recent" result the spec asks for.
     const [sessionsRes, openAlertsRes] = await Promise.all([
-      httpRequest('GET', '/sessions?limit=1'),
-      httpRequest('GET', '/alerts?status=open&limit=1'),
+      httpRequest('GET', '/api/sessions?limit=1'),
+      httpRequest('GET', '/api/alerts?status=open&limit=1'),
     ])
 
     const sessions = ((sessionsRes.body && sessionsRes.body.sessions) || []).slice(0, 1)
@@ -364,7 +364,7 @@ async function updateTrayTooltip() {
 async function pollAlerts() {
   if (!backendReady) return
   try {
-    const { status, body } = await httpRequest('GET', '/alerts?status=open')
+    const { status, body } = await httpRequest('GET', '/api/alerts?status=open')
     if (status !== 200 || !body) {
       throw new Error(`unexpected response status ${status}`)
     }
@@ -458,7 +458,7 @@ function formatDigestBody(body) {
 
 async function triggerDigestNow() {
   try {
-    const { status, body } = await httpRequest('GET', '/digest/daily')
+    const { status, body } = await httpRequest('GET', '/api/digest/daily')
     if (status !== 200 || !body) {
       console.error('digest fetch failed:', status)
       return
@@ -479,7 +479,7 @@ async function triggerDigestNow() {
   // Fire-and-forget: a webhook failure (unconfigured, unreachable, bad
   // URL) must never affect the toast above, which has already shown by
   // the time this runs.
-  httpRequest('POST', '/digest/send-webhook')
+  httpRequest('POST', '/api/digest/send-webhook')
     .then(({ body }) => {
       if (body && body.sent) {
         console.log('Morning digest sent to webhook')
@@ -661,7 +661,7 @@ function createTray() {
 ipcMain.handle('send-action', async (_event, { type, alertId, agentId }) => {
   try {
     if (type === 'resolve') {
-      const { status, body } = await httpRequest('POST', `/alerts/${alertId}/resolve`, {
+      const { status, body } = await httpRequest('POST', `/api/alerts/${alertId}/resolve`, {
         action: 'dismiss',
       })
       const ok = status >= 200 && status < 300
@@ -672,7 +672,7 @@ ipcMain.handle('send-action', async (_event, { type, alertId, agentId }) => {
       return { ok, status, body }
     }
     if (type === 'block') {
-      const { status, body } = await httpRequest('POST', `/agents/${agentId}/block`)
+      const { status, body } = await httpRequest('POST', `/api/agents/${agentId}/block`)
       const ok = status >= 200 && status < 300
       if (ok) {
         currentAlert = null
