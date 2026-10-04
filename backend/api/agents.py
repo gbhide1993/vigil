@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 from config.policy import POLICY_FILE
 from core.cve_check import check_agent_cves, get_installed_agent_version
+from core.feature_flags import CORE_ONLY
 from db.database import get_db
 
 router = APIRouter()
@@ -212,6 +213,8 @@ async def get_agent_cve_check(agent_name: str):
     KNOWN_CVES table. installed_version is None when it couldn't be
     determined (e.g. binary not found, --version output unparseable) —
     that's a valid, non-error result, not a failure."""
+    if CORE_ONLY:
+        return {"agent_name": agent_name, "disabled": True, "reason": "core-only mode"}
     installed_version = get_installed_agent_version(agent_name)
     applicable_cves = check_agent_cves(agent_name)
     return {

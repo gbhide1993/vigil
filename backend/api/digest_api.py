@@ -6,6 +6,7 @@ from fastapi import APIRouter
 from api.config_api import get_config_value
 from core.analytics import track
 from core.config_auditor import audit_all_configs
+from core.feature_flags import CORE_ONLY
 from db.database import get_db
 
 router = APIRouter()
@@ -209,6 +210,8 @@ async def _build_daily_digest(db) -> dict:
 
 @router.get("/digest/daily")
 async def get_daily_digest():
+    if CORE_ONLY:
+        return {"disabled": True, "reason": "core-only mode"}
     db = await get_db()
     return await _build_daily_digest(db)
 
@@ -218,6 +221,8 @@ async def get_proof_of_value():
     """Standalone endpoint so the web UI's Live Feed can show this as a
     persistent card independent of the once-daily toast — same
     _build_proof_of_value() logic /digest/daily uses, not a duplicate."""
+    if CORE_ONLY:
+        return {"disabled": True, "reason": "core-only mode"}
     db = await get_db()
     return await _build_proof_of_value(db)
 
@@ -289,6 +294,8 @@ async def send_webhook():
     misconfigured or unreachable webhook must not break the digest flow
     that calls this, so every failure path returns {"sent": False,
     "reason": ...} instead of propagating an exception."""
+    if CORE_ONLY:
+        return {"sent": False, "reason": "core-only mode"}
     db = await get_db()
     url = await get_config_value(db, "webhook_url")
 

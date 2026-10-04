@@ -14,6 +14,7 @@ import time
 
 from core.alerter import Alerter
 from core.attributor import Attributor
+from core.feature_flags import CORE_ONLY
 from core.red_lines import RedLines
 from db.database import get_db
 
@@ -258,7 +259,7 @@ class McpWatcher:
         )
         event_id = cur.lastrowid
 
-        if not is_approved:
+        if not is_approved and not CORE_ONLY:
             await self._check_mcp_auto_approval_or_fallback(db, agent_id, agent_name, endpoint, event_id, session_id)
 
     async def _check_mcp_auto_approval_or_fallback(

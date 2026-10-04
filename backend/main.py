@@ -93,6 +93,7 @@ from core.aggregator import Aggregator
 from core.attributor import Attributor
 from core.baseline import Baseline
 from core.config_auditor import audit_all_configs
+from core.feature_flags import CORE_ONLY
 from core.insights import get_insights
 from core.red_lines import SESSION_LAUNCH_DIR
 from db.database import DB_PATH, close_db, get_db, init_db
@@ -621,6 +622,8 @@ async def config_audit():
     — read-only, never writes to the user's config. Runs synchronously
     against local disk reads (no DB/network), cheap enough to call on
     every request rather than caching."""
+    if CORE_ONLY:
+        return {"disabled": True, "reason": "core-only mode"}
     return audit_all_configs(str(SESSION_LAUNCH_DIR))
 
 

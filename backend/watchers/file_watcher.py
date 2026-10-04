@@ -43,6 +43,7 @@ from core.burst_detector import BurstDetector
 from core.correlation_engine import CorrelationEngine
 from core.evidence import AttributionChain, AttributionConfidence, VigilEvidence
 from core.evidence_store import evidence_store
+from core.feature_flags import CORE_ONLY
 from core.red_lines import RedLines, is_agent_config_path, is_mcp_config_path, register_agent_workspace
 from db.database import get_db
 from watchers.etw_file_watcher import ETWFileWatcher
@@ -475,9 +476,10 @@ class VlawFileHandler(FileSystemEventHandler):
         agent_id = await self.attributor.get_or_create_agent(agent_name, pid, confidence=behaviour_confidence)
         session_id = await self.attributor.sessions.touch(agent_id)
 
-        await self._check_red_lines(agent_id, agent_name, path, event_type, session_id)
-        await self._check_config_exec(agent_id, agent_name, path, event_type, session_id)
-        await self._check_mcp_config_write(agent_id, path, event_type)
+        if not CORE_ONLY:
+            await self._check_red_lines(agent_id, agent_name, path, event_type, session_id)
+            await self._check_config_exec(agent_id, agent_name, path, event_type, session_id)
+            await self._check_mcp_config_write(agent_id, path, event_type)
 
         event_dict = {
             "agent_id": agent_id,
