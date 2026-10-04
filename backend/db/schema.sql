@@ -35,6 +35,14 @@ CREATE TABLE IF NOT EXISTS events (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS event_chain (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL UNIQUE REFERENCES events(id),
+    row_hash TEXT NOT NULL,
+    prev_hash TEXT NOT NULL,
+    sealed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Alerts generated from events
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,8 +113,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     mcp_connects INTEGER DEFAULT 0,
     alert_count INTEGER DEFAULT 0,
     anomaly_score REAL DEFAULT 0,
-    summary TEXT                  -- plain-English digest, set when the
+    summary TEXT,                 -- plain-English digest, set when the
                                    -- session closes (core/digest.py)
+    operator_username TEXT,       -- OS user this session ran under (core/identity.py)
+    operator_hostname TEXT        -- machine hostname this session ran on
 );
 
 -- User-defined suppressions for recurring false positives, e.g. a specific

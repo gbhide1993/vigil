@@ -83,6 +83,29 @@ async def export_pdf(date: str = Query(default="today")):
     c.drawString(inch, y, f"Events: {summary['event_count']}  Sessions: {len(summary['sessions'])}  Alerts: {len(summary['alerts'])}")
     y -= 0.4 * inch
 
+    from core.evidence_chain import verify_chain
+    from db.database import get_db as _get_db
+    chain_result = await verify_chain(await _get_db())
+    chain_status = "VERIFIED INTACT" if chain_result["valid"] else f"INTEGRITY FAILURE: {chain_result['reason']}"
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(inch, y, f"Evidence chain: {chain_status} ({chain_result['checked_count']} events checked)")
+    y -= 0.3 * inch
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(inch, y, "Sessions")
+    y -= 0.25 * inch
+    c.setFont("Helvetica", 9)
+    for session in summary["sessions"]:
+        if y < inch:
+            c.showPage()
+            y = height - inch
+            c.setFont("Helvetica", 9)
+        operator = f"{session.get('operator_username') or 'unknown'}@{session.get('operator_hostname') or 'unknown'}"
+        line = f"{session['id'][:8]}  operator={operator}  started={session['started_at']}"
+        c.drawString(inch, y, line[:110])
+        y -= 0.2 * inch
+    y -= 0.2 * inch
+
     c.setFont("Helvetica-Bold", 12)
     c.drawString(inch, y, "Alerts")
     y -= 0.25 * inch
