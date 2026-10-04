@@ -87,7 +87,7 @@ from fastapi import FastAPI, APIRouter, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from api import agents, alerts, analytics_api, config_api, digest_api, events, evidence, export, git_routes, mcp_routes, platform_routes, sessions
+from api import agents, alerts, analytics_api, chain_routes, config_api, digest_api, events, evidence, export, git_routes, mcp_routes, platform_routes, sessions
 from config.policy import load_policy
 from core.aggregator import Aggregator
 from core.attributor import Attributor
@@ -400,6 +400,10 @@ async def lifespan(app: FastAPI):
     # independent of any single file event's own pid-guess attribution.
     scheduler.add_job(file_handler.check_burst, "interval", seconds=30, id="file_burst_check", max_instances=1, coalesce=True)
     scheduler.add_job(_baseline_tick, "interval", hours=1, id="baseline_update", args=[baseline], max_instances=1, coalesce=True)
+    scheduler.add_job(
+        _seal_evidence_chain, "interval", seconds=15, id="evidence_chain_seal",
+        max_instances=1, coalesce=True,
+    )
     # SessionManager.close_idle_sessions disabled pending event-loop audit.
     # scheduler.add_job(
     #     attributor.sessions.close_idle_sessions,
@@ -442,6 +446,12 @@ async def _baseline_tick(baseline: Baseline) -> None:
         await baseline.update_from_session(row["id"])
 
 
+async def _seal_evidence_chain() -> None:
+    from core.evidence_chain import seal_new_events
+    db = await get_db()
+    await seal_new_events(db)
+
+
 app = FastAPI(title="V-LAW", version=VERSION, lifespan=lifespan)
 
 # Unprefixed registration exists only for dev mode: the frontend always
@@ -466,6 +476,7 @@ if not getattr(sys, "frozen", False):
     app.include_router(config_api.router)
     app.include_router(analytics_api.router)
     app.include_router(evidence.router)
+    app.include_router(chain_routes.router)
 
 # mcp_routes/platform_routes/git_routes have no /api-prefixed twin at all
 # (see below) -- the VS Code extension calls these directly, unprefixed,
@@ -488,6 +499,7 @@ app.include_router(sessions.router, prefix="/api")
 app.include_router(config_api.router, prefix="/api")
 app.include_router(analytics_api.router, prefix="/api")
 app.include_router(evidence.router, prefix="/api")
+app.include_router(chain_routes.router, prefix="/api")
 
 
 @app.get("/stats")

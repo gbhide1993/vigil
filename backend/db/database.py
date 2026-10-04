@@ -103,6 +103,15 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         await db.execute("ALTER TABLE events ADD COLUMN event_source TEXT DEFAULT NULL")
         await db.commit()
 
+    cur = await db.execute("PRAGMA table_info(sessions)")
+    columns = {row["name"] for row in await cur.fetchall()}
+    if "operator_username" not in columns:
+        await db.execute("ALTER TABLE sessions ADD COLUMN operator_username TEXT")
+        await db.commit()
+    if "operator_hostname" not in columns:
+        await db.execute("ALTER TABLE sessions ADD COLUMN operator_hostname TEXT")
+        await db.commit()
+
 
 async def _seed_policy(db: aiosqlite.Connection) -> None:
     if not POLICY_FILE.exists():

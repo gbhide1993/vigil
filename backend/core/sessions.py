@@ -38,9 +38,12 @@ class SessionManager:
             return active["session_id"]
 
         session_id = str(uuid.uuid4())
+        from core.identity import get_operator_identity
+        operator_username, operator_hostname = get_operator_identity()
         await db.execute(
-            "INSERT INTO sessions (id, agent_id, started_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-            (session_id, agent_id),
+            "INSERT INTO sessions (id, agent_id, started_at, operator_username, operator_hostname) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?)",
+            (session_id, agent_id, operator_username, operator_hostname),
         )
         await db.execute(
             "UPDATE agents SET session_count = session_count + 1 WHERE id = ?",
