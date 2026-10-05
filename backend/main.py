@@ -83,9 +83,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from api import agents, alerts, analytics_api, chain_routes, config_api, digest_api, events, evidence, export, git_routes, mcp_routes, platform_routes, sessions
 from config.policy import load_policy
@@ -455,6 +455,61 @@ async def _seal_evidence_chain() -> None:
 
 
 app = FastAPI(title="V-LAW", version=VERSION, lifespan=lifespan)
+
+# Allowed browser Origins for state-changing requests. http://localhost:7422
+# and http://127.0.0.1:7422 are the web UI served by this backend itself;
+# http://localhost:5173 is the Vite dev server. No vscode-webview:// entry
+# is needed: vigil-vscode has no webview, every backend call it makes runs
+# in the extension host (a Node process), which sends no Origin header at
+# all, same as the tray and the Claude Code MCP plugin.
+_ALLOWED_ORIGINS = {
+    "http://localhost:7422",
+    "http://127.0.0.1:7422",
+    "http://localhost:5173",
+}
+_STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _host_header_hostname(host_header: str) -> str:
+    """Strips the port (and, for an IPv6 literal, the brackets) off a Host
+    header value, so "127.0.0.1:7422", "[::1]:7422", and "localhost" all
+    compare correctly against the allowed hostnames below."""
+    host = host_header.strip()
+    if host.startswith("["):
+        return host[1:host.index("]")] if "]" in host else host
+    return host.split(":")[0]
+
+
+@app.middleware("http")
+async def _localhost_origin_guard(request: Request, call_next):
+    """Defense in depth even though the server only binds 127.0.0.1 (see
+    VLAW_HOST above): any web page open in the developer's browser can
+    still send a body-less POST to http://localhost:7422/api/... with no
+    CORS preflight, since a simple POST is never preflighted -- that would
+    let a hostile page dismiss alerts or block/approve an agent on an
+    evidence product with zero interaction from the user. Two checks:
+
+    1. Host header must resolve to localhost/127.0.0.1/::1 -- blocks DNS
+       rebinding (a page on attacker.example pointing attacker.example's
+       own DNS record at 127.0.0.1, which a bind-address check alone can't
+       catch, since the request still arrives on the loopback interface).
+    2. For state-changing methods, an Origin header, if present, must be
+       in the allowlist. Real clients (the tray, the VS Code extension
+       host, the Claude Code MCP plugin) are Node/Python processes and
+       send no Origin at all, so an absent Origin is allowed; a browser
+       always sends one on a cross-origin request, so a present-but-
+       disallowed Origin is rejected."""
+    hostname = _host_header_hostname(request.headers.get("host", ""))
+    if hostname not in ("localhost", "127.0.0.1", "::1"):
+        return JSONResponse(status_code=403, content={"detail": "forbidden host"})
+
+    if request.method in _STATE_CHANGING_METHODS:
+        origin = request.headers.get("origin")
+        if origin is not None and origin not in _ALLOWED_ORIGINS:
+            return JSONResponse(status_code=403, content={"detail": "forbidden origin"})
+
+    return await call_next(request)
+
 
 # Unprefixed registration exists only for dev mode: the frontend always
 # calls /api/* (see frontend/src/api.js's BASE), but when it's run via

@@ -586,7 +586,10 @@ def test_unprefixed_routers_gated_by_frozen_flag(monkeypatch, tmp_path):
 
     try:
         not_frozen = reload_as(frozen=False)
-        client = TestClient(not_frozen.app)
+        # base_url="http://localhost" (not TestClient's "http://testserver"
+        # default) so the Host header this client sends passes main.py's
+        # localhost/origin guard middleware, same as any real request would.
+        client = TestClient(not_frozen.app, base_url="http://localhost")
         for path in ("/alerts", "/agents", "/incidents"):
             resp = client.get(path)
             assert resp.headers["content-type"].startswith("application/json"), (
@@ -595,7 +598,7 @@ def test_unprefixed_routers_gated_by_frozen_flag(monkeypatch, tmp_path):
             )
 
         frozen = reload_as(frozen=True)
-        client = TestClient(frozen.app)
+        client = TestClient(frozen.app, base_url="http://localhost")
         for path in ("/alerts", "/agents", "/incidents"):
             resp = client.get(path)
             assert resp.status_code == 200
