@@ -692,7 +692,16 @@ else:
 if __name__ == "__main__":
     import uvicorn
 
+    # The API has no auth and includes mutating routes (approve/block an
+    # agent, resolve/dismiss an alert), so it must not be reachable from
+    # the LAN. 127.0.0.1 is the correct default for every real client:
+    # the tray, the VS Code extension, and the Claude Code MCP plugin all
+    # already target 127.0.0.1/localhost explicitly (checked before this
+    # change). VLAW_HOST is an escape hatch for a deployment that needs a
+    # different interface, not something to be set by default.
+    HOST = os.environ.get("VLAW_HOST", "127.0.0.1")
+
     # Pass the app object directly rather than the "main:app" string form:
     # the string form makes uvicorn re-import "main" by module name, which
     # doesn't resolve inside a frozen PyInstaller executable.
-    uvicorn.run(app, host="0.0.0.0", port=PORT, reload=False)
+    uvicorn.run(app, host=HOST, port=PORT, reload=False)
