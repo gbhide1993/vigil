@@ -151,32 +151,40 @@ export default function Alerts({ onNavigate }) {
   const [agentFilter, setAgentFilter] = useState('')
   const [agents, setAgents] = useState([])
   const [bulkBusy, setBulkBusy] = useState(false)
-
-  async function load() {
-    try {
-      const params = { limit: ALERTS_PAGE_SIZE, offset: page * ALERTS_PAGE_SIZE }
-      if (statusFilter) params.status = statusFilter
-      if (severityFilter) params.severity = severityFilter
-      if (agentFilter) params.agent = agentFilter
-      const data = await api.getAlerts(params)
-      setAlerts(data.alerts)
-      setTotal(data.total)
-      setHasMore(data.has_more)
-    } catch {
-      // ignore poll failures
-    }
-  }
+  const [reloadTick, setReloadTick] = useState(0)
 
   // Each filter's own onChange resets page to 0 (see the <select>s below)
   // rather than this effect deriving the reset from a filter change, so a
   // filter change and the page reset land in the same render instead of
   // this load firing once with the old page and once more right after.
+  // reloadTick lets handleResolve/handleBulkDismissLow trigger a refresh
+  // through this same effect, so their requests get the same `cancelled`
+  // guard as the poll and filter-change ones instead of racing them.
   useEffect(() => {
+    let cancelled = false
+    async function load() {
+      try {
+        const params = { limit: ALERTS_PAGE_SIZE, offset: page * ALERTS_PAGE_SIZE }
+        if (statusFilter) params.status = statusFilter
+        if (severityFilter) params.severity = severityFilter
+        if (agentFilter) params.agent = agentFilter
+        const data = await api.getAlerts(params)
+        if (cancelled) return
+        setAlerts(data.alerts)
+        setTotal(data.total)
+        setHasMore(data.has_more)
+      } catch {
+        // ignore poll failures
+      }
+    }
     load()
     const id = setInterval(load, 3000)
-    return () => clearInterval(id)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [statusFilter, severityFilter, agentFilter, page])
+  }, [statusFilter, severityFilter, agentFilter, page, reloadTick])
 
   useEffect(() => {
     let cancelled = false
@@ -196,14 +204,14 @@ export default function Alerts({ onNavigate }) {
 
   async function handleResolve(alertId, action, note) {
     await api.resolveAlert(alertId, { action, note })
-    await load()
+    setReloadTick((t) => t + 1)
   }
 
   async function handleBulkDismissLow() {
     setBulkBusy(true)
     try {
       await api.bulkDismissAlerts('low')
-      await load()
+      setReloadTick((t) => t + 1)
     } finally {
       setBulkBusy(false)
     }

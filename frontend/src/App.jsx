@@ -4,6 +4,7 @@ import Status from './components/Status'
 import Incidents from './components/Incidents'
 import History from './components/History'
 import AgentDetail from './components/AgentDetail'
+import Alerts from './components/Alerts'
 import Settings from './components/Settings'
 import WelcomeScreen from './components/WelcomeScreen'
 import { api } from './api'
@@ -80,6 +81,7 @@ export default function App() {
         {view === 'incidents' && <Incidents onNavigate={setView} />}
         {view === 'history' && <History />}
         {view === 'agents' && <AgentDetail />}
+        {view === 'alerts' && <Alerts onNavigate={setView} />}
         {view === 'settings' && <Settings />}
       </main>
     </div>
