@@ -13,6 +13,7 @@ documented so verify_chain() can recognize and accept it rather than
 treating the first row as a broken link.
 """
 
+import asyncio
 import hashlib
 import logging
 
@@ -30,6 +31,17 @@ GENESIS_HASH = "0" * 64
 # of blocking everything in one long run; the next cycle simply picks up
 # wherever this one left off (ORDER BY id ASC, resumed from MAX(event_id)).
 SEAL_BATCH_LIMIT = 500
+
+# Row-fetch batch size for verify_chain()'s single streamed query -- keeps
+# memory bounded on a large chain without the N+1 the batching replaced.
+VERIFY_BATCH_SIZE = 1000
+
+# Guards verify_chain() so two concurrent callers (e.g. a GET
+# /evidence/chain/verify request arriving while a PDF export is already
+# walking the chain) never run two full walks at once -- each one opens
+# its own connection and can take real time on a large chain, and there
+# is no benefit to doing that work twice in parallel.
+_verify_chain_lock = asyncio.Lock()
 
 
 def _canonical_row_string(event_row: dict) -> str:
@@ -137,7 +149,7 @@ async def get_chain_head(db) -> dict:
     }
 
 
-async def verify_chain(db) -> dict:
+async def verify_chain() -> dict:
     """Re-walks every sealed event in order, recomputing each hash from
     the event row's CURRENT content and comparing it to what was stored
     when it was sealed. A mismatch means that event row was edited after
@@ -146,40 +158,85 @@ async def verify_chain(db) -> dict:
     form an unbroken chain (catches a chain row being deleted or
     reordered). Returns as soon as the first problem is found, plus a
     summary. valid=True with checked_count=0 is the correct result on a
-    fresh install with nothing sealed yet -- not an error."""
-    cur = await db.execute("SELECT * FROM event_chain ORDER BY id ASC")
-    chain_rows = await cur.fetchall()
+    fresh install with nothing sealed yet -- not an error.
 
-    expected_prev = GENESIS_HASH
-    checked = 0
-    for chain_row in chain_rows:
-        chain_row = dict(chain_row)
-        if chain_row["prev_hash"] != expected_prev:
-            return {
-                "valid": False, "checked_count": checked,
-                "reason": "broken_link",
-                "detail": f"event_chain row id={chain_row['id']} (event_id={chain_row['event_id']}) "
-                          f"has prev_hash that doesn't match the previous row's row_hash",
-            }
+    Runs on its own dedicated connection, same reasoning as
+    seal_new_events() above. The original version ran one SELECT per
+    chain row against events (an N+1) on the shared get_db() connection
+    -- measured directly, this got slow enough at ~14.8k events that it
+    blocked every other caller sharing that connection, including plain
+    health checks. Replaced with a single streamed query (a LEFT JOIN of
+    event_chain to events, so a deleted event comes back as a row whose
+    events columns are NULL rather than needing a second query to find
+    out) fetched in VERIFY_BATCH_SIZE batches, with an
+    await asyncio.sleep(0) between batches so other coroutines on the
+    event loop get a turn during a long walk. No cache or incremental
+    mode: a cache of "verified through id N" would stop re-checking
+    already-verified rows, which defeats the entire point of the check --
+    an edit to an old, already-sealed row must still be caught on every
+    call. _verify_chain_lock prevents two callers from running two full
+    walks at once, not from re-verifying what's already been verified."""
+    async with _verify_chain_lock:
+        conn = await aiosqlite.connect(DB_PATH)
+        conn.row_factory = aiosqlite.Row
+        try:
+            cur = await conn.execute(
+                """
+                SELECT c.id AS chain_id, c.event_id AS chain_event_id,
+                       c.row_hash AS chain_row_hash, c.prev_hash AS chain_prev_hash,
+                       e.*
+                FROM event_chain c
+                LEFT JOIN events e ON e.id = c.event_id
+                ORDER BY c.id ASC
+                """
+            )
 
-        cur2 = await db.execute("SELECT * FROM events WHERE id = ?", (chain_row["event_id"],))
-        event_row = await cur2.fetchone()
-        if event_row is None:
-            return {
-                "valid": False, "checked_count": checked,
-                "reason": "event_deleted",
-                "detail": f"event_id={chain_row['event_id']} was sealed but no longer exists in events",
-            }
+            expected_prev = GENESIS_HASH
+            checked = 0
+            while True:
+                batch = await cur.fetchmany(VERIFY_BATCH_SIZE)
+                if not batch:
+                    break
 
-        recomputed = compute_row_hash(dict(event_row), chain_row["prev_hash"])
-        if recomputed != chain_row["row_hash"]:
-            return {
-                "valid": False, "checked_count": checked,
-                "reason": "hash_mismatch",
-                "detail": f"event_id={chain_row['event_id']} was modified after being sealed",
-            }
+                for row in batch:
+                    row_dict = dict(row)
+                    chain_id = row_dict["chain_id"]
+                    chain_event_id = row_dict["chain_event_id"]
+                    chain_row_hash = row_dict["chain_row_hash"]
+                    chain_prev_hash = row_dict["chain_prev_hash"]
 
-        expected_prev = chain_row["row_hash"]
-        checked += 1
+                    if chain_prev_hash != expected_prev:
+                        return {
+                            "valid": False, "checked_count": checked,
+                            "reason": "broken_link",
+                            "detail": f"event_chain row id={chain_id} (event_id={chain_event_id}) "
+                                      f"has prev_hash that doesn't match the previous row's row_hash",
+                        }
 
-    return {"valid": True, "checked_count": checked, "reason": None, "detail": None}
+                    # events.id comes back as "id" from e.* -- NULL here
+                    # means the LEFT JOIN found no matching events row
+                    # (events.id is an INTEGER PRIMARY KEY, so a real row
+                    # can never have id IS NULL).
+                    if row_dict.get("id") is None:
+                        return {
+                            "valid": False, "checked_count": checked,
+                            "reason": "event_deleted",
+                            "detail": f"event_id={chain_event_id} was sealed but no longer exists in events",
+                        }
+
+                    recomputed = compute_row_hash(row_dict, chain_prev_hash)
+                    if recomputed != chain_row_hash:
+                        return {
+                            "valid": False, "checked_count": checked,
+                            "reason": "hash_mismatch",
+                            "detail": f"event_id={chain_event_id} was modified after being sealed",
+                        }
+
+                    expected_prev = chain_row_hash
+                    checked += 1
+
+                await asyncio.sleep(0)
+
+            return {"valid": True, "checked_count": checked, "reason": None, "detail": None}
+        finally:
+            await conn.close()

@@ -84,8 +84,8 @@ async def export_pdf(date: str = Query(default="today")):
     y -= 0.4 * inch
 
     from core.evidence_chain import verify_chain
-    from db.database import get_db as _get_db
-    chain_result = await verify_chain(await _get_db())
+    # verify_chain() opens its own dedicated connection internally.
+    chain_result = await verify_chain()
     chain_status = "VERIFIED INTACT" if chain_result["valid"] else f"INTEGRITY FAILURE: {chain_result['reason']}"
     c.setFont("Helvetica-Bold", 10)
     c.drawString(inch, y, f"Evidence chain: {chain_status} ({chain_result['checked_count']} events checked)")

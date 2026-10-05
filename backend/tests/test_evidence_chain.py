@@ -56,7 +56,7 @@ def _uniq(label: str) -> str:
 
 @pytest.mark.asyncio
 async def test_seal_and_verify_empty(test_db):
-    result = await verify_chain(test_db)
+    result = await verify_chain()
     assert result == {"valid": True, "checked_count": 0, "reason": None, "detail": None}
 
 
@@ -89,7 +89,7 @@ async def test_seal_creates_chain(test_db):
     assert head["unsealed_count"] == 0
     assert head["head_hash"] != GENESIS_HASH
 
-    result = await verify_chain(test_db)
+    result = await verify_chain()
     assert result["valid"] is True
     assert result["checked_count"] == sealed
 
@@ -117,7 +117,7 @@ async def test_verify_detects_tampering(test_db):
     await test_db.commit()
 
     try:
-        result = await verify_chain(test_db)
+        result = await verify_chain()
         assert result["valid"] is False
         assert result["reason"] == "hash_mismatch"
     finally:
@@ -157,7 +157,7 @@ async def test_verify_detects_deletion(test_db):
     await test_db.commit()
 
     try:
-        result = await verify_chain(test_db)
+        result = await verify_chain()
         assert result["valid"] is False
         assert result["reason"] == "event_deleted"
     finally:
@@ -204,7 +204,7 @@ async def test_chain_persists_across_seal_calls(test_db):
     # last row, not restart from GENESIS_HASH.
     assert rows[-2]["prev_hash"] == head_after_first["head_hash"]
 
-    result = await verify_chain(test_db)
+    result = await verify_chain()
     assert result["valid"] is True
     assert result["checked_count"] == head_after_first["sealed_count"] + 2
 

@@ -17,5 +17,6 @@ async def chain_head():
 
 @router.get("/evidence/chain/verify")
 async def chain_verify():
-    db = await get_db()
-    return await verify_chain(db)
+    # verify_chain() opens its own dedicated connection internally (see
+    # core/evidence_chain.py) -- no db handle needed here.
+    return await verify_chain()
