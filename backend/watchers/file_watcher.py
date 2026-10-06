@@ -161,21 +161,34 @@ class _AgentPidCache:
     shutdown (there's nowhere clean to hang that off the watchdog Observer/
     PollingObserver/ETWFileWatcher objects start_file_watcher returns,
     and letting it run for up to one more refresh cycle during shutdown is
-    harmless)."""
+    harmless).
 
-    # This class's own docstring above already documents the cost: a full
-    # refresh (psutil.process_iter() + get_named_agent_for_pid per process)
-    # measured 50-100ms per process, "15-20+ seconds for a full scan" on a
-    # real desktop (~375 processes). At the old 3s interval this thread was
-    # therefore doing another multi-second scan almost as soon as the
-    # previous one finished -- effectively always busy, not periodically
-    # refreshing -- which py-spy confirmed as a sustained-CPU contributor
-    # (thread caught mid-scan on every sample taken). 30s gives the scan
-    # comfortable headroom to actually finish with idle time in between,
-    # cutting this thread's busy fraction roughly in half to two-thirds,
-    # at the cost of the real-time-tier cache being up to 30s (not 3s)
-    # stale in the worst case -- the same order of staleness already
-    # accepted elsewhere (ProcessWatcher's own poll interval is 30s).
+    UPDATE: the 50-100ms/process, 15-20+ second figures below described
+    _refresh() calling get_named_agent_for_pid with no pid_snapshot, which
+    falls back to opening a fresh psutil.Process(pid) handle per
+    parent-chain level for every process on the machine -- confirmed via
+    py-spy as the sustained ~0.96-core/GIL-starvation source, stalling
+    /api/health for 3s and /api/sessions for 16s on first call. _refresh()
+    now builds one pid_snapshot per call and resolves every PID from it
+    (_walk_parent_chain_from_snapshot, zero further psutil calls) -- see
+    its own docstring for current numbers. REFRESH_INTERVAL_SECONDS left
+    at 30 for now; the busy-fraction reasoning below no longer applies at
+    the new per-refresh cost, but changing the interval is a separate
+    decision, not made here."""
+
+    # Historical cost model this interval was originally chosen against
+    # (no longer accurate for _refresh() specifically -- see UPDATE above):
+    # a full refresh (psutil.process_iter() + get_named_agent_for_pid per
+    # process) measured 50-100ms per process, "15-20+ seconds for a full
+    # scan" on a real desktop (~375 processes). At the old 3s interval this
+    # thread was therefore doing another multi-second scan almost as soon
+    # as the previous one finished -- effectively always busy, not
+    # periodically refreshing -- which py-spy confirmed as a sustained-CPU
+    # contributor (thread caught mid-scan on every sample taken). 30s gave
+    # the scan comfortable headroom to actually finish with idle time in
+    # between, at the cost of the real-time-tier cache being up to 30s
+    # (not 3s) stale in the worst case -- the same order of staleness
+    # already accepted elsewhere (ProcessWatcher's own poll interval is 30s).
     REFRESH_INTERVAL_SECONDS = 30
 
     def __init__(self, attributor: Attributor):
@@ -197,17 +210,38 @@ class _AgentPidCache:
             self._refresh()
 
     def _refresh(self) -> None:
+        """Builds one {pid: {"name", "ppid"}} snapshot from a single
+        psutil.process_iter() pass, then resolves every PID's attribution
+        from that in-memory dict via Attributor._walk_parent_chain_from_snapshot
+        (zero further psutil calls) -- same pattern ProcessWatcher already
+        uses for _gather_spawn_info's get_agent_for_pid calls. Previously
+        this called get_named_agent_for_pid with no pid_snapshot, which falls
+        back to _walk_parent_chain's per-level psutil.Process(pid).parent()
+        path: one fresh OS process handle open per parent-chain level, for
+        every process on the machine, every refresh. py-spy confirmed this
+        thread as the sustained-CPU/GIL-starvation source (see
+        get_agent_for_pid's docstring for why the snapshot path exists)."""
         try:
+            pid_snapshot: dict[int, dict] = {}
+            for proc in psutil.process_iter(["pid", "name", "ppid"]):
+                pid = proc.info.get("pid")
+                if pid is None:
+                    continue
+                pid_snapshot[pid] = {
+                    "name": proc.info.get("name") or "",
+                    "ppid": proc.info.get("ppid") or 0,
+                }
+
             fresh = {}
-            for proc in psutil.process_iter(["pid", "name"]):
+            for pid in pid_snapshot:
                 # get_named_agent_for_pid, not get_agent_for_pid: this loop
                 # runs against every process on the machine, and
                 # get_agent_for_pid's behavioural fallback (a synchronous DB
                 # round trip) would run for every one of them that isn't a
                 # name-matched known agent -- see its docstring.
-                agent = self.attributor.get_named_agent_for_pid(proc.info["pid"])
+                agent = self.attributor.get_named_agent_for_pid(pid, pid_snapshot=pid_snapshot)
                 if agent:
-                    fresh[proc.info["pid"]] = agent
+                    fresh[pid] = agent
             self._map = fresh
         except Exception:
             logger.exception("agent pid cache refresh failed, keeping previous snapshot")
