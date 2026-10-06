@@ -31,6 +31,8 @@ app.on('second-instance', () => {
 
 const BACKEND_URL = 'http://localhost:7422'
 const WEB_UI_URL = 'http://localhost:7422'
+const BACKEND_PORT = 7422
+const BACKEND_PROCESS_NAME = 'vigil-backend'
 const POLL_INTERVAL_MS = 4000
 const TOOLTIP_POLL_INTERVAL_MS = 60000
 
@@ -107,18 +109,86 @@ function spawnBackend() {
   })
 }
 
-function killBackendProcess() {
-  if (!backendProcess) return
-  const pid = backendProcess.pid
-  // Plain ChildProcess.kill() is unreliable against the packaged
-  // console-mode PyInstaller exe on Windows — it can leave the process
-  // running. taskkill /F /T forcibly kills it and its child tree.
-  if (process.platform === 'win32' && pid) {
-    execFile('taskkill', ['/pid', String(pid), '/T', '/F'], () => {})
-  } else {
-    backendProcess.kill()
+function execFileAsync(file, args) {
+  return new Promise((resolve) => {
+    execFile(file, args, { windowsHide: true }, (err, stdout) => {
+      resolve({ err, stdout: stdout || '' })
+    })
+  })
+}
+
+async function isPortListening(port) {
+  const { err, stdout } = await execFileAsync('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-Command',
+    `[bool](Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue)`,
+  ])
+  return !err && stdout.trim().toLowerCase() === 'true'
+}
+
+// Resolves whoever currently owns the port and kills it ONLY if its
+// process name matches ours. This is the fallback path, used when the PID
+// the tray itself tracked is gone or was never set -- it must never kill
+// by name alone (an unrelated process could share that name), so it always
+// checks the actual port owner first and matches the name on that specific
+// PID before touching it.
+async function killPortOwnerIfOurs(port, expectedProcessName) {
+  const script =
+    `$c = Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; ` +
+    `if (-not $c) { Write-Output 'NOPORT'; exit }; ` +
+    `$p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; ` +
+    `if (-not $p) { Write-Output 'NOPROC'; exit }; ` +
+    `if ($p.ProcessName -eq '${expectedProcessName}') { Stop-Process -Id $p.Id -Force; Write-Output "KILLED:$($p.Id)" } ` +
+    `else { Write-Output "SKIP:$($p.Id):$($p.ProcessName)" }`
+  const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script])
+  return stdout.trim()
+}
+
+async function waitUntilPortFree(port, timeoutMs) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (!(await isPortListening(port))) return true
+    await new Promise((r) => setTimeout(r, 300))
   }
-  backendProcess = null
+  return !(await isPortListening(port))
+}
+
+const QUIT_KILL_TIMEOUT_MS = 5000
+
+// Kills the backend and WAITS for it to actually be gone before resolving.
+// Plain ChildProcess.kill() is unreliable against the packaged console-mode
+// PyInstaller exe on Windows -- it can leave the process running, which is
+// why this already used taskkill /T /F. The bug was that the previous
+// version fired taskkill with an empty callback and returned immediately,
+// so nothing here, or in the before-quit handler that called it, ever
+// waited for the kill to finish -- Electron's own quit sequence could (and
+// did) tear down the whole app process before taskkill had actually killed
+// the tree, or before it had even been spawned.
+//
+// taskkill /T matches a child by its process's recorded parent PID, which
+// breaks if the PyInstaller bootloader we spawned has already exited and
+// the inner process that owns the actual listener got orphaned before
+// taskkill ran, or if backendProcess was never set (e.g. we adopted an
+// already-running backend at startup rather than spawning it ourselves).
+// The port-owner fallback below covers that case independently of whether
+// the primary tree-kill found anything.
+async function killBackendAndWait() {
+  if (backendProcess && backendProcess.pid) {
+    const pid = backendProcess.pid
+    console.log(`Killing backend process tree (PID ${pid})...`)
+    await execFileAsync('taskkill', ['/pid', String(pid), '/T', '/F'])
+    backendProcess = null
+  }
+
+  if (await isPortListening(BACKEND_PORT)) {
+    const result = await killPortOwnerIfOurs(BACKEND_PORT, BACKEND_PROCESS_NAME)
+    console.log(`Port-owner fallback kill on port ${BACKEND_PORT}: ${result}`)
+  }
+
+  const exited = await waitUntilPortFree(BACKEND_PORT, QUIT_KILL_TIMEOUT_MS)
+  if (!exited) {
+    console.error(`Backend still listening on port ${BACKEND_PORT} after ${QUIT_KILL_TIMEOUT_MS}ms, proceeding anyway`)
+  }
+  return exited
 }
 
 function handleBackendCrash() {
@@ -628,8 +698,7 @@ function createTray() {
       { type: 'separator' },
       {
         label: 'Restart Backend',
-        click: () => {
-          killBackendProcess()
+        click: async () => {
           if (pollTimer) clearInterval(pollTimer)
           if (tooltipPollTimer) clearInterval(tooltipPollTimer)
           if (backendStableTimer) {
@@ -640,10 +709,9 @@ function createTray() {
           backendFailCount = 0
           setTrayWarning()
           tray.setToolTip('Vigil — Restarting backend...')
-          setTimeout(() => {
-            spawnBackend()
-            waitForBackend()
-          }, 1000)
+          await killBackendAndWait()
+          spawnBackend()
+          waitForBackend()
         },
       },
       { type: 'separator' },
@@ -694,7 +762,16 @@ ipcMain.on('hide-flyout', () => {
   if (flyout && !flyout.isDestroyed()) flyout.hide()
 })
 
-app.whenReady().then(() => {
+async function isBackendAlreadyHealthy() {
+  try {
+    const res = await fetch(`${BACKEND_URL}/health`, { signal: AbortSignal.timeout(1000) })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+app.whenReady().then(async () => {
   app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true })
   if (app.dock) app.dock.hide()
 
@@ -705,8 +782,17 @@ app.whenReady().then(() => {
   setTrayWarning()
   tray.setToolTip('Vigil — Starting...')
 
-  // Spawn backend, then wait for health, then start polling
-  spawnBackend()
+  // A previous tray crash (or a Stop-Process on the tray exe) can leave a
+  // perfectly healthy backend running with no tray left to own it. Without
+  // this check, startup would spawn a second backend that fails to bind
+  // the already-taken port and shows "Backend offline" next to a working
+  // one. backendProcess stays null here (same as dev mode) since this
+  // tray instance didn't start it -- quit will not try to kill it.
+  if (await isBackendAlreadyHealthy()) {
+    console.log('Healthy backend already on port 7422, not spawned by this tray -- adopting it')
+  } else {
+    spawnBackend()
+  }
   waitForBackend() // starts pollAlerts() internally once healthy
 
   cron.schedule('0 9 * * *', () => {
@@ -719,11 +805,30 @@ app.on('window-all-closed', (e) => {
   e.preventDefault()
 })
 
-app.on('before-quit', () => {
+let quitInProgress = false
+
+// before-quit only REQUESTS a shutdown -- if the handler returns without
+// calling event.preventDefault(), Electron carries on with its own quit
+// sequence and tears down the process regardless of whether any async
+// work started in this handler (like killBackendAndWait()'s taskkill and
+// port-owner checks) has actually finished. That race was the root cause
+// of the orphaned vigil-backend processes: the handler fired taskkill and
+// returned immediately, so the app could (and did) exit before the kill
+// completed, or in the worst case before it had even been spawned.
+//
+// The fix is the standard Electron pattern for this: block the quit with
+// preventDefault(), do the async cleanup, then call app.exit() -- a hard,
+// immediate exit that does not re-emit before-quit -- once cleanup is
+// done or the timeout in killBackendAndWait() gives up.
+app.on('before-quit', (e) => {
+  if (quitInProgress) return
+  quitInProgress = true
+  e.preventDefault()
+
   if (pollTimer) clearInterval(pollTimer)
   if (tooltipPollTimer) clearInterval(tooltipPollTimer)
-  if (backendProcess) {
-    console.log('Killing backend process before quit...')
-    killBackendProcess()
-  }
+
+  killBackendAndWait().finally(() => {
+    app.exit(0)
+  })
 })

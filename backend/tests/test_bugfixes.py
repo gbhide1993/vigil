@@ -111,8 +111,12 @@ async def test_network_destination_host_matching(test_db):
 # ---------------------------------------------------------- 2. time anomaly
 
 @pytest.mark.asyncio
-async def test_time_anomaly_boundary(test_db):
+async def test_time_anomaly_boundary(test_db, monkeypatch):
     layer2a._alerter._last_fired.clear()
+    # Pin the local timezone to UTC so this test exercises only the hour
+    # boundary logic, independent of whatever timezone the machine running
+    # it is in.
+    monkeypatch.setattr(layer2a, "_local_tz", lambda: timezone.utc)
 
     agent_name = _uniq("claude_code_timetest")
     agent_id = await _make_agent(test_db, agent_name)
@@ -130,6 +134,47 @@ async def test_time_anomaly_boundary(test_db):
     assert no_fire == [], "21:59 (still inside normal hours) should not fire"
 
 
+@pytest.mark.asyncio
+async def test_time_anomaly_respects_local_timezone(test_db, monkeypatch):
+    """The actual bug: a session at 05:34 UTC is 11:04 AM in Pune
+    (UTC+5:30), a normal working hour, and must not fire. A session at
+    22:00 UTC is 03:30 AM in Pune, outside normal hours, and must fire
+    with the local time in its title. A UTC-pinned run must behave exactly
+    as before (unchanged at this specific boundary)."""
+    layer2a._alerter._last_fired.clear()
+    kolkata = timezone(timedelta(hours=5, minutes=30))
+
+    agent_name = _uniq("claude_code_tztest")
+    agent_id = await _make_agent(test_db, agent_name)
+    prior = get_prior(agent_name)
+    assert prior["normal_hours"] == [6, 22]
+
+    monkeypatch.setattr(layer2a, "_local_tz", lambda: kolkata)
+
+    no_fire = await check_time_anomaly(
+        _uniq("sess"), agent_id, agent_name, "2026-01-01 05:34:00", prior, test_db,
+    )
+    assert no_fire == [], "05:34 UTC is 11:04 AM in Asia/Kolkata, inside normal hours"
+
+    fires = await check_time_anomaly(
+        _uniq("sess"), agent_id, agent_name, "2026-01-01 22:00:00", prior, test_db,
+    )
+    assert len(fires) == 1, "22:00 UTC is 03:30 AM in Asia/Kolkata, outside normal hours"
+
+    alert = await test_db.execute(
+        "SELECT title FROM alerts WHERE id = ?", (fires[0],)
+    )
+    title = (await alert.fetchone())["title"]
+    assert "3:30 AM" in title, f"expected local time 3:30 AM in title, got: {title!r}"
+
+    monkeypatch.setattr(layer2a, "_local_tz", lambda: timezone.utc)
+
+    fires_utc = await check_time_anomaly(
+        _uniq("sess"), agent_id, agent_name, "2026-01-01 22:30:00", prior, test_db,
+    )
+    assert len(fires_utc) == 1, "with tz pinned to UTC, 22:30 behaves exactly as before"
+
+
 # --------------------------------------------------------- 3. session close
 
 class _NoopBaseline:
@@ -138,8 +183,9 @@ class _NoopBaseline:
 
 
 @pytest.mark.asyncio
-async def test_close_idle_sessions_alert_count_and_summary(test_db):
+async def test_close_idle_sessions_alert_count_and_summary(test_db, monkeypatch):
     layer2a._alerter._last_fired.clear()
+    monkeypatch.setattr(layer2a, "_local_tz", lambda: timezone.utc)
 
     agent_name = _uniq("claude_code_closetest")
     agent_id = await _make_agent(test_db, agent_name)
@@ -275,8 +321,9 @@ async def test_recover_orphaned_sessions_bad_row_does_not_abort(test_db, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_recover_orphaned_sessions_scores(test_db):
+async def test_recover_orphaned_sessions_scores(test_db, monkeypatch):
     layer2a._alerter._last_fired.clear()
+    monkeypatch.setattr(layer2a, "_local_tz", lambda: timezone.utc)
 
     agent_name = _uniq("claude_code_recoverscoretest")
     agent_id = await _make_agent(test_db, agent_name)
@@ -448,6 +495,22 @@ def test_export_invalid_date_returns_400():
 
     resp = client.get("/export/json", params={"date": "garbage"})
     assert resp.status_code == 400
+
+
+def test_export_format_local_converts_utc_to_local_with_offset():
+    """The PDF 'Generated:' header and session start times used to print
+    the raw UTC isoformat string (e.g. 2026-10-06T07:04:20.950145+00:00).
+    _format_local must convert to local time and label it, for both a
+    naive-UTC DB timestamp and an isoformat string with an explicit
+    offset (generated_at)."""
+    from api.export import _format_local
+
+    naive_result = _format_local("2026-01-01 22:30:00")
+    assert "2026" in naive_result and ":" in naive_result
+    assert naive_result != "2026-01-01 22:30:00"  # actually converted, not passed through
+
+    offset_result = _format_local("2026-01-01T22:30:00.123456+00:00")
+    assert "2026" in offset_result
 
 
 # ------------------------------------------ 8. writer wedge-replace failure

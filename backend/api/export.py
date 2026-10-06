@@ -9,6 +9,16 @@ from db.database import get_db
 router = APIRouter()
 
 
+def _format_local(ts: str) -> str:
+    """Parse a stored UTC timestamp (naive 'YYYY-MM-DD HH:MM:SS' or an
+    isoformat string with an explicit offset) and format it in the
+    system's local timezone, labelled with the local zone name/offset."""
+    dt = datetime.fromisoformat(ts.replace(" ", "T"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
 def _date_bounds(date: str) -> tuple[str, str]:
     if date == "today":
         day = datetime.now(timezone.utc).date()
@@ -78,7 +88,7 @@ async def export_pdf(date: str = Query(default="today")):
     y -= 0.3 * inch
 
     c.setFont("Helvetica", 10)
-    c.drawString(inch, y, f"Date: {summary['date']}  Generated: {summary['generated_at']}")
+    c.drawString(inch, y, f"Date: {summary['date']}  Generated: {_format_local(summary['generated_at'])}")
     y -= 0.3 * inch
     c.drawString(inch, y, f"Events: {summary['event_count']}  Sessions: {len(summary['sessions'])}  Alerts: {len(summary['alerts'])}")
     y -= 0.4 * inch
@@ -101,7 +111,7 @@ async def export_pdf(date: str = Query(default="today")):
             y = height - inch
             c.setFont("Helvetica", 9)
         operator = f"{session.get('operator_username') or 'unknown'}@{session.get('operator_hostname') or 'unknown'}"
-        line = f"{session['id'][:8]}  operator={operator}  started={session['started_at']}"
+        line = f"{session['id'][:8]}  operator={operator}  started={_format_local(session['started_at'])}"
         c.drawString(inch, y, line[:110])
         y -= 0.2 * inch
     y -= 0.2 * inch

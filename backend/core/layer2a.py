@@ -27,6 +27,14 @@ def _parse_ts(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace(" ", "T")).replace(tzinfo=timezone.utc)
 
 
+def _local_tz():
+    """The system's local timezone. A separate function, rather than
+    inlining datetime.now().astimezone().tzinfo at the call site, so tests
+    can monkeypatch it to a fixed zone and get deterministic results
+    regardless of which machine or CI runner they execute on."""
+    return datetime.now().astimezone().tzinfo
+
+
 async def check_hard_thresholds(session_id: str, agent_id: int, agent_name: str, prior: dict, db) -> list[int]:
     cur = await db.execute(
         "SELECT COUNT(*) c FROM events WHERE session_id = ? AND event_type IN ('file_read', 'file_write')",
@@ -84,7 +92,14 @@ async def check_hard_thresholds(session_id: str, agent_id: int, agent_name: str,
 
 
 async def check_time_anomaly(session_id: str, agent_id: int, agent_name: str, session_start: str, prior: dict, db) -> list[int]:
-    start_dt = _parse_ts(session_start)
+    # session_start is stored in UTC. normal_hours is a local-time policy
+    # (people have working hours in their own timezone, not UTC), so the
+    # hour and the printed time label must both be converted to local time
+    # before comparing or displaying -- comparing a UTC hour against
+    # normal_hours flagged a normal 11:04 AM local session (05:34 UTC, in
+    # Pune at UTC+5:30) as outside normal hours.
+    start_utc = _parse_ts(session_start)
+    start_dt = start_utc.astimezone(_local_tz())
     hour = start_dt.hour
     normal_start, normal_end = prior["normal_hours"]
 
@@ -110,7 +125,7 @@ async def check_time_anomaly(session_id: str, agent_id: int, agent_name: str, se
 
     if last_row is not None:
         last_activity = _parse_ts(last_row["ended_at"])
-        gap_hours = (start_dt - last_activity).total_seconds() / 3600
+        gap_hours = (start_utc - last_activity).total_seconds() / 3600
         if gap_hours > 4:
             severity = "critical"
             title = f"{agent_name} active at {time_label} with no user activity for {round(gap_hours)} hours"
