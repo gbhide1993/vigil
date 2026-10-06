@@ -396,24 +396,31 @@ function formatMB(bytes) {
 async function updateTrayTooltip() {
   if (!backendReady || !tray) return
   try {
-    // Neither endpoint supports a server-side `limit` — /sessions is already
-    // ordered newest-first, so slicing client-side after the fetch gives the
-    // same "most recent" result the spec asks for.
-    const [sessionsRes, openAlertsRes] = await Promise.all([
+    // /sessions doesn't support a server-side `limit` -- it's already
+    // ordered newest-first, so slicing client-side after the fetch gives
+    // the same "most recent" result the spec asks for. The alert count
+    // comes from /api/stats's needs_review field (open, severity high or
+    // critical) -- the same definition the Status page and the Incidents
+    // sidebar badge use. This used to fetch /api/alerts?status=open&limit=1
+    // and show that result's own length, which is capped at 1 by the
+    // request itself -- the tooltip could only ever say "1 alert", never
+    // the real count, and it counted every open severity, not just the
+    // ones that actually need review.
+    const [sessionsRes, statsRes] = await Promise.all([
       httpRequest('GET', '/api/sessions?limit=1'),
-      httpRequest('GET', '/api/alerts?status=open&limit=1'),
+      httpRequest('GET', '/api/stats'),
     ])
 
     const sessions = ((sessionsRes.body && sessionsRes.body.sessions) || []).slice(0, 1)
-    const openAlerts = (openAlertsRes.body && openAlertsRes.body.alerts) || []
+    const needsReview = (statsRes.body && statsRes.body.needs_review) || 0
 
     if (sessions.length === 0) {
       tray.setToolTip('Vigil — Watching. No sessions recorded yet.')
       return
     }
 
-    if (openAlerts.length > 0) {
-      tray.setToolTip(`Vigil — ${openAlerts.length} alert${openAlerts.length !== 1 ? 's' : ''} need review.`)
+    if (needsReview > 0) {
+      tray.setToolTip(`Vigil — ${needsReview} alert${needsReview !== 1 ? 's' : ''} need${needsReview !== 1 ? '' : 's'} review.`)
       return
     }
 

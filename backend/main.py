@@ -658,6 +658,16 @@ async def get_stats():
         cur = await db.execute("SELECT COUNT(*) c FROM alerts WHERE status = 'open'")
         alerts_open = (await cur.fetchone())["c"]
 
+        # Single definition of "needs review", used everywhere a review
+        # count is shown (tray tooltip, Status page, Incidents sidebar
+        # badge): open alerts at severity high or critical. Pending-agent
+        # approval is a separate concept (see api/agents.py) and is never
+        # folded into this number.
+        cur = await db.execute(
+            "SELECT COUNT(*) c FROM alerts WHERE status = 'open' AND severity IN ('high', 'critical')"
+        )
+        needs_review = (await cur.fetchone())["c"]
+
         # checkpoint_activity (RL3's normal-/rewind tier — see core/red_lines.py)
         # is expected, frequent, benign background noise, not a "meaningful
         # alert" in Sprint A's sense — excluded from the noise-reduction
@@ -708,6 +718,7 @@ async def get_stats():
         "events_yesterday": events_yesterday,
         "alerts_open": alerts_open,
         "alerts_open_yesterday": alerts_open_yesterday,
+        "needs_review": needs_review,
         "net_egress_mb_today": round(net_bytes_today / (1024 * 1024), 3),
         "net_egress_mb_yesterday": round(net_bytes_yesterday / (1024 * 1024), 3),
         "cred_accesses_today": cred_accesses_today,

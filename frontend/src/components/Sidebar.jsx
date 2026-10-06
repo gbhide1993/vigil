@@ -7,6 +7,7 @@ const NAV_ITEMS = [
   { key: 'incidents', label: 'Incidents' },
   { key: 'alerts', label: 'Alerts' },
   { key: 'history', label: 'History' },
+  { key: 'export', label: 'Export' },
   { key: 'settings', label: 'Settings' },
 ]
 
@@ -16,7 +17,7 @@ function statusDotColor(agent) {
   return 'green'
 }
 
-export default function Sidebar({ view, onNavigate, openAlertCount }) {
+export default function Sidebar({ view, onNavigate, needsReviewCount }) {
   const [agents, setAgents] = useState([])
 
   useEffect(() => {
@@ -61,11 +62,11 @@ export default function Sidebar({ view, onNavigate, openAlertCount }) {
             <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               {item.key === 'agents' && pendingCount > 0 && <span className="status-dot amber" />}
               {item.key === 'agents' && pendingCount > 0
-                ? `${item.label} (${pendingCount} pending)`
+                ? `${item.label} (${pendingCount} awaiting approval)`
                 : item.label}
             </span>
-            {item.key === 'incidents' && openAlertCount > 0 && (
-              <span className="sidebar-badge">{openAlertCount}</span>
+            {item.key === 'incidents' && needsReviewCount > 0 && (
+              <span className="sidebar-badge">{needsReviewCount}</span>
             )}
           </button>
         ))}

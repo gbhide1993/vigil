@@ -101,16 +101,41 @@ class Alerter:
             return None
         self._last_fired[dedup_key] = now
 
+        # Persisted guard, independent of the in-memory check above: that
+        # dict resets on every restart, which is exactly how two identical
+        # time_anomaly alerts for the same session ended up open at once
+        # (a restart between a session being scored once and being scored
+        # again forgets the first firing ever happened). Unlike the
+        # in-memory window, this has no expiry -- as long as the earlier
+        # alert for the same agent + reason + session + target is still
+        # open, a new one is suppressed instead of piling up next to it.
+        # Resolving or dismissing the existing alert clears the guard.
+        #
+        # Scoped to session_id is not None, and never for rule_type ==
+        # "red_line": event-based alerts (including every red_line alert)
+        # have no session_id, so COALESCE-ing a NULL session_id to '' would
+        # match it against every other session-less alert for the same
+        # agent/reason/target. red_line alerts specifically cannot be
+        # resolved from the UI (see resolve_alert's 403), so they never
+        # leave "open" -- the first one would silently suppress every real
+        # repeat violation forever, which is exactly the evidence this
+        # system exists to keep. Only the session-level detectors that
+        # caused the actual reported duplicate (Layer 2a/2b, scored once
+        # per session close, always with a session_id) are guarded here.
+        if session_id is not None and rule_type != "red_line":
+            if await self._has_open_duplicate(db, agent_id, reason, session_id, target):
+                return None
+
         if await self._is_suppressed(db, agent_id, rule_type, reason, target):
             await self._increment_stat(db, "suppressed_alerts")
             return None
 
         cur = await db.execute(
             """
-            INSERT INTO alerts (event_id, agent_id, severity, title, description, rule_type, session_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO alerts (event_id, agent_id, severity, title, description, rule_type, session_id, reason, target)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (event_id, agent_id, severity, title, description, rule_type, session_id),
+            (event_id, agent_id, severity, title, description, rule_type, session_id, reason, target),
         )
         alert_id = cur.lastrowid
 
@@ -127,6 +152,21 @@ class Alerter:
         )
         await db.commit()
         return alert_id
+
+    async def _has_open_duplicate(
+        self, db, agent_id: int, reason: str, session_id: str | None, target: str | None
+    ) -> bool:
+        cur = await db.execute(
+            """
+            SELECT 1 FROM alerts
+            WHERE agent_id = ? AND reason = ? AND status = 'open'
+              AND COALESCE(session_id, '') = COALESCE(?, '')
+              AND COALESCE(target, '') = COALESCE(?, '')
+            LIMIT 1
+            """,
+            (agent_id, reason, session_id, target),
+        )
+        return await cur.fetchone() is not None
 
     async def _is_suppressed(self, db, agent_id: int, rule_type: str, reason: str, target: str | None) -> bool:
         cur = await db.execute("SELECT name FROM agents WHERE id = ?", (agent_id,))

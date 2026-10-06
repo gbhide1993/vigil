@@ -39,16 +39,22 @@ export default function Status({ onNavigate }) {
         // the other tier. The medium/low call only needs `total` (an
         // existence check), so it asks for limit: 1 rather than pulling
         // rows nothing here renders.
-        const [criticalData, minorData, agentsData, sessionsData, proofOfValueData] = await Promise.all([
+        const [criticalData, minorData, agentsData, sessionsData, proofOfValueData, statsData] = await Promise.all([
           api.getAlerts({ status: 'open', severity: 'high,critical' }),
           api.getAlerts({ status: 'open', severity: 'medium,low', limit: 1 }),
           api.getAgents(),
           api.getSessions(),
           api.getProofOfValue(),
+          api.getStats(),
         ])
         if (cancelled) return
         setCriticalAlerts(criticalData.alerts)
-        setCriticalTotal(criticalData.total)
+        // needs_review (open, severity high or critical) is the one
+        // definition shared with the tray tooltip and the Incidents
+        // sidebar badge -- sourced from /api/stats rather than
+        // criticalData.total so all three stay in sync by construction,
+        // not by coincidence of matching filters in three places.
+        setCriticalTotal(statsData.needs_review)
         setHasMinorAlerts(minorData.total > 0)
         setAgents(agentsData.agents)
         setProofOfValue(proofOfValueData)
@@ -78,7 +84,7 @@ export default function Status({ onNavigate }) {
   if (orbState === 'red') {
     contextLine = (
       <a href="#incident-list" className="status-context-link">
-        {criticalTotal} incident{criticalTotal !== 1 ? 's' : ''} need attention. Investigate →
+        {criticalTotal} incident{criticalTotal !== 1 ? 's' : ''} need{criticalTotal !== 1 ? '' : 's'} attention. Investigate →
       </a>
     )
   } else if (orbState === 'amber') {

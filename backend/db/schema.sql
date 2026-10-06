@@ -62,6 +62,15 @@ CREATE TABLE IF NOT EXISTS alerts (
     session_id TEXT,              -- set directly by session-level detectors
                                    -- (e.g. Layer 2b) that have no single
                                    -- triggering event_id to join through
+    reason TEXT,                   -- fine-grained detection reason passed to
+                                    -- Alerter.fire_alert (e.g. "time_anomaly",
+                                    -- "credential_access") -- used with target
+                                    -- below for the open-duplicate guard
+    target TEXT,                   -- the specific thing this alert is about
+                                    -- (a path, a session_id, a destination) --
+                                    -- same value fire_alert's in-memory dedup
+                                    -- already keys on, persisted here so the
+                                    -- guard survives a restart
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

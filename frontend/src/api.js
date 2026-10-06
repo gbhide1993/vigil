@@ -1,15 +1,28 @@
 const BASE = '/api'
+// App.jsx's stats poll runs every 3s and uses failures here to decide
+// whether to show the "Backend not responding" banner -- without a
+// timeout, a hung request (backend wedged but the TCP connection still
+// open) never rejects, so inFlight never clears and polling stalls
+// forever instead of ever reporting a failure.
+const REQUEST_TIMEOUT_MS = 10000
 
 async function request(path, options = {}) {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  })
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error(body.detail || `Request failed: ${res.status}`)
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  try {
+    const res = await fetch(`${BASE}${path}`, {
+      headers: { 'Content-Type': 'application/json' },
+      ...options,
+      signal: controller.signal,
+    })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.detail || `Request failed: ${res.status}`)
+    }
+    return await res.json()
+  } finally {
+    clearTimeout(timeoutId)
   }
-  return res.json()
 }
 
 export const api = {

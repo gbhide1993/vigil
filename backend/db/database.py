@@ -79,6 +79,12 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     if "session_id" not in columns:
         await db.execute("ALTER TABLE alerts ADD COLUMN session_id TEXT")
         await db.commit()
+    if "reason" not in columns:
+        await db.execute("ALTER TABLE alerts ADD COLUMN reason TEXT")
+        await db.commit()
+    if "target" not in columns:
+        await db.execute("ALTER TABLE alerts ADD COLUMN target TEXT")
+        await db.commit()
 
     cur = await db.execute("PRAGMA table_info(sessions)")
     columns = {row["name"] for row in await cur.fetchall()}
@@ -117,7 +123,23 @@ async def _seed_policy(db: aiosqlite.Connection) -> None:
     if not POLICY_FILE.exists():
         return
 
-    policy = json.loads(POLICY_FILE.read_text())
+    # utf-8-sig strips a leading UTF-8 BOM if present (and behaves exactly
+    # like utf-8 if it isn't) -- a BOM here previously made json.loads
+    # raise on the stray ﻿ character before the opening brace, which
+    # blocked init_db() and therefore the whole backend from starting.
+    # Any other corruption (truncated file, not a JSON object at all) is
+    # treated the same way: log it and seed nothing this run rather than
+    # crash startup, exactly as if POLICY_FILE didn't exist -- whatever
+    # policy rows already exist in the DB, or the built-in defaults
+    # elsewhere, still apply.
+    try:
+        policy = json.loads(POLICY_FILE.read_text(encoding="utf-8-sig"))
+        if not isinstance(policy, dict):
+            raise ValueError(f"expected a JSON object at the top level, got {type(policy).__name__}")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
+        logger.warning("policy file %s is invalid (%s) -- falling back to defaults", POLICY_FILE, e)
+        return
+
     for key, value in policy.items():
         await db.execute(
             """

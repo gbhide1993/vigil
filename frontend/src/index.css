@@ -374,6 +374,16 @@ a {
   animation: pulse-green 3s ease-in-out infinite;
 }
 
+.backend-down-banner {
+  background: #dc2626;
+  color: #fff;
+  font-weight: 600;
+  text-align: center;
+  padding: 10px 16px;
+  border-radius: 6px;
+  margin-bottom: 16px;
+}
+
 .status-orb.amber {
   background: radial-gradient(circle at 35% 35%, #fbbf24, #d97706);
   box-shadow: 0 0 40px rgba(251, 191, 36, 0.35),

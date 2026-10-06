@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from config.policy import POLICY_FILE
 from core.cve_check import check_agent_cves, get_installed_agent_version
 from core.feature_flags import CORE_ONLY
-from db.database import get_db
+from db.database import get_db, get_read_db
 
 router = APIRouter()
 
@@ -106,23 +106,26 @@ async def _latest_agent_audit_entries(db) -> dict[int, dict]:
 
 @router.get("/agents")
 async def get_agents():
-    db = await get_db()
-    cur = await db.execute("SELECT * FROM agents ORDER BY last_seen DESC")
-    rows = await cur.fetchall()
-    audit_by_agent = await _latest_agent_audit_entries(db)
-    agents = []
-    for r in rows:
-        agent = dict(r)
-        agent["current_status"] = _current_status(agent.get("last_seen"))
-        audit = audit_by_agent.get(agent["id"])
-        if audit and agent["approved"] == 1:
-            agent["approved_by"] = audit["actor"]
-            agent["approved_at"] = audit["created_at"]
-        elif audit and agent["approved"] == 2:
-            agent["blocked_reason"] = audit["reason"]
-            agent["blocked_at"] = audit["created_at"]
-        agents.append(agent)
-    return {"agents": agents}
+    db = await get_read_db()
+    try:
+        cur = await db.execute("SELECT * FROM agents ORDER BY last_seen DESC")
+        rows = await cur.fetchall()
+        audit_by_agent = await _latest_agent_audit_entries(db)
+        agents = []
+        for r in rows:
+            agent = dict(r)
+            agent["current_status"] = _current_status(agent.get("last_seen"))
+            audit = audit_by_agent.get(agent["id"])
+            if audit and agent["approved"] == 1:
+                agent["approved_by"] = audit["actor"]
+                agent["approved_at"] = audit["created_at"]
+            elif audit and agent["approved"] == 2:
+                agent["blocked_reason"] = audit["reason"]
+                agent["blocked_at"] = audit["created_at"]
+            agents.append(agent)
+        return {"agents": agents}
+    finally:
+        await db.close()
 
 
 @router.post("/agents/{agent_id}/approve")
@@ -226,15 +229,17 @@ async def get_agent_cve_check(agent_name: str):
 
 @router.get("/agents/{agent_id}/sessions")
 async def get_agent_sessions(agent_id: int):
-    db = await get_db()
+    db = await get_read_db()
+    try:
+        cur = await db.execute("SELECT id FROM agents WHERE id = ?", (agent_id,))
+        if await cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="agent not found")
 
-    cur = await db.execute("SELECT id FROM agents WHERE id = ?", (agent_id,))
-    if await cur.fetchone() is None:
-        raise HTTPException(status_code=404, detail="agent not found")
-
-    cur = await db.execute(
-        "SELECT * FROM sessions WHERE agent_id = ? ORDER BY started_at DESC",
-        (agent_id,),
-    )
-    rows = await cur.fetchall()
-    return {"sessions": [dict(r) for r in rows]}
+        cur = await db.execute(
+            "SELECT * FROM sessions WHERE agent_id = ? ORDER BY started_at DESC",
+            (agent_id,),
+        )
+        rows = await cur.fetchall()
+        return {"sessions": [dict(r) for r in rows]}
+    finally:
+        await db.close()

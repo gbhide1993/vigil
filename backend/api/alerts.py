@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from core.analytics import track
-from db.database import get_db
+from db.database import get_db, get_read_db
 
 router = APIRouter()
 
@@ -14,6 +14,18 @@ VALID_ACTIONS = {
     "risk_accepted": "risk_accepted",
 }
 NOTE_REQUIRED_ACTIONS = {"exception_approved", "risk_accepted"}
+
+
+def _invalidate_stats_cache() -> None:
+    """/api/stats caches for _STATS_CACHE_TTL_SECONDS (main.py) so repeated
+    3s polls don't each pay the query cost -- but that means resolving or
+    dismissing an alert here would otherwise not be reflected in
+    needs_review/alerts_open for up to that long. Deferred import (not at
+    module load time) avoids a circular import, since main.py is what
+    imports this router -- matches the existing pattern in
+    api/platform_routes.py's scheduler/aggregator introspection."""
+    import main as _main
+    _main._stats_cache["data"] = None
 
 
 class ResolveAlertRequest(BaseModel):
@@ -44,8 +56,14 @@ async def get_alerts(
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ):
-    db = await get_db()
+    db = await get_read_db()
+    try:
+        return await _get_alerts_data(db, status, severity, agent, session_id, limit, offset)
+    finally:
+        await db.close()
 
+
+async def _get_alerts_data(db, status, severity, agent, session_id, limit, offset):
     clauses = []
     params: list = []
     if status is not None:
@@ -151,6 +169,7 @@ async def bulk_dismiss(severity: str = Query(...), actor: str = Query(default="a
             (alert_id, actor, json.dumps({"note": "bulk dismissed from UI", "severity": severity})),
         )
     await db.commit()
+    _invalidate_stats_cache()
     return {"dismissed": len(ids)}
 
 
@@ -215,6 +234,7 @@ async def bulk_resolve(body: BulkResolveRequest, actor: str = Query(default="adm
             (alert_id, actor, json.dumps(body.model_dump(exclude_unset=True))),
         )
     await db.commit()
+    _invalidate_stats_cache()
     return {"resolved": len(ids)}
 
 
@@ -258,6 +278,7 @@ async def resolve_alert(alert_id: int, body: ResolveAlertRequest):
         ),
     )
     await db.commit()
+    _invalidate_stats_cache()
 
     await track("alert_resolved", {"severity": alert["severity"], "rule_type": alert["rule_type"]})
 

@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from core.alerter import Alerter
 from core.red_lines import SESSION_LAUNCH_DIR
 from core.verification import build_verification_report, touches_credential_path
-from db.database import get_db
+from db.database import get_read_db
 
 router = APIRouter()
 _alerter = Alerter()
@@ -34,27 +34,29 @@ async def get_sessions(status: str | None = Query(default=None)):
     of events total, not one per session row) joined in once, plus a new
     idx_events_session index for this and any other session_id-filtered
     query."""
-    db = await get_db()
-
-    where = "WHERE s.ended_at IS NULL" if status == "open" else ""
-    cur = await db.execute(
-        f"""
-        SELECT s.*, a.name as agent_name,
-            COALESCE(nc.net_connect_count, 0) as net_connect_count
-        FROM sessions s
-        LEFT JOIN agents a ON a.id = s.agent_id
-        LEFT JOIN (
-            SELECT session_id, COUNT(*) as net_connect_count
-            FROM events
-            WHERE event_type = 'net_connect'
-            GROUP BY session_id
-        ) nc ON nc.session_id = s.id
-        {where}
-        ORDER BY s.started_at DESC
-        """
-    )
-    rows = await cur.fetchall()
-    return {"sessions": [dict(r) for r in rows]}
+    db = await get_read_db()
+    try:
+        where = "WHERE s.ended_at IS NULL" if status == "open" else ""
+        cur = await db.execute(
+            f"""
+            SELECT s.*, a.name as agent_name,
+                COALESCE(nc.net_connect_count, 0) as net_connect_count
+            FROM sessions s
+            LEFT JOIN agents a ON a.id = s.agent_id
+            LEFT JOIN (
+                SELECT session_id, COUNT(*) as net_connect_count
+                FROM events
+                WHERE event_type = 'net_connect'
+                GROUP BY session_id
+            ) nc ON nc.session_id = s.id
+            {where}
+            ORDER BY s.started_at DESC
+            """
+        )
+        rows = await cur.fetchall()
+        return {"sessions": [dict(r) for r in rows]}
+    finally:
+        await db.close()
 
 
 @router.get("/sessions/{session_id}/verify")
@@ -64,19 +66,25 @@ async def verify_session(session_id: str):
     observed at the OS level. See core/verification.py for the comparison
     logic. A non-empty discrepancies list fires a verification_mismatch
     alert as a side effect — that's the significant, actionable case."""
-    db = await get_db()
+    db = await get_read_db()
+    try:
+        cur = await db.execute("SELECT id, agent_id FROM sessions WHERE id = ?", (session_id,))
+        session = await cur.fetchone()
+        if session is None:
+            raise HTTPException(status_code=404, detail="session not found")
 
-    cur = await db.execute("SELECT id, agent_id FROM sessions WHERE id = ?", (session_id,))
-    session = await cur.fetchone()
-    if session is None:
-        raise HTTPException(status_code=404, detail="session not found")
+        cur = await db.execute("SELECT name FROM agents WHERE id = ?", (session["agent_id"],))
+        agent = await cur.fetchone()
+        agent_name = agent["name"] if agent else "unknown agent"
 
-    cur = await db.execute("SELECT name FROM agents WHERE id = ?", (session["agent_id"],))
-    agent = await cur.fetchone()
-    agent_name = agent["name"] if agent else "unknown agent"
+        report = await build_verification_report(session_id, agent_name, db)
+    finally:
+        await db.close()
 
-    report = await build_verification_report(session_id, agent_name, db)
-
+    # fire_alert opens its own dedicated get_db() connection internally --
+    # intentionally outside the read-only connection's try/finally above,
+    # since this is the one write this handler can trigger as a side
+    # effect and must never run on a query_only connection.
     discrepancies = report.get("discrepancies")
     if discrepancies:
         await _fire_verification_mismatch_alert(session["agent_id"], agent_name, session_id, discrepancies)
@@ -114,39 +122,41 @@ async def get_session_top_finding(session_id: str):
     session directly — event-driven alerts carry it via events.session_id,
     session-close alerts (Layer 2a/2b) carry it in audit_log.detail — so
     both sources are checked."""
-    db = await get_db()
+    db = await get_read_db()
+    try:
+        async def _find(rule_type_clause: str, params: tuple) -> dict | None:
+            cur = await db.execute(
+                f"""
+                SELECT al.* FROM alerts al
+                WHERE {rule_type_clause}
+                  AND (
+                    al.event_id IN (SELECT id FROM events WHERE session_id = ?)
+                    OR al.id IN (
+                        SELECT CAST(json_extract(detail, '$.alert_id') AS INTEGER)
+                        FROM audit_log
+                        WHERE action = 'alert_created' AND json_extract(detail, '$.session_id') = ?
+                    )
+                  )
+                ORDER BY al.created_at ASC
+                LIMIT 1
+                """,
+                (*params, session_id, session_id),
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
 
-    async def _find(rule_type_clause: str, params: tuple) -> dict | None:
-        cur = await db.execute(
-            f"""
-            SELECT al.* FROM alerts al
-            WHERE {rule_type_clause}
-              AND (
-                al.event_id IN (SELECT id FROM events WHERE session_id = ?)
-                OR al.id IN (
-                    SELECT CAST(json_extract(detail, '$.alert_id') AS INTEGER)
-                    FROM audit_log
-                    WHERE action = 'alert_created' AND json_extract(detail, '$.session_id') = ?
-                )
-              )
-            ORDER BY al.created_at ASC
-            LIMIT 1
-            """,
-            (*params, session_id, session_id),
-        )
-        row = await cur.fetchone()
-        return dict(row) if row else None
+        red_line = await _find("al.rule_type = ?", ("red_line",))
+        if red_line:
+            return {"kind": "red_line", "alert": red_line}
 
-    red_line = await _find("al.rule_type = ?", ("red_line",))
-    if red_line:
-        return {"kind": "red_line", "alert": red_line}
+        placeholders = ", ".join("?" for _ in ANOMALY_RULE_TYPES)
+        anomaly = await _find(f"al.rule_type IN ({placeholders})", ANOMALY_RULE_TYPES)
+        if anomaly:
+            return {"kind": "anomaly", "alert": anomaly}
 
-    placeholders = ", ".join("?" for _ in ANOMALY_RULE_TYPES)
-    anomaly = await _find(f"al.rule_type IN ({placeholders})", ANOMALY_RULE_TYPES)
-    if anomaly:
-        return {"kind": "anomaly", "alert": anomaly}
-
-    return {"kind": None, "alert": None}
+        return {"kind": None, "alert": None}
+    finally:
+        await db.close()
 
 
 def _is_outside_workdir(path: str) -> bool:
@@ -211,8 +221,14 @@ def _format_local(ts: str | None) -> str | None:
 async def _build_session_report(session_id: str) -> dict:
     """Assembles every data point the PDF/JSON session report needs, in one
     place, so the /report and /report/preview endpoints stay in sync."""
-    db = await get_db()
+    db = await get_read_db()
+    try:
+        return await _build_session_report_data(db, session_id)
+    finally:
+        await db.close()
 
+
+async def _build_session_report_data(db, session_id: str) -> dict:
     cur = await db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
     session = await cur.fetchone()
     if session is None:
