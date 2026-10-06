@@ -9,3 +9,5 @@
 build/tray/
 build/backend/
 output/
+
+build/frontend/
