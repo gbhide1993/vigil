@@ -55,6 +55,18 @@ let waitingForBackend = false
 const MAX_BACKEND_FAILURES = 3
 const BACKEND_STABLE_MS = 10000
 
+// Both set true only around a kill WE initiated (quit, or killBackendAndWait()
+// itself). Without these, the backendProcess 'exit' handler sees the nonzero
+// exit code from our own taskkill and treats it as a crash: handleBackendCrash()
+// schedules a 3s-delayed respawn. If the quit sequence (which spawns
+// powershell several times for the port checks) takes longer than that 3s,
+// the timer fires, a new backend starts, and then before-quit's app.exit(0)
+// runs anyway -- leaving that new backend orphaned with its parent already
+// gone. Confirmed live: a new vigil-backend appeared at the moment the tray
+// was quit.
+let quitInProgress = false
+let intentionalBackendKill = false
+
 function getBackendPath() {
   if (app.isPackaged) {
     // Installer layout: app\tray\Vigil.exe and app\backend\vigil-backend.exe
@@ -67,6 +79,11 @@ function getBackendPath() {
 }
 
 function spawnBackend() {
+  if (quitInProgress) {
+    console.log('Quit in progress, not spawning a new backend')
+    return
+  }
+
   if (backendProcess && !backendProcess.killed) {
     console.log(`Backend already running (PID ${backendProcess.pid}), skipping duplicate spawn`)
     return
@@ -103,6 +120,12 @@ function spawnBackend() {
   backendProcess.on('exit', (code) => {
     console.log(`Backend exited with code ${code}`)
     backendProcess = null
+    if (intentionalBackendKill || quitInProgress) {
+      // A kill we initiated ourselves (taskkill /F during quit or a
+      // manual restart) always exits with a nonzero code -- that is not
+      // a crash, and must not trigger a respawn here.
+      return
+    }
     if (code !== 0 && code !== null) {
       handleBackendCrash()
     }
@@ -172,6 +195,8 @@ const QUIT_KILL_TIMEOUT_MS = 5000
 // The port-owner fallback below covers that case independently of whether
 // the primary tree-kill found anything.
 async function killBackendAndWait() {
+  intentionalBackendKill = true
+
   if (backendProcess && backendProcess.pid) {
     const pid = backendProcess.pid
     console.log(`Killing backend process tree (PID ${pid})...`)
@@ -192,6 +217,13 @@ async function killBackendAndWait() {
 }
 
 function handleBackendCrash() {
+  if (quitInProgress || intentionalBackendKill) {
+    // Belt and suspenders alongside the 'exit' handler's own check above --
+    // handleBackendCrash() is also called directly from the spawn 'error'
+    // handler, not only from 'exit', so it needs this guard independently.
+    return
+  }
+
   backendReady = false
   if (backendStableTimer) {
     clearTimeout(backendStableTimer)
@@ -206,6 +238,13 @@ function handleBackendCrash() {
   }
 
   setTimeout(() => {
+    // Re-check: a quit (or a manual restart's kill) can start after this
+    // timer was scheduled but before it fires -- the 3s delay is exactly
+    // the gap the live orphan bug fell into.
+    if (quitInProgress || intentionalBackendKill) {
+      console.log('Quit or intentional kill in progress, skipping scheduled respawn')
+      return
+    }
     console.log('Retrying backend spawn...')
     spawnBackend()
     waitForBackend()
@@ -717,6 +756,10 @@ function createTray() {
           setTrayWarning()
           tray.setToolTip('Vigil — Restarting backend...')
           await killBackendAndWait()
+          // Clear the flag before spawning again so a real crash of this
+          // freshly restarted backend is still treated as a crash, not
+          // silently ignored because of the kill that just preceded it.
+          intentionalBackendKill = false
           spawnBackend()
           waitForBackend()
         },
@@ -811,8 +854,6 @@ app.on('window-all-closed', (e) => {
   // tray app has no dock-visible windows to close into quitting
   e.preventDefault()
 })
-
-let quitInProgress = false
 
 // before-quit only REQUESTS a shutdown -- if the handler returns without
 // calling event.preventDefault(), Electron carries on with its own quit
