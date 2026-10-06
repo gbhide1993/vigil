@@ -16,12 +16,17 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false
+    let inFlight = false
     async function load() {
+      if (inFlight) return
+      inFlight = true
       try {
         const data = await api.getStats()
         if (!cancelled) setOpenAlertCount(data.alerts_open)
       } catch {
         // ignore poll failures
+      } finally {
+        inFlight = false
       }
     }
     load()
@@ -37,12 +42,17 @@ export default function App() {
     // back for this app lifetime — stop polling to save the request.
     if (hasSessions) return
     let cancelled = false
+    let inFlight = false
     async function load() {
+      if (inFlight) return
+      inFlight = true
       try {
         const data = await api.getSessions()
         if (!cancelled) setHasSessions(data.sessions.length > 0)
       } catch {
         // ignore poll failures — keep showing whatever state we last knew
+      } finally {
+        inFlight = false
       }
     }
     load()

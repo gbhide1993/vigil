@@ -21,12 +21,17 @@ export default function Sidebar({ view, onNavigate, openAlertCount }) {
 
   useEffect(() => {
     let cancelled = false
+    let inFlight = false
     async function load() {
+      if (inFlight) return
+      inFlight = true
       try {
         const data = await api.getAgents()
         if (!cancelled) setAgents(data.agents)
       } catch {
         // sidebar polling failures are non-fatal, silently retry next tick
+      } finally {
+        inFlight = false
       }
     }
     load()
