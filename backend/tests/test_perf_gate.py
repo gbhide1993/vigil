@@ -24,7 +24,12 @@ import db.database as database
 import main as main_module
 
 P95_BUDGET_MS = 250
-SAMPLES = 20
+# 20 samples made p95 effectively "the 19th of 20 sorted values" -- a
+# single slow outlier (GC pause, OS scheduler jitter) could swing the
+# reported p95 by 150ms+ on this shared dev machine even though the
+# median stayed consistently in the 80-160ms range across every run.
+# 50 gives statistics.quantiles enough data for a stable tail estimate.
+SAMPLES = 50
 
 # Endpoint -> (method, path). All three are polled unconditionally by the
 # app shell (see App.jsx and Sidebar.jsx) on a fixed 3s interval,
@@ -39,9 +44,29 @@ APP_SHELL_POLLED_ENDPOINTS = {
 @pytest_asyncio.fixture
 async def seeded_db():
     """Same test_db pattern as the rest of this suite, seeded with a
-    realistic row count before the test runs."""
+    realistic row count before the test runs.
+
+    This fixture is function-scoped and re-runs once per parametrized
+    endpoint (3 times total), but VLAW_DATA_DIR points at the same
+    on-disk file for the whole pytest process -- without clearing first,
+    each run's INSERTs would stack on top of whatever the previous
+    parametrized run already seeded (900 -> 1800 -> 2700 sessions by the
+    third run), silently testing against 2-3x the intended row count and
+    making the result depend on parametrize execution order rather than
+    the fixed, documented size below. The DELETEs make every run start
+    from the same clean slate regardless of what ran before it."""
     database._db = None
     db = await database.get_db()
+    # Deletion order matters: event_chain.event_id and alerts.event_id both
+    # reference events(id) with no ON DELETE CASCADE (PRAGMA foreign_keys
+    # is ON -- see db/database.py), and events/alerts/sessions all
+    # reference agents(id). test_evidence_chain.py runs earlier
+    # alphabetically in the same shared DB file (see conftest.py) and
+    # seals real events into event_chain, so deleting events before its
+    # referencing rows fails with FOREIGN KEY constraint failed.
+    for table in ("event_chain", "alerts", "events", "sessions", "agents"):
+        await db.execute(f"DELETE FROM {table}")
+    await db.commit()
 
     now = datetime.now(timezone.utc)
 
