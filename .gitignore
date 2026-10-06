@@ -83,3 +83,5 @@ backend/test_write.txt
 backend/.vlaw-trial-started
 installer/build/
 vigil-plugin.zip
+
+.claude/
