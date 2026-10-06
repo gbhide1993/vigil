@@ -79,8 +79,9 @@ os.environ.setdefault("VLAW_LICENSE_FILE", os.path.join(BASE_DIR, ".vlaw-license
 import asyncio
 import concurrent.futures
 import logging
+import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, APIRouter, HTTPException, Request
@@ -96,7 +97,7 @@ from core.config_auditor import audit_all_configs
 from core.feature_flags import CORE_ONLY
 from core.insights import get_insights
 from core.red_lines import SESSION_LAUNCH_DIR
-from db.database import DB_PATH, close_db, get_db, init_db
+from db.database import DB_PATH, close_db, get_db, get_read_db, init_db
 from license.license_service import LicenseService
 from watchers.file_watcher import start_file_watcher
 from watchers.mcp_watcher import McpWatcher
@@ -559,77 +560,149 @@ app.include_router(evidence.router, prefix="/api")
 app.include_router(chain_routes.router, prefix="/api")
 
 
+_STATS_CACHE_TTL_SECONDS = 2.0
+_stats_cache = {"data": None, "computed_at": 0.0}
+
+
 @app.get("/stats")
 @app.get("/api/stats")
 async def get_stats():
-    db = await get_db()
+    """Polled every 3s by App.jsx on every page -- it's part of the app
+    shell, never unmounted. Measured directly on the live machine: 4.3s,
+    9.1s, 5.9s per call, which at ~0.82-0.94 CPU cores with the dashboard
+    open (vs 0.01 idle) was clearly the dominant cost.
 
-    cur = await db.execute("SELECT COUNT(*) c FROM agents WHERE approved = 1")
-    active_agents = (await cur.fetchone())["c"]
+    This used to run 13 sequential queries on the shared get_db()
+    singleton, most wrapping created_at in date(...) in the WHERE clause
+    -- date(created_at) = date('now') -- which defeats any index on that
+    column (EXPLAIN QUERY PLAN confirmed SCAN, not SEARCH, even where an
+    index existed). Measured on a copy of the live DB (~15k events, ~3k
+    alerts): all 13 queries combined cost only ~7.5ms there, ruling out
+    raw query cost as the cause of the multi-second latency at today's
+    scale. The real cause is connection contention: get_db() is the one
+    shared, single-writer-thread connection that ProcessWatcher, the
+    file watcher, Aggregator.flush_buffers, and _seal_evidence_chain all
+    write through -- the same class of hazard already fixed for
+    seal_new_events()/verify_chain() in core/evidence_chain.py, just
+    never applied here even though this is the highest-frequency reader
+    in the app.
 
-    cur = await db.execute("SELECT COUNT(*) c FROM events WHERE date(created_at) = date('now')")
-    events_today = (await cur.fetchone())["c"]
+    Fixed four ways:
+    1. get_read_db() instead of get_db() -- a dedicated connection that
+       never queues behind the shared writer thread.
+    2. Every date(created_at) = date('now') replaced with a
+       created_at >= ? AND created_at < ? range against UTC day
+       boundaries computed in Python, so the planner can do an actual
+       index range SEARCH (idx_events_created, idx_alerts_created,
+       idx_sessions_started -- the latter two added alongside this fix).
+    3. 13 round-trips consolidated into 6 queries via conditional
+       SUM(CASE WHEN ...), each still restricted to created_at >=
+       yesterday's start so the index prunes everything older than that
+       regardless of how large events/alerts grow.
+    4. A short in-process cache (TTL above) so concurrent pollers
+       (multiple tabs, or Sidebar/App.jsx polling close together) don't
+       each pay even the now-cheap query cost.
 
-    cur = await db.execute("SELECT COUNT(*) c FROM events WHERE date(created_at) = date('now', '-1 day')")
-    events_yesterday = (await cur.fetchone())["c"]
+    Still protects against the table growing: cost here scales with
+    "rows from yesterday onward", not total table size, since every
+    multi-row query is now WHERE-bounded on the indexed created_at
+    column rather than scanning everything."""
+    now_ts = time.monotonic()
+    if _stats_cache["data"] is not None and now_ts - _stats_cache["computed_at"] < _STATS_CACHE_TTL_SECONDS:
+        return _stats_cache["data"]
 
-    cur = await db.execute("SELECT COUNT(*) c FROM alerts WHERE status = 'open'")
-    alerts_open = (await cur.fetchone())["c"]
+    db = await get_read_db()
+    try:
+        now = datetime.now(timezone.utc)
+        today_start = now.strftime("%Y-%m-%d 00:00:00")
+        tomorrow_start = (now + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+        yesterday_start = (now - timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
 
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM alerts WHERE status = 'open' AND date(created_at) = date('now', '-1 day')"
-    )
-    alerts_open_yesterday = (await cur.fetchone())["c"]
+        cur = await db.execute("SELECT COUNT(*) c FROM agents WHERE approved = 1")
+        active_agents = (await cur.fetchone())["c"]
 
-    cur = await db.execute(
-        "SELECT COALESCE(SUM(data_volume_bytes), 0) v FROM events WHERE event_type = 'net_connect' AND date(created_at) = date('now')"
-    )
-    net_bytes_today = (await cur.fetchone())["v"]
+        cur = await db.execute(
+            """
+            SELECT
+                SUM(CASE WHEN created_at >= ? AND created_at < ? THEN 1 ELSE 0 END) AS events_today,
+                SUM(CASE WHEN created_at >= ? AND created_at < ? THEN 1 ELSE 0 END) AS events_yesterday,
+                SUM(CASE WHEN created_at >= ? AND created_at < ? AND event_type = 'net_connect'
+                    THEN COALESCE(data_volume_bytes, 0) ELSE 0 END) AS net_bytes_today,
+                SUM(CASE WHEN created_at >= ? AND created_at < ? AND event_type = 'net_connect'
+                    THEN COALESCE(data_volume_bytes, 0) ELSE 0 END) AS net_bytes_yesterday,
+                SUM(CASE WHEN created_at >= ? AND created_at < ? AND event_type = 'cred_access'
+                    THEN 1 ELSE 0 END) AS cred_accesses_today,
+                SUM(CASE WHEN created_at >= ? AND created_at < ? AND event_type = 'cred_access'
+                    THEN 1 ELSE 0 END) AS cred_accesses_yesterday
+            FROM events
+            WHERE created_at >= ?
+            """,
+            (
+                today_start, tomorrow_start,
+                yesterday_start, today_start,
+                today_start, tomorrow_start,
+                yesterday_start, today_start,
+                today_start, tomorrow_start,
+                yesterday_start, today_start,
+                yesterday_start,
+            ),
+        )
+        events_row = await cur.fetchone()
+        events_today = events_row["events_today"] or 0
+        events_yesterday = events_row["events_yesterday"] or 0
+        net_bytes_today = events_row["net_bytes_today"] or 0
+        net_bytes_yesterday = events_row["net_bytes_yesterday"] or 0
+        cred_accesses_today = events_row["cred_accesses_today"] or 0
+        cred_accesses_yesterday = events_row["cred_accesses_yesterday"] or 0
 
-    cur = await db.execute(
-        "SELECT COALESCE(SUM(data_volume_bytes), 0) v FROM events WHERE event_type = 'net_connect' AND date(created_at) = date('now', '-1 day')"
-    )
-    net_bytes_yesterday = (await cur.fetchone())["v"]
+        cur = await db.execute("SELECT COUNT(*) c FROM alerts WHERE status = 'open'")
+        alerts_open = (await cur.fetchone())["c"]
 
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM events WHERE event_type = 'cred_access' AND date(created_at) = date('now')"
-    )
-    cred_accesses_today = (await cur.fetchone())["c"]
+        # checkpoint_activity (RL3's normal-/rewind tier — see core/red_lines.py)
+        # is expected, frequent, benign background noise, not a "meaningful
+        # alert" in Sprint A's sense — excluded from the noise-reduction
+        # numerator below so it doesn't inflate the count of alerts that
+        # actually warrant a human's attention.
+        cur = await db.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status = 'open' AND created_at >= ? AND created_at < ?
+                    THEN 1 ELSE 0 END) AS alerts_open_yesterday,
+                SUM(CASE WHEN created_at >= ? AND created_at < ? THEN 1 ELSE 0 END) AS alerts_today,
+                SUM(CASE WHEN created_at >= ? AND created_at < ? AND rule_type != 'checkpoint_activity'
+                    THEN 1 ELSE 0 END) AS meaningful_alerts_today
+            FROM alerts
+            WHERE created_at >= ?
+            """,
+            (
+                yesterday_start, today_start,
+                today_start, tomorrow_start,
+                today_start, tomorrow_start,
+                yesterday_start,
+            ),
+        )
+        alerts_row = await cur.fetchone()
+        alerts_open_yesterday = alerts_row["alerts_open_yesterday"] or 0
+        alerts_today = alerts_row["alerts_today"] or 0
+        meaningful_alerts_today = alerts_row["meaningful_alerts_today"] or 0
 
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM events WHERE event_type = 'cred_access' AND date(created_at) = date('now', '-1 day')"
-    )
-    cred_accesses_yesterday = (await cur.fetchone())["c"]
+        cur = await db.execute(
+            "SELECT COUNT(*) c FROM sessions WHERE started_at >= ? AND started_at < ?",
+            (today_start, tomorrow_start),
+        )
+        sessions_today = (await cur.fetchone())["c"]
 
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM sessions WHERE date(started_at) = date('now')"
-    )
-    sessions_today = (await cur.fetchone())["c"]
-
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM alerts WHERE date(created_at) = date('now')"
-    )
-    alerts_today = (await cur.fetchone())["c"]
-
-    # checkpoint_activity (RL3's normal-/rewind tier — see core/red_lines.py)
-    # is expected, frequent, benign background noise, not a "meaningful
-    # alert" in Sprint A's sense — excluded from the noise-reduction
-    # numerator below so it doesn't inflate the count of alerts that
-    # actually warrant a human's attention.
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM alerts WHERE date(created_at) = date('now') AND rule_type != 'checkpoint_activity'"
-    )
-    meaningful_alerts_today = (await cur.fetchone())["c"]
-
-    cur = await db.execute("SELECT value FROM stats_kv WHERE key = 'suppressed_alerts'")
-    row = await cur.fetchone()
-    suppressed_alerts = row["value"] if row else 0
+        cur = await db.execute("SELECT value FROM stats_kv WHERE key = 'suppressed_alerts'")
+        row = await cur.fetchone()
+        suppressed_alerts = row["value"] if row else 0
+    finally:
+        await db.close()
 
     # Signal-over-noise: how much raw activity got compressed down to
     # alerts actually worth a human's attention today.
     noise_reduction_ratio = round(meaningful_alerts_today / events_today, 4) if events_today else 0.0
 
-    return {
+    result = {
         "active_agents": active_agents,
         "events_today": events_today,
         "events_yesterday": events_yesterday,
@@ -645,6 +718,9 @@ async def get_stats():
         "noise_reduction_ratio": noise_reduction_ratio,
         "suppressed_alerts": suppressed_alerts,
     }
+    _stats_cache["data"] = result
+    _stats_cache["computed_at"] = now_ts
+    return result
 
 
 @app.get("/health")

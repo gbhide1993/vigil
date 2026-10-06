@@ -21,16 +21,34 @@ ANOMALY_RULE_TYPES = ("volumetric_threshold", "time_anomaly", "ratio_anomaly", "
 async def get_sessions(status: str | None = Query(default=None)):
     """Global session listing across all agents. status=open restricts to
     sessions that haven't closed yet (ended_at IS NULL) — used by the tray
-    for an active-agent count."""
+    for an active-agent count. Also one of the app shell's always-on 3s
+    polls (App.jsx, until the first session shows up).
+
+    net_connect_count used to be a correlated scalar subquery -- one
+    SELECT COUNT(*) FROM events ... re-run per session row. events has
+    no index on session_id, so each of those per-row subqueries fell
+    back to scanning every net_connect-type event checking session_id by
+    hand. Measured directly: p95 11.5s at 900 sessions / 15k events (the
+    performance gate in tests/test_perf_gate.py). Fixed by pre-aggregating
+    net_connect counts for every session in one GROUP BY pass (one scan
+    of events total, not one per session row) joined in once, plus a new
+    idx_events_session index for this and any other session_id-filtered
+    query."""
     db = await get_db()
 
     where = "WHERE s.ended_at IS NULL" if status == "open" else ""
     cur = await db.execute(
         f"""
         SELECT s.*, a.name as agent_name,
-            (SELECT COUNT(*) FROM events e WHERE e.session_id = s.id AND e.event_type = 'net_connect') as net_connect_count
+            COALESCE(nc.net_connect_count, 0) as net_connect_count
         FROM sessions s
         LEFT JOIN agents a ON a.id = s.agent_id
+        LEFT JOIN (
+            SELECT session_id, COUNT(*) as net_connect_count
+            FROM events
+            WHERE event_type = 'net_connect'
+            GROUP BY session_id
+        ) nc ON nc.session_id = s.id
         {where}
         ORDER BY s.started_at DESC
         """
