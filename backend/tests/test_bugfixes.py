@@ -667,6 +667,103 @@ def test_resolve_local_day_utc_unchanged(monkeypatch):
     assert end_utc - start_utc == timedelta(hours=24)
 
 
+def test_wrap_line_handles_very_long_zone_name():
+    """_wrap_line must split a line that is too wide for the printable
+    page width into multiple lines, each one individually measuring
+    within that width -- using reportlab's own stringWidth, not a
+    guessed character count, since different fonts/sizes render the
+    same text at different widths. Uses a deliberately long fake zone
+    name (longer than any real one) rather than this machine's actual
+    timezone, which varies by machine and isn't reliably long enough to
+    exercise wrapping on its own."""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    import api.export as export_module
+
+    max_width = letter[0] - 2 * inch
+    long_zone_name = "Pacific Extremely Long Fictional Standard Time For Wrap Testing Purposes Only"
+    text = f"Period: 07 Oct 2026 00:00 to 08 Oct 2026 00:00 {long_zone_name}"
+
+    lines = export_module._wrap_line(text, "Helvetica", 10, max_width)
+
+    assert len(lines) > 1, "expected this deliberately long line to actually wrap"
+    for line in lines:
+        assert stringWidth(line, "Helvetica", 10) <= max_width, (
+            f"wrapped line exceeds printable width: {line!r}"
+        )
+    # no words lost or reordered by wrapping
+    assert " ".join(lines) == text
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_no_drawn_line_exceeds_printable_width(test_db):
+    """End-to-end: seeds a session with a long operator/hostname and an
+    alert with a very long title, then renders the real PDF and checks
+    every single drawString call reportlab actually made -- header,
+    sessions, and alerts alike -- against the same max_width the PDF
+    itself is laid out with. Captures the real font/size active on the
+    canvas at each draw call (Canvas._fontname/_fontsize) since width
+    depends on both, not just the text."""
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    agent_name = _uniq("claude_code_pdfwraptest")
+    agent_id = await _make_agent(test_db, agent_name)
+    session_id = _uniq("sess")
+    long_hostname = "a-very-long-workstation-hostname-" + "x" * 80
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, operator_username, operator_hostname) "
+        "VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?)",
+        (session_id, agent_id, "a_very_long_operator_username_" + "y" * 80, long_hostname),
+    )
+    long_title = "Critical alert: " + "suspicious activity detected in a path " * 15
+    await test_db.execute(
+        "INSERT INTO alerts (agent_id, severity, title, description, status, rule_type) "
+        "VALUES (?, 'critical', ?, 'd', 'open', 'policy')",
+        (agent_id, long_title),
+    )
+    await test_db.commit()
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    max_width = letter[0] - 2 * inch
+    captured = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        captured.append((text, self._fontname, self._fontsize))
+        return original(self, x, y, text)
+
+    with patch.object(canvas.Canvas, "drawString", capture):
+        resp = client.get("/export/pdf")
+    assert resp.status_code == 200
+    assert len(captured) > 0
+
+    overflowing = [
+        (text, font, size, stringWidth(text, font, size))
+        for text, font, size in captured
+        if stringWidth(text, font, size) > max_width
+    ]
+    assert overflowing == [], f"drawn line(s) exceed printable width {max_width}: {overflowing}"
+
+    # the long alert title must still appear in full somewhere across the
+    # wrapped lines, not silently truncated the way line[:110] used to.
+    joined = " ".join(text for text, _, _ in captured)
+    assert "suspicious activity detected in a path" in joined
+
+
 # ------------------------------------------ 8. writer wedge-replace failure
 #
 # Covers the gap found during the 2026-09-30 soak test: _replace_wedged_

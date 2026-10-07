@@ -67,6 +67,74 @@ def _local_day_bounds_utc(day, tz=None) -> tuple[datetime, datetime]:
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
+def _wrap_line(text: str, font_name: str, font_size: float, max_width: float) -> list[str]:
+    """Splits `text` on spaces into as many lines as needed so each one
+    measures within max_width at (font_name, font_size), using reportlab's
+    own stringWidth rather than guessing from a character count. A fixed
+    character-count truncation (what this used to do, line[:110]) either
+    cuts off real content or, for a wide font/size, still overflows the
+    page width anyway -- stringWidth measures the actual rendered width.
+
+    A single space-free token (a long operator=user@hostname string, a
+    path, a URL) can itself be wider than max_width with no space to
+    break on -- word-wrapping alone would leave it on one overflowing
+    line. Any such token is pre-split character by character into
+    max_width-sized chunks before the normal word-wrap pass runs, so
+    every token the word-wrap loop sees already fits on its own."""
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    def split_oversized_token(token: str) -> list[str]:
+        if stringWidth(token, font_name, font_size) <= max_width:
+            return [token]
+        chunks: list[str] = []
+        current_chunk = ""
+        for ch in token:
+            candidate = current_chunk + ch
+            if current_chunk and stringWidth(candidate, font_name, font_size) > max_width:
+                chunks.append(current_chunk)
+                current_chunk = ch
+            else:
+                current_chunk = candidate
+        if current_chunk:
+            chunks.append(current_chunk)
+        return chunks
+
+    tokens: list[str] = []
+    for word in text.split(" "):
+        tokens.extend(split_oversized_token(word))
+
+    lines: list[str] = []
+    current = ""
+    for token in tokens:
+        candidate = f"{current} {token}".strip()
+        if current and stringWidth(candidate, font_name, font_size) > max_width:
+            lines.append(current)
+            current = token
+        else:
+            current = candidate
+    lines.append(current)
+    return lines
+
+
+def _draw_wrapped(
+    c, x: float, y: float, text: str, font_name: str, font_size: float,
+    max_width: float, line_height: float, page_top_y: float, bottom_margin: float,
+) -> float:
+    """Draws `text` at (x, y), wrapping onto extra lines via _wrap_line and
+    starting a new page (continuing at page_top_y, same font) if a line
+    would land below bottom_margin. Returns the y position after the last
+    line drawn, so callers keep using this file's existing top-down,
+    y -= line_height layout."""
+    for line in _wrap_line(text, font_name, font_size, max_width):
+        if y < bottom_margin:
+            c.showPage()
+            c.setFont(font_name, font_size)
+            y = page_top_y
+        c.drawString(x, y, line)
+        y -= line_height
+    return y
+
+
 async def _build_summary(date: str, tz=None) -> dict:
     db = await get_db()
     day = _resolve_local_day(date, tz)
@@ -127,6 +195,12 @@ async def export_pdf(date: str = Query(default="today")):
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=letter)
     width, height = letter
+    margin = inch
+    max_width = width - 2 * margin
+    page_top_y = height - margin
+
+    def draw(y, text, font_name, font_size, line_height):
+        return _draw_wrapped(c, margin, y, text, font_name, font_size, max_width, line_height, page_top_y, margin)
 
     # period_start/period_end are UTC ISO; converting each back to local
     # time for display here (rather than storing a pre-formatted string in
@@ -138,54 +212,50 @@ async def export_pdf(date: str = Query(default="today")):
         f"Period: {period_start_local.strftime('%d %b %Y %H:%M')} to "
         f"{period_end_local.strftime('%d %b %Y %H:%M')} {period_start_local.strftime('%Z')}"
     )
+    generated_label = f"Generated: {_format_local(summary['generated_at'])}"
 
-    y = height - inch
+    y = page_top_y
     c.setFont("Helvetica-Bold", 16)
-    c.drawString(inch, y, "Vigil Audit Report")
-    y -= 0.3 * inch
+    y = draw(y, "Vigil Audit Report", "Helvetica-Bold", 16, 0.3 * inch)
 
     c.setFont("Helvetica", 10)
-    c.drawString(inch, y, f"{period_label}  Generated: {_format_local(summary['generated_at'])}")
-    y -= 0.3 * inch
-    c.drawString(inch, y, f"Events: {summary['event_count']}  Sessions: {len(summary['sessions'])}  Alerts: {len(summary['alerts'])}")
-    y -= 0.4 * inch
+    # Period and Generated each get their own line -- a long zone name
+    # (e.g. "India Standard Time" rather than "IST") combined with the
+    # Generated timestamp on one line was wide enough to run past the
+    # page margin.
+    y = draw(y, period_label, "Helvetica", 10, 0.2 * inch)
+    y = draw(y, generated_label, "Helvetica", 10, 0.3 * inch)
+    y = draw(
+        y,
+        f"Events: {summary['event_count']}  Sessions: {len(summary['sessions'])}  Alerts: {len(summary['alerts'])}",
+        "Helvetica", 10, 0.4 * inch,
+    )
 
     from core.evidence_chain import verify_chain
     # verify_chain() opens its own dedicated connection internally.
     chain_result = await verify_chain()
     chain_status = "VERIFIED INTACT" if chain_result["valid"] else f"INTEGRITY FAILURE: {chain_result['reason']}"
     c.setFont("Helvetica-Bold", 10)
-    c.drawString(inch, y, f"Evidence chain: {chain_status} ({chain_result['checked_count']} events checked)")
-    y -= 0.3 * inch
+    y = draw(
+        y, f"Evidence chain: {chain_status} ({chain_result['checked_count']} events checked)",
+        "Helvetica-Bold", 10, 0.3 * inch,
+    )
 
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(inch, y, "Sessions")
-    y -= 0.25 * inch
+    y = draw(y, "Sessions", "Helvetica-Bold", 12, 0.25 * inch)
     c.setFont("Helvetica", 9)
     for session in summary["sessions"]:
-        if y < inch:
-            c.showPage()
-            y = height - inch
-            c.setFont("Helvetica", 9)
         operator = f"{session.get('operator_username') or 'unknown'}@{session.get('operator_hostname') or 'unknown'}"
         line = f"{session['id'][:8]}  operator={operator}  started={_format_local(session['started_at'])}"
-        c.drawString(inch, y, line[:110])
-        y -= 0.2 * inch
+        y = draw(y, line, "Helvetica", 9, 0.2 * inch)
     y -= 0.2 * inch
 
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(inch, y, "Alerts")
-    y -= 0.25 * inch
+    y = draw(y, "Alerts", "Helvetica-Bold", 12, 0.25 * inch)
     c.setFont("Helvetica", 9)
-
     for alert in summary["alerts"]:
-        if y < inch:
-            c.showPage()
-            y = height - inch
-            c.setFont("Helvetica", 9)
         line = f"[{alert['severity'].upper()}] {alert['title']} (status={alert['status']})"
-        c.drawString(inch, y, line[:110])
-        y -= 0.2 * inch
+        y = draw(y, line, "Helvetica", 9, 0.2 * inch)
 
     c.save()
     buffer.seek(0)
