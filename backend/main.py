@@ -113,7 +113,7 @@ logging.basicConfig(
 logger = logging.getLogger("vlaw")
 logger.info("V-LAW backend starting. BASE_DIR=%s", BASE_DIR)
 
-VERSION = "0.2.0-beta"
+VERSION = "0.9.0"
 PORT = int(os.environ.get("VLAW_PORT", 7422))
 
 _state: dict = {}
@@ -713,6 +713,7 @@ async def get_stats():
     noise_reduction_ratio = round(meaningful_alerts_today / events_today, 4) if events_today else 0.0
 
     result = {
+        "version": VERSION,
         "active_agents": active_agents,
         "events_today": events_today,
         "events_yesterday": events_yesterday,

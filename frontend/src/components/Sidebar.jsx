@@ -17,7 +17,7 @@ function statusDotColor(agent) {
   return 'green'
 }
 
-export default function Sidebar({ view, onNavigate, needsReviewCount }) {
+export default function Sidebar({ view, onNavigate, needsReviewCount, version }) {
   const [agents, setAgents] = useState([])
 
   useEffect(() => {
@@ -89,7 +89,9 @@ export default function Sidebar({ view, onNavigate, needsReviewCount }) {
         </div>
       </div>
 
-      <div className="sidebar-version">v1.0.0</div>
+      {/* version is null until the backend has actually answered -- show
+          nothing rather than a hardcoded or stale number in the meantime. */}
+      {version && <div className="sidebar-version">v{version}</div>}
     </aside>
   )
 }

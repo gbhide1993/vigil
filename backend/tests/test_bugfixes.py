@@ -764,6 +764,150 @@ async def test_export_pdf_no_drawn_line_exceeds_printable_width(test_db):
     assert "suspicious activity detected in a path" in joined
 
 
+@pytest.mark.asyncio
+async def test_export_sessions_overlap_period_not_just_start_inside_it(test_db):
+    """A session that started before today and is still running (or only
+    just ended) this morning has real events inside today's report -- it
+    must be listed even though its own started_at isn't inside today's
+    window. A session that's fully before or fully after the period must
+    not appear. Uses tz=timezone.utc so "today" is deterministic
+    regardless of this machine's real timezone."""
+    import api.export as export_module
+
+    agent_name = _uniq("claude_code_overlaptest")
+    agent_id = await _make_agent(test_db, agent_name)
+
+    # Spans midnight: started well before today, still open.
+    spanning_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, ?, NULL)",
+        (spanning_id, agent_id, "2026-03-14 20:00:00"),
+    )
+    # Fully before the period: ended before today started.
+    before_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, ?, ?)",
+        (before_id, agent_id, "2026-03-13 10:00:00", "2026-03-13 11:00:00"),
+    )
+    # Fully after the period: starts tomorrow.
+    after_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, ?, ?)",
+        (after_id, agent_id, "2026-03-16 01:00:00", "2026-03-16 02:00:00"),
+    )
+    # Started inside the period (the ordinary case, must still work).
+    inside_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, ?, ?)",
+        (inside_id, agent_id, "2026-03-15 08:00:00", "2026-03-15 09:00:00"),
+    )
+    await test_db.commit()
+
+    summary = await export_module._build_summary("2026-03-15", tz=timezone.utc)
+    # Scoped to this test's own agent_id -- the shared test DB can carry
+    # sessions from other tests/runs, so asserting on the full returned
+    # list's size would be fragile to data this test never created.
+    my_sessions = [s for s in summary["sessions"] if s["agent_id"] == agent_id]
+    my_session_ids = {s["id"] for s in my_sessions}
+
+    assert spanning_id in my_session_ids, "a session spanning midnight into this period must be listed"
+    assert inside_id in my_session_ids, "a session that started inside the period must still be listed"
+    assert before_id not in my_session_ids, "a session fully before the period must not be listed"
+    assert after_id not in my_session_ids, "a session fully after the period must not be listed"
+
+    # the summary counts must match what's actually in the list, for this
+    # test's own agent: exactly the spanning and inside sessions.
+    assert my_session_ids == {spanning_id, inside_id}
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_marks_sessions_that_began_before_the_period(test_db):
+    """The spanning-midnight session's PDF line must show both started
+    and ended in local time and the "(began before this period)" marker;
+    a session that started inside the period must not get that marker."""
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    import api.export as export_module
+    from api.export import router as export_router
+
+    async def fake_build_summary(date, tz=None):
+        return {
+            "date": "2026-03-15",
+            "generated_at": "2026-03-15T12:00:00+00:00",
+            "period_start": "2026-03-15T00:00:00+00:00",
+            "period_end": "2026-03-16T00:00:00+00:00",
+            "timezone": "UTC",
+            "event_count": 0,
+            "sessions": [
+                {
+                    "id": "spanning-session-id",
+                    "started_at": "2026-03-14 20:00:00",
+                    "ended_at": None,
+                    "operator_username": "alice",
+                    "operator_hostname": "alice-pc",
+                },
+                {
+                    "id": "inside-session-id",
+                    "started_at": "2026-03-15 08:00:00",
+                    "ended_at": "2026-03-15 09:00:00",
+                    "operator_username": "bob",
+                    "operator_hostname": "bob-pc",
+                },
+            ],
+            "alerts": [],
+            "report_notes": export_module.REPORT_NOTES,
+        }
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    with patch.object(export_module, "_build_summary", fake_build_summary), \
+         patch.object(canvas.Canvas, "drawString", capture):
+        resp = client.get("/export/pdf")
+    assert resp.status_code == 200
+
+    # The marker phrase itself can be split across two wrapped sub-lines
+    # (confirmed: on this machine the long local zone name pushes
+    # "(began before" onto one line and "this period)" onto the next),
+    # so join everything drawn before checking for it as a phrase.
+    joined = " ".join(drawn)
+    assert joined.count("(began before this period)") == 1, (
+        "exactly the spanning session should get the marker, not the one that started inside"
+    )
+    assert "ended=ongoing" in joined
+
+
+@pytest.mark.asyncio
+async def test_export_json_includes_report_notes():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import api.export as export_module
+    from api.export import router as export_router
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    resp = client.get("/export/json")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["report_notes"] == export_module.REPORT_NOTES
+    assert len(data["report_notes"]) == 5
+
+
 # ------------------------------------------ 8. writer wedge-replace failure
 #
 # Covers the gap found during the 2026-09-30 soak test: _replace_wedged_

@@ -15,6 +15,9 @@ export default function App() {
   const [needsReviewCount, setNeedsReviewCount] = useState(0)
   const [hasSessions, setHasSessions] = useState(null)
   const [backendDown, setBackendDown] = useState(false)
+  // null until the backend has actually answered at least once -- Sidebar
+  // shows nothing rather than a hardcoded or stale value while this is null.
+  const [version, setVersion] = useState(null)
 
   useEffect(() => {
     let cancelled = false
@@ -38,6 +41,7 @@ export default function App() {
         // needs a human to look at it.
         if (!cancelled) {
           setNeedsReviewCount(data.needs_review)
+          setVersion(data.version)
           consecutiveFailures = 0
           setBackendDown(false)
         }
@@ -105,7 +109,7 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <Sidebar view={view} onNavigate={handleNavigate} needsReviewCount={needsReviewCount} />
+      <Sidebar view={view} onNavigate={handleNavigate} needsReviewCount={needsReviewCount} version={version} />
       <main className="main-content">
         {backendDown && <div className="backend-down-banner">Backend not responding</div>}
         {view === 'status' && <Status onNavigate={setView} />}

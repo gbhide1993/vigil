@@ -135,6 +135,18 @@ def _draw_wrapped(
     return y
 
 
+# Shown verbatim in the PDF's "How to read this report" section and as
+# report_notes in the JSON export -- one list, so the two outputs can
+# never say something different about the same report.
+REPORT_NOTES = [
+    "Times are shown in the local time zone of the machine that produced this report.",
+    "A session's start time is when Vigil first observed that agent in its current run. It can be later than when the agent actually started.",
+    "Most file events carry the time the activity happened. Events from the polling fallback are timed when Vigil recorded them, which can be 5 to 20 seconds later.",
+    "Events are counted by their own time. Sessions are listed if they overlap this period, so a session that began earlier can contribute events here.",
+    "Vigil records only while it is running. Periods when it was not running, for example when the computer was asleep, contain no records and are not yet marked in this report.",
+]
+
+
 async def _build_summary(date: str, tz=None) -> dict:
     db = await get_db()
     day = _resolve_local_day(date, tz)
@@ -144,8 +156,16 @@ async def _build_summary(date: str, tz=None) -> dict:
     start_sql = start_utc.strftime("%Y-%m-%d %H:%M:%S")
     end_sql = end_utc.strftime("%Y-%m-%d %H:%M:%S")
 
+    # Overlap, not "started inside this period": started_at < end (it
+    # began before the period closed) AND (still open, or it ended at or
+    # after the period opened). A session that started yesterday and is
+    # still running (or only just ended) this morning has real events in
+    # today's report -- excluding it from the Sessions list, as a plain
+    # started_at-in-range filter did, meant the report could count a
+    # session's events without ever listing that session.
     cur = await db.execute(
-        "SELECT * FROM sessions WHERE started_at >= ? AND started_at < ?", (start_sql, end_sql)
+        "SELECT * FROM sessions WHERE started_at < ? AND (ended_at IS NULL OR ended_at >= ?)",
+        (end_sql, start_sql),
     )
     sessions = [dict(r) for r in await cur.fetchall()]
 
@@ -176,6 +196,7 @@ async def _build_summary(date: str, tz=None) -> dict:
         "event_count": event_count,
         "sessions": sessions,
         "alerts": alerts,
+        "report_notes": REPORT_NOTES,
     }
 
 
@@ -241,12 +262,23 @@ async def export_pdf(date: str = Query(default="today")):
         "Helvetica-Bold", 10, 0.3 * inch,
     )
 
+    period_start_utc = datetime.fromisoformat(summary["period_start"])
+
     c.setFont("Helvetica-Bold", 12)
     y = draw(y, "Sessions", "Helvetica-Bold", 12, 0.25 * inch)
     c.setFont("Helvetica", 9)
     for session in summary["sessions"]:
         operator = f"{session.get('operator_username') or 'unknown'}@{session.get('operator_hostname') or 'unknown'}"
-        line = f"{session['id'][:8]}  operator={operator}  started={_format_local(session['started_at'])}"
+        ended_label = _format_local(session["ended_at"]) if session.get("ended_at") else "ongoing"
+        line = (
+            f"{session['id'][:8]}  operator={operator}  "
+            f"started={_format_local(session['started_at'])}  ended={ended_label}"
+        )
+        session_started_utc = datetime.fromisoformat(
+            session["started_at"].replace(" ", "T")
+        ).replace(tzinfo=timezone.utc)
+        if session_started_utc < period_start_utc:
+            line += "  (began before this period)"
         y = draw(y, line, "Helvetica", 9, 0.2 * inch)
     y -= 0.2 * inch
 
@@ -256,6 +288,13 @@ async def export_pdf(date: str = Query(default="today")):
     for alert in summary["alerts"]:
         line = f"[{alert['severity'].upper()}] {alert['title']} (status={alert['status']})"
         y = draw(y, line, "Helvetica", 9, 0.2 * inch)
+    y -= 0.2 * inch
+
+    c.setFont("Helvetica-Bold", 12)
+    y = draw(y, "How to read this report", "Helvetica-Bold", 12, 0.25 * inch)
+    c.setFont("Helvetica", 9)
+    for note in summary["report_notes"]:
+        y = draw(y, note, "Helvetica", 9, 0.2 * inch)
 
     c.save()
     buffer.seek(0)
