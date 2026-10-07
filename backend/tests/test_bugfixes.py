@@ -16,7 +16,7 @@ import asyncio
 import json
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
@@ -511,6 +511,160 @@ def test_export_format_local_converts_utc_to_local_with_offset():
 
     offset_result = _format_local("2026-01-01T22:30:00.123456+00:00")
     assert "2026" in offset_result
+
+
+def test_export_pdf_header_shows_period_not_the_word_today():
+    """export_pdf's header printed "Date: today" literally when called
+    with no date= param, because summary['date'] is the raw query string
+    ("today" by default), never resolved to an actual calendar date for
+    display. The header is now a "Period: <start> to <end> <zone>" line
+    built from the resolved local-day boundaries, never the literal word
+    "today". The PDF's text is inside a compressed content stream, so
+    this patches Canvas.drawString to capture exactly what was drawn
+    instead of trying to parse the PDF bytes."""
+    from datetime import datetime
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    with patch.object(canvas.Canvas, "drawString", capture):
+        resp = client.get("/export/pdf")
+    assert resp.status_code == 200
+
+    period_lines = [t for t in drawn if t.startswith("Period:")]
+    assert len(period_lines) == 1, f"expected exactly one 'Period:' line, got {period_lines!r}"
+    assert "today" not in period_lines[0], f"header still shows the literal word 'today': {period_lines[0]!r}"
+
+    today_local = datetime.now().astimezone().date()
+    assert today_local.strftime("%d %b %Y") in period_lines[0], (
+        f"expected today's real local date in {period_lines[0]!r}"
+    )
+
+    assert any(t == "Vigil Audit Report" for t in drawn)
+
+
+class _FixedDatetime(datetime):
+    """datetime.now(tz) frozen to a fixed real moment, for deterministic
+    local-day tests. Windows has no time.tzset() to actually change the
+    process's effective local timezone, so export.py's _resolve_local_day/
+    _local_day_bounds_utc take an explicit tz parameter instead -- this
+    class only needs to fix "now" itself, not fake a system timezone."""
+    _fixed = None
+
+    @classmethod
+    def now(cls, tz=None):
+        if tz is not None:
+            return cls._fixed.astimezone(tz)
+        return cls._fixed
+
+
+def test_resolve_local_day_ist_at_2am_reports_local_day_not_utc_day(monkeypatch):
+    """At 02:00 IST, UTC is still the previous calendar day (IST is
+    UTC+5:30, so IST midnight is 18:30 UTC the day before). "today" must
+    resolve to the LOCAL day (the one a person in that timezone is
+    actually living in), not whatever day it is in UTC at that instant."""
+    from zoneinfo import ZoneInfo
+
+    import api.export as export_module
+
+    ist = ZoneInfo("Asia/Kolkata")
+    fixed_now = datetime(2026, 10, 7, 2, 0, 0, tzinfo=ist)  # 2026-10-06 20:30 UTC
+    assert fixed_now.astimezone(timezone.utc).date() == date(2026, 10, 6), (
+        "sanity check: at this instant UTC's calendar date really is the day before IST's"
+    )
+
+    _FixedDatetime._fixed = fixed_now
+    monkeypatch.setattr(export_module, "datetime", _FixedDatetime)
+
+    day = export_module._resolve_local_day("today", tz=ist)
+    assert day == date(2026, 10, 7), "the IST calendar day, not UTC's 2026-10-06"
+
+    start_utc, end_utc = export_module._local_day_bounds_utc(day, tz=ist)
+    assert start_utc == datetime(2026, 10, 6, 18, 30, tzinfo=timezone.utc)
+    assert end_utc == datetime(2026, 10, 7, 18, 30, tzinfo=timezone.utc)
+
+
+def test_local_day_bounds_utc_handles_us_dst_transition_day():
+    """A day containing a DST transition is 23 or 25 real hours, not 24 --
+    _local_day_bounds_utc must compute the end boundary from the next
+    calendar DATE, not by adding a fixed 24-hour timedelta, or the period
+    would be off by an hour on exactly these days. Finds a real
+    transition day in America/New_York empirically (rather than hardcoding
+    one) so this doesn't silently stop testing anything if the date of a
+    future year's transition is ever assumed wrong."""
+    from zoneinfo import ZoneInfo
+
+    import api.export as export_module
+
+    ny = ZoneInfo("America/New_York")
+
+    def utc_offset_at_midnight(d):
+        return datetime(d.year, d.month, d.day, tzinfo=ny).utcoffset()
+
+    transition_day = None
+    d = date(2026, 1, 1)
+    for _ in range(366):
+        next_d = d + timedelta(days=1)
+        if utc_offset_at_midnight(d) != utc_offset_at_midnight(next_d):
+            transition_day = d
+            break
+        d = next_d
+    assert transition_day is not None, "could not find a DST transition day in 2026 for America/New_York"
+
+    start_utc, end_utc = export_module._local_day_bounds_utc(transition_day, tz=ny)
+    duration = end_utc - start_utc
+    assert duration != timedelta(hours=24), (
+        f"transition day {transition_day} must not be exactly 24 hours, got {duration}"
+    )
+    assert duration in (timedelta(hours=23), timedelta(hours=25)), (
+        f"expected a 23 or 25 hour day, got {duration}"
+    )
+
+
+def test_resolve_local_day_with_explicit_date_ignores_tz_and_now():
+    """An explicit date=YYYY-MM-DD is parsed directly regardless of
+    timezone or the current moment -- only the "today" sentinel needs
+    local-day resolution at all."""
+    from zoneinfo import ZoneInfo
+
+    import api.export as export_module
+
+    day = export_module._resolve_local_day("2026-03-15", tz=ZoneInfo("America/New_York"))
+    assert day == date(2026, 3, 15)
+
+
+def test_resolve_local_day_utc_unchanged(monkeypatch):
+    """A UTC-based machine (tz=timezone.utc, no DST ever) must behave
+    exactly as the original, pre-local-day-fix code did: "today" is
+    UTC's current date, and a day's bounds span exactly 24 hours."""
+    import api.export as export_module
+
+    fixed_now = datetime(2026, 6, 15, 10, 0, 0, tzinfo=timezone.utc)
+    _FixedDatetime._fixed = fixed_now
+    monkeypatch.setattr(export_module, "datetime", _FixedDatetime)
+
+    day = export_module._resolve_local_day("today", tz=timezone.utc)
+    assert day == date(2026, 6, 15)
+
+    start_utc, end_utc = export_module._local_day_bounds_utc(day, tz=timezone.utc)
+    assert start_utc == datetime(2026, 6, 15, 0, 0, tzinfo=timezone.utc)
+    assert end_utc == datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc)
+    assert end_utc - start_utc == timedelta(hours=24)
 
 
 # ------------------------------------------ 8. writer wedge-replace failure

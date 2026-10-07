@@ -8,7 +8,7 @@ const WATCH_ITEMS = [
 export default function WelcomeScreen() {
   return (
     <div className="welcome-screen">
-      <div className="welcome-brand">V-LAW</div>
+      <div className="welcome-brand">Vigil</div>
       <div className="welcome-headline">
         Vigil is now watching your AI agents. Start a Claude Code or Cursor session to see activity here.
       </div>

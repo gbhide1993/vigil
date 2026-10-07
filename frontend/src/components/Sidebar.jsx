@@ -48,7 +48,7 @@ export default function Sidebar({ view, onNavigate, needsReviewCount }) {
   return (
     <aside className="sidebar">
       <div className="sidebar-brand">
-        <div className="sidebar-brand-name">V-LAW</div>
+        <div className="sidebar-brand-name">Vigil</div>
         <div className="sidebar-brand-tagline">Local AI Watchdog</div>
       </div>
 

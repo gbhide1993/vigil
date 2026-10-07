@@ -98,11 +98,11 @@ export default function Status({ onNavigate }) {
       <div className="page-header">
         <div>
           <div className="page-title">Status</div>
-          <div className="page-subtitle">V-LAW is observing this machine</div>
+          <div className="page-subtitle">Vigil is observing this machine</div>
         </div>
       </div>
 
-      {error && <div className="empty-state">Could not reach V-LAW backend: {error}</div>}
+      {error && <div className="empty-state">Could not reach Vigil backend: {error}</div>}
 
       <div className="quiet-mode">
         <div className={`status-orb ${orbState}`} />

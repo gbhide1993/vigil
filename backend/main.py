@@ -455,7 +455,7 @@ async def _seal_evidence_chain() -> None:
     await seal_new_events()
 
 
-app = FastAPI(title="V-LAW", version=VERSION, lifespan=lifespan)
+app = FastAPI(title="Vigil", version=VERSION, lifespan=lifespan)
 
 # Allowed browser Origins for state-changing requests. http://localhost:7422
 # and http://127.0.0.1:7422 are the web UI served by this backend itself;

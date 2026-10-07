@@ -1,5 +1,5 @@
 import io
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -19,25 +19,65 @@ def _format_local(ts: str) -> str:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-def _date_bounds(date: str) -> tuple[str, str]:
+def _resolve_local_day(date: str, tz=None):
+    """The calendar date `date` ("today" or YYYY-MM-DD) refers to in this
+    machine's LOCAL timezone. "today" must mean today where this machine
+    physically is, not today in UTC -- those already disagree for part of
+    every day in any timezone ahead of UTC (e.g. just after local
+    midnight in IST, UTC is still "yesterday").
+
+    tz lets a test pin a specific zoneinfo-aware timezone instead of this
+    machine's real one. Windows has no equivalent of POSIX's
+    time.tzset() to change a process's effective local timezone for a
+    test, so this is the hook tests use instead; production code never
+    passes it, and the default behaves exactly as before."""
     if date == "today":
-        day = datetime.now(timezone.utc).date()
+        now = datetime.now(tz) if tz is not None else datetime.now().astimezone()
+        return now.date()
+    try:
+        return datetime.fromisoformat(date).date()
+    except ValueError:
+        raise HTTPException(400, "date must be 'today' or YYYY-MM-DD")
+
+
+def _local_day_bounds_utc(day, tz=None) -> tuple[datetime, datetime]:
+    """Local midnight at the start of `day` to local midnight at the start
+    of the next calendar day, each independently converted to UTC.
+
+    The next boundary is deliberately computed from the next calendar
+    DATE (day + timedelta(days=1), plain date arithmetic), not by adding
+    a 24-hour timedelta to the start datetime -- a fixed 24 hours lands
+    on the wrong wall-clock time on a DST-transition day, which has 23 or
+    25 real hours, not 24.
+
+    With tz=None (production), each midnight is built as a naive datetime
+    and converted to UTC separately: astimezone() on a naive datetime
+    treats it as system local time and resolves the correct UTC offset
+    for that specific calendar date, so a DST change inside the period
+    doesn't throw either boundary off. With an explicit zoneinfo-aware tz
+    (tests only), each midnight is built directly in that zone instead,
+    which is independently DST-correct per date the same way."""
+    next_day = day + timedelta(days=1)
+    if tz is not None:
+        start_local = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+        end_local = datetime.combine(next_day, datetime.min.time(), tzinfo=tz)
     else:
-        try:
-            day = datetime.fromisoformat(date).date()
-        except ValueError:
-            raise HTTPException(400, "date must be 'today' or YYYY-MM-DD")
-    start = f"{day.isoformat()} 00:00:00"
-    end = f"{day.isoformat()} 23:59:59"
-    return start, end
+        start_local = datetime.combine(day, datetime.min.time())
+        end_local = datetime.combine(next_day, datetime.min.time())
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
-async def _build_summary(date: str) -> dict:
+async def _build_summary(date: str, tz=None) -> dict:
     db = await get_db()
-    start, end = _date_bounds(date)
+    day = _resolve_local_day(date, tz)
+    start_utc, end_utc = _local_day_bounds_utc(day, tz)
+    # DB timestamps are naive UTC strings -- same format the rest of the
+    # codebase already queries against (see main.py's /api/stats).
+    start_sql = start_utc.strftime("%Y-%m-%d %H:%M:%S")
+    end_sql = end_utc.strftime("%Y-%m-%d %H:%M:%S")
 
     cur = await db.execute(
-        "SELECT * FROM sessions WHERE started_at BETWEEN ? AND ?", (start, end)
+        "SELECT * FROM sessions WHERE started_at >= ? AND started_at < ?", (start_sql, end_sql)
     )
     sessions = [dict(r) for r in await cur.fetchall()]
 
@@ -45,20 +85,26 @@ async def _build_summary(date: str) -> dict:
         """
         SELECT al.*, a.name as agent_name FROM alerts al
         LEFT JOIN agents a ON a.id = al.agent_id
-        WHERE al.created_at BETWEEN ? AND ?
+        WHERE al.created_at >= ? AND al.created_at < ?
         """,
-        (start, end),
+        (start_sql, end_sql),
     )
     alerts = [dict(r) for r in await cur.fetchall()]
 
     cur = await db.execute(
-        "SELECT COUNT(*) c FROM events WHERE created_at BETWEEN ? AND ?", (start, end)
+        "SELECT COUNT(*) c FROM events WHERE created_at >= ? AND created_at < ?", (start_sql, end_sql)
     )
     event_count = (await cur.fetchone())["c"]
 
     return {
-        "date": date,
+        # Always the resolved real calendar date, never the literal
+        # string "today" -- this is also what drives the download
+        # filenames below, so "today" never leaks into a saved file name.
+        "date": day.isoformat(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "period_start": start_utc.isoformat(),
+        "period_end": end_utc.isoformat(),
+        "timezone": start_utc.astimezone(tz).strftime("%Z") if tz is not None else start_utc.astimezone().strftime("%Z"),
         "event_count": event_count,
         "sessions": sessions,
         "alerts": alerts,
@@ -82,13 +128,24 @@ async def export_pdf(date: str = Query(default="today")):
     c = canvas.Canvas(buffer, pagesize=letter)
     width, height = letter
 
+    # period_start/period_end are UTC ISO; converting each back to local
+    # time for display here (rather than storing a pre-formatted string in
+    # the summary) keeps _build_summary's return value machine-readable
+    # for the JSON export and lets the PDF format it however it needs to.
+    period_start_local = datetime.fromisoformat(summary["period_start"]).astimezone()
+    period_end_local = datetime.fromisoformat(summary["period_end"]).astimezone()
+    period_label = (
+        f"Period: {period_start_local.strftime('%d %b %Y %H:%M')} to "
+        f"{period_end_local.strftime('%d %b %Y %H:%M')} {period_start_local.strftime('%Z')}"
+    )
+
     y = height - inch
     c.setFont("Helvetica-Bold", 16)
-    c.drawString(inch, y, "V-LAW Audit Report")
+    c.drawString(inch, y, "Vigil Audit Report")
     y -= 0.3 * inch
 
     c.setFont("Helvetica", 10)
-    c.drawString(inch, y, f"Date: {summary['date']}  Generated: {_format_local(summary['generated_at'])}")
+    c.drawString(inch, y, f"{period_label}  Generated: {_format_local(summary['generated_at'])}")
     y -= 0.3 * inch
     c.drawString(inch, y, f"Events: {summary['event_count']}  Sessions: {len(summary['sessions'])}  Alerts: {len(summary['alerts'])}")
     y -= 0.4 * inch
@@ -136,5 +193,5 @@ async def export_pdf(date: str = Query(default="today")):
     return StreamingResponse(
         buffer,
         media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=vlaw-report-{summary['date']}.pdf"},
+        headers={"Content-Disposition": f"attachment; filename=vigil-report-{summary['date']}.pdf"},
     )

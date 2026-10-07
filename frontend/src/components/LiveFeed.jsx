@@ -66,7 +66,7 @@ function WelcomeState() {
       <div className="panel-body" style={{ padding: '56px 24px', textAlign: 'center' }}>
         <div style={{ fontSize: 32, fontWeight: 700, color: 'var(--color-teal)', marginBottom: 12 }}>V</div>
         <div style={{ fontSize: 18, fontWeight: 600, color: 'var(--color-navy)', marginBottom: 16 }}>
-          V-LAW is active and watching.
+          Vigil is active and watching.
         </div>
         <div style={{ fontSize: 13, color: 'var(--color-navy-muted)', marginBottom: 24 }}>
           Start your AI agent (Claude Code, Cursor, or Copilot)
@@ -103,7 +103,7 @@ function FirstSessionCard({ session, topFinding, onDismiss }) {
     borderColor = 'var(--color-amber)'
     text = `First session complete. ${session.agent_name} accessed ${session.file_reads + session.file_writes} files. ${session.alert_count} alert${session.alert_count !== 1 ? 's' : ''} raised.`
   } else {
-    text = `First session complete. ${session.agent_name} ran clean — no alerts, ${session.file_reads + session.file_writes} files accessed. V-LAW is working.`
+    text = `First session complete. ${session.agent_name} ran clean — no alerts, ${session.file_reads + session.file_writes} files accessed. Vigil is working.`
   }
 
   return (
@@ -314,7 +314,7 @@ export default function LiveFeed() {
         </div>
       </div>
 
-      {error && <div className="empty-state">Could not reach V-LAW backend: {error}</div>}
+      {error && <div className="empty-state">Could not reach Vigil backend: {error}</div>}
 
       {firstSessionCard && (
         <FirstSessionCard

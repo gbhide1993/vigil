@@ -86,7 +86,15 @@ export default function Export() {
         <div className="export-card">
           <h3>SIEM JSON</h3>
           <p>Structured session and alert data for ingestion into your SIEM or log pipeline.</p>
-          <a className="btn primary" href={api.exportJsonUrl(date)} download={`vlaw-export-${date}.json`}>
+          {/* preview.date is the backend-resolved real calendar date (never the
+              literal string "today"), once the fetch for the current date input
+              has completed. Falls back to the raw date input only for the brief
+              window before that first fetch resolves. */}
+          <a
+            className="btn primary"
+            href={api.exportJsonUrl(date)}
+            download={`vigil-export-${preview ? preview.date : date}.json`}
+          >
             Download JSON
           </a>
         </div>
