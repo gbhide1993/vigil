@@ -12,11 +12,26 @@ router = APIRouter()
 def _format_local(ts: str) -> str:
     """Parse a stored UTC timestamp (naive 'YYYY-MM-DD HH:MM:SS' or an
     isoformat string with an explicit offset) and format it in the
-    system's local timezone, labelled with the local zone name/offset."""
+    system's local timezone. No zone name/offset suffix here -- the
+    Period line at the top of the report states the offset once (see
+    _utc_offset_label); repeating a long zone name on every single time
+    in the report added width for no new information."""
     dt = datetime.fromisoformat(ts.replace(" ", "T"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _utc_offset_label(dt: datetime) -> str:
+    """"UTC+05:30" / "UTC-04:00" style label for an aware datetime's
+    local UTC offset, used once on the Period line instead of a long
+    zone name repeated on every time in the report."""
+    offset = dt.utcoffset() or timedelta(0)
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    total_minutes = abs(total_minutes)
+    hours, minutes = divmod(total_minutes, 60)
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"
 
 
 def _resolve_local_day(date: str, tz=None):
@@ -163,16 +178,18 @@ def _sql_ts(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _format_duration_hm(seconds: float) -> str:
-    total_minutes = int(seconds // 60)
-    hours, minutes = divmod(total_minutes, 60)
-    return f"{hours}h {minutes}m"
-
-
-def _format_duration_ms(seconds: float) -> str:
+def _format_duration(seconds: float) -> str:
+    """"Xh Ym" for an hour or more, "Xm Ys" under an hour -- "0h 5m" for a
+    five-minute gap loses the only precision that distinguishes it from
+    a near-instant one, so anything under an hour shows seconds instead
+    of a second hour-scale unit that would always read 0."""
     total_seconds = int(seconds)
-    minutes, secs = divmod(total_seconds, 60)
-    return f"{minutes}m {secs}s"
+    if total_seconds < 3600:
+        minutes, secs = divmod(total_seconds, 60)
+        return f"{minutes}m {secs}s"
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes = remainder // 60
+    return f"{hours}h {minutes}m"
 
 
 async def _compute_coverage(
@@ -264,10 +281,38 @@ async def _build_summary(date: str, tz=None) -> dict:
     # started_at-in-range filter did, meant the report could count a
     # session's events without ever listing that session.
     cur = await db.execute(
-        "SELECT * FROM sessions WHERE started_at < ? AND (ended_at IS NULL OR ended_at >= ?)",
+        """
+        SELECT s.*, a.name as agent_name FROM sessions s
+        LEFT JOIN agents a ON a.id = s.agent_id
+        WHERE s.started_at < ? AND (s.ended_at IS NULL OR s.ended_at >= ?)
+        """,
         (end_sql, start_sql),
     )
     sessions = [dict(r) for r in await cur.fetchall()]
+
+    # One aggregated pass over events, not one COUNT(*) per session --
+    # same reasoning as every other per-row count in this codebase
+    # (see e.g. api/sessions.py's net_connect_count). Scoped to this
+    # period's events only, matching what each session line displays.
+    cur = await db.execute(
+        "SELECT session_id, COUNT(*) c FROM events WHERE created_at >= ? AND created_at < ? GROUP BY session_id",
+        (start_sql, end_sql),
+    )
+    event_counts_by_session = {row["session_id"]: row["c"] for row in await cur.fetchall()}
+    for session in sessions:
+        session["event_count_in_period"] = event_counts_by_session.get(session["id"], 0)
+        # A session whose started_at/ended_at are identical and which
+        # contributed no events this period is the artifact a restart
+        # produces (see the duplicate-session investigation): opened and
+        # immediately closed with nothing ever having happened in it.
+        # Listing dozens of these individually buries the sessions that
+        # actually did something, so they're folded into one count
+        # instead -- the JSON keeps every row (no_activity marks which).
+        session["no_activity"] = (
+            session["ended_at"] is not None
+            and session["started_at"] == session["ended_at"]
+            and session["event_count_in_period"] == 0
+        )
 
     cur = await db.execute(
         """
@@ -335,7 +380,7 @@ async def export_pdf(date: str = Query(default="today")):
     period_end_local = datetime.fromisoformat(summary["period_end"]).astimezone()
     period_label = (
         f"Period: {period_start_local.strftime('%d %b %Y %H:%M')} to "
-        f"{period_end_local.strftime('%d %b %Y %H:%M')} {period_start_local.strftime('%Z')}"
+        f"{period_end_local.strftime('%d %b %Y %H:%M')} ({_utc_offset_label(period_start_local)})"
     )
     generated_label = f"Generated: {_format_local(summary['generated_at'])}"
 
@@ -344,15 +389,20 @@ async def export_pdf(date: str = Query(default="today")):
     y = draw(y, "Vigil Audit Report", "Helvetica-Bold", 16, 0.3 * inch)
 
     c.setFont("Helvetica", 10)
-    # Period and Generated each get their own line -- a long zone name
-    # (e.g. "India Standard Time" rather than "IST") combined with the
-    # Generated timestamp on one line was wide enough to run past the
-    # page margin.
+    # Period and Generated each get their own line -- combining them was
+    # wide enough to run past the page margin even before the offset
+    # label was added.
     y = draw(y, period_label, "Helvetica", 10, 0.2 * inch)
     y = draw(y, generated_label, "Helvetica", 10, 0.3 * inch)
+
+    active_sessions = [s for s in summary["sessions"] if not s["no_activity"]]
+    no_activity_sessions = [s for s in summary["sessions"] if s["no_activity"]]
+    sessions_summary = f"Sessions: {len(active_sessions)}"
+    if no_activity_sessions:
+        sessions_summary += f" (+{len(no_activity_sessions)} with no recorded activity)"
     y = draw(
         y,
-        f"Events: {summary['event_count']}  Sessions: {len(summary['sessions'])}  Alerts: {len(summary['alerts'])}",
+        f"Events: {summary['event_count']}  {sessions_summary}  Alerts: {len(summary['alerts'])}",
         "Helvetica", 10, 0.4 * inch,
     )
 
@@ -371,12 +421,14 @@ async def export_pdf(date: str = Query(default="today")):
     c.setFont("Helvetica-Bold", 12)
     y = draw(y, "Sessions", "Helvetica-Bold", 12, 0.25 * inch)
     c.setFont("Helvetica", 9)
-    for session in summary["sessions"]:
+    for session in active_sessions:
         operator = f"{session.get('operator_username') or 'unknown'}@{session.get('operator_hostname') or 'unknown'}"
         ended_label = _format_local(session["ended_at"]) if session.get("ended_at") else "ongoing"
+        agent_name = session.get("agent_name") or "unidentified_agent"
         line = (
-            f"{session['id'][:8]}  operator={operator}  "
-            f"started={_format_local(session['started_at'])}  ended={ended_label}"
+            f"{session['id'][:8]}  agent={agent_name}  operator={operator}  "
+            f"started={_format_local(session['started_at'])}  ended={ended_label}  "
+            f"events={session['event_count_in_period']}"
         )
         session_started_utc = datetime.fromisoformat(
             session["started_at"].replace(" ", "T")
@@ -384,25 +436,38 @@ async def export_pdf(date: str = Query(default="today")):
         if session_started_utc < period_start_utc:
             line += "  (began before this period)"
         y = draw(y, line, "Helvetica", 9, 0.2 * inch)
+    if no_activity_sessions:
+        plural = "s" if len(no_activity_sessions) != 1 else ""
+        y = draw(
+            y, f"{len(no_activity_sessions)} session{plural} with no recorded activity",
+            "Helvetica", 9, 0.2 * inch,
+        )
     y -= 0.2 * inch
 
     c.setFont("Helvetica-Bold", 12)
     y = draw(y, "Alerts", "Helvetica-Bold", 12, 0.25 * inch)
     c.setFont("Helvetica", 9)
     for alert in summary["alerts"]:
-        line = f"[{alert['severity'].upper()}] {alert['title']} (status={alert['status']})"
+        prefix = _format_local(alert["created_at"])
+        if alert.get("session_id"):
+            prefix += f"  session={alert['session_id'][:8]}"
+        line = f"{prefix}  [{alert['severity'].upper()}] {alert['title']} (status={alert['status']})"
         y = draw(y, line, "Helvetica", 9, 0.2 * inch)
     y -= 0.2 * inch
 
     c.setFont("Helvetica-Bold", 12)
     y = draw(y, "Monitoring coverage", "Helvetica-Bold", 12, 0.25 * inch)
     c.setFont("Helvetica", 9)
+    # %H:%M:%S here, not %H:%M -- the stored value already has whole-
+    # second precision (no sub-second rounding happens anywhere in this
+    # display), so showing seconds exactly is what keeps this time from
+    # ever reading as earlier than the real tracking start.
     if not summary["coverage_available"]:
         if summary["tracking_started_at"] is not None:
             tracking_started_local = datetime.fromisoformat(summary["tracking_started_at"]).astimezone()
             y = draw(
                 y,
-                f"Coverage was not recorded before {tracking_started_local.strftime('%d %b %Y %H:%M')} "
+                f"Coverage was not recorded before {tracking_started_local.strftime('%d %b %Y %H:%M:%S')} "
                 "(local); this entire report period is before that.",
                 "Helvetica", 9, 0.2 * inch,
             )
@@ -414,8 +479,8 @@ async def export_pdf(date: str = Query(default="today")):
         percent = (active_seconds / period_seconds_measured * 100) if period_seconds_measured > 0 else 0.0
         y = draw(
             y,
-            f"Vigil active: {_format_duration_hm(active_seconds)} of "
-            f"{_format_duration_hm(period_seconds_measured)} ({percent:.1f}%)",
+            f"Vigil active: {_format_duration(active_seconds)} of "
+            f"{_format_duration(period_seconds_measured)} ({percent:.1f}%)",
             "Helvetica", 9, 0.2 * inch,
         )
 
@@ -424,7 +489,7 @@ async def export_pdf(date: str = Query(default="today")):
             tracking_started_local = tracking_started_at_utc.astimezone()
             y = draw(
                 y,
-                f"Coverage was not recorded before {tracking_started_local.strftime('%d %b %Y %H:%M')} (local).",
+                f"Coverage was not recorded before {tracking_started_local.strftime('%d %b %Y %H:%M:%S')} (local).",
                 "Helvetica", 9, 0.2 * inch,
             )
 
@@ -432,8 +497,9 @@ async def export_pdf(date: str = Query(default="today")):
             gap_start_local = datetime.fromisoformat(gap["start"]).astimezone()
             gap_end_local = datetime.fromisoformat(gap["end"]).astimezone()
             line = (
-                f"{gap_start_local.strftime('%d %b %Y %H:%M')} to {gap_end_local.strftime('%d %b %Y %H:%M')} "
-                f"({_format_duration_hm(gap['duration_seconds'])}) - {gap['reason']}"
+                f"{gap_start_local.strftime('%d %b %Y %H:%M:%S')} to "
+                f"{gap_end_local.strftime('%d %b %Y %H:%M:%S')} "
+                f"({_format_duration(gap['duration_seconds'])}) - {gap['reason']}"
             )
             y = draw(y, line, "Helvetica", 9, 0.2 * inch)
 
@@ -442,7 +508,7 @@ async def export_pdf(date: str = Query(default="today")):
             y = draw(
                 y,
                 f"{summary['short_gap_count']} short restart{plural}, "
-                f"total {_format_duration_ms(summary['short_gap_seconds'])}",
+                f"total {_format_duration(summary['short_gap_seconds'])}",
                 "Helvetica", 9, 0.2 * inch,
             )
     y -= 0.2 * inch

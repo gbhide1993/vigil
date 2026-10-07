@@ -764,6 +764,149 @@ async def test_export_pdf_no_drawn_line_exceeds_printable_width(test_db):
     assert "suspicious activity detected in a path" in joined
 
 
+def test_format_duration_under_and_over_an_hour():
+    from api.export import _format_duration
+
+    assert _format_duration(45) == "0m 45s"
+    assert _format_duration(125) == "2m 5s"
+    assert _format_duration(3599) == "59m 59s"
+    assert _format_duration(3600) == "1h 0m"
+    assert _format_duration(80164) == "22h 16m"
+
+
+def test_utc_offset_label_formats_positive_and_negative():
+    from api.export import _utc_offset_label
+
+    ist = datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    assert _utc_offset_label(ist) == "UTC+05:30"
+
+    behind = datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=-4)))
+    assert _utc_offset_label(behind) == "UTC-04:00"
+
+    utc = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert _utc_offset_label(utc) == "UTC+00:00"
+
+
+@pytest.mark.asyncio
+async def test_export_folds_no_activity_sessions_pdf_and_json(test_db):
+    """A session with started_at == ended_at and zero events this period
+    is folded into one count line in the PDF and the summary line, but
+    the JSON keeps every session with a no_activity flag on it. A normal
+    session with real activity is listed individually with its agent
+    name and period event count."""
+    import re
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    agent_name = _uniq("claude_code_noactivitytest")
+    agent_id = await _make_agent(test_db, agent_name)
+
+    real_session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (real_session_id, agent_id),
+    )
+    await test_db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path) VALUES (?, ?, 'file_write', '/tmp/x.py')",
+        (agent_id, real_session_id),
+    )
+
+    empty_session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (empty_session_id, agent_id),
+    )
+    await test_db.commit()
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    json_resp = client.get("/export/json")
+    assert json_resp.status_code == 200
+    by_id = {s["id"]: s for s in json_resp.json()["sessions"]}
+    assert by_id[real_session_id]["no_activity"] is False
+    assert by_id[real_session_id]["event_count_in_period"] == 1
+    assert by_id[real_session_id]["agent_name"] == agent_name
+    assert by_id[empty_session_id]["no_activity"] is True
+    assert by_id[empty_session_id]["event_count_in_period"] == 0
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    with patch.object(canvas.Canvas, "drawString", capture):
+        pdf_resp = client.get("/export/pdf")
+    assert pdf_resp.status_code == 200
+
+    joined = " ".join(drawn)
+    # Counts are checked as "at least this test's own contribution", not
+    # an exact match -- another test earlier in the same shared DB can
+    # leave its own no-activity session behind (started_at == ended_at,
+    # no events), which would otherwise make an exact count fragile to
+    # execution order.
+    fold_match = re.search(r"(\d+) sessions? with no recorded activity", joined)
+    assert fold_match is not None and int(fold_match.group(1)) >= 1
+    summary_match = re.search(r"\(\+(\d+) with no recorded activity\)", joined)
+    assert summary_match is not None and int(summary_match.group(1)) >= 1
+    assert f"agent={agent_name}" in joined
+    assert "events=1" in joined
+    # the empty session's own id must never appear as an individually
+    # listed line
+    assert empty_session_id[:8] not in joined
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_alert_line_prefixed_with_time_and_session(test_db):
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    agent_name = _uniq("claude_code_alertprefixtest")
+    agent_id = await _make_agent(test_db, agent_name)
+    session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO alerts (agent_id, severity, title, description, status, rule_type, session_id) "
+        "VALUES (?, 'critical', 'prefix test alert', 'd', 'open', 'policy', ?)",
+        (agent_id, session_id),
+    )
+    await test_db.commit()
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    with patch.object(canvas.Canvas, "drawString", capture):
+        resp = client.get("/export/pdf")
+    assert resp.status_code == 200
+
+    alert_lines = [t for t in drawn if "prefix test alert" in t]
+    assert len(alert_lines) == 1
+    line = alert_lines[0]
+    assert f"session={session_id[:8]}" in line
+    # starts with a local timestamp, e.g. "2026-10-07 18:35:11"
+    assert line[:4].isdigit()
+
+
 @pytest.mark.asyncio
 async def test_export_sessions_overlap_period_not_just_start_inside_it(test_db):
     """A session that started before today and is still running (or only
@@ -849,6 +992,9 @@ async def test_export_pdf_marks_sessions_that_began_before_the_period(test_db):
                     "ended_at": None,
                     "operator_username": "alice",
                     "operator_hostname": "alice-pc",
+                    "agent_name": "claude_code",
+                    "event_count_in_period": 3,
+                    "no_activity": False,
                 },
                 {
                     "id": "inside-session-id",
@@ -856,6 +1002,9 @@ async def test_export_pdf_marks_sessions_that_began_before_the_period(test_db):
                     "ended_at": "2026-03-15 09:00:00",
                     "operator_username": "bob",
                     "operator_hostname": "bob-pc",
+                    "agent_name": "codex",
+                    "event_count_in_period": 1,
+                    "no_activity": False,
                 },
             ],
             "alerts": [],
