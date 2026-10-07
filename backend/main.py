@@ -265,6 +265,13 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("database initialized")
 
+    # As early as possible after the schema exists, so the recorded
+    # started_at isn't delayed by license checks, crash recovery replay,
+    # etc. below -- that delay would otherwise show up as a few extra
+    # seconds of "Vigil was not running" in the next export.
+    from core.monitoring_coverage import start_run as _start_coverage_run
+    await _start_coverage_run()
+
     # 2. Policy
     _ensure_default_policy()
     policy = load_policy()
@@ -378,6 +385,12 @@ async def lifespan(app: FastAPI):
     # landing on the event loop together and visibly delaying unrelated
     # requests (e.g. /health) for several seconds. A 10s gap spreads that
     # load across the cycle instead of bursting it.
+    # core/monitoring_coverage.py's heartbeat rides on this specific job's
+    # 30s interval (see record_coverage_tick(), called from
+    # ProcessWatcher.poll() itself) rather than a scheduler job of its
+    # own. If this job is ever disabled the way network_watcher/
+    # mcp_watcher below already have been, Monitoring coverage in the
+    # export silently stops advancing along with it.
     _now = datetime.now(scheduler.timezone)
     scheduler.add_job(
         process_watcher.poll, "interval", seconds=30, id="process_watcher",
@@ -426,6 +439,8 @@ async def lifespan(app: FastAPI):
     observer.stop()
     observer.join(timeout=5)
     await aggregator.stop_writer()
+    from core.monitoring_coverage import mark_clean_shutdown as _mark_coverage_clean_shutdown
+    await _mark_coverage_clean_shutdown()
     await close_db()
     try:
         _lock_file.close()

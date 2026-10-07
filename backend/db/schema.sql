@@ -154,6 +154,36 @@ CREATE TABLE IF NOT EXISTS app_config (
     updated_at TEXT DEFAULT (datetime('now'))
 );
 
+-- One row per backend process lifetime. last_seen_at is advanced every
+-- ~30s by a scheduler tick (see core/monitoring_coverage.py); a gap
+-- between ticks, or between one run's last_seen_at and the next run's
+-- started_at, is what Monitoring coverage in the export is built from.
+CREATE TABLE IF NOT EXISTS vigil_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT UNIQUE NOT NULL,
+    started_at TIMESTAMP NOT NULL,
+    last_seen_at TIMESTAMP NOT NULL,
+    clean_shutdown INTEGER DEFAULT 0  -- informational only, never used to
+                                      -- choose gap reason wording -- the
+                                      -- tray force-kills the backend on a
+                                      -- normal quit, so this is 0 even
+                                      -- for an entirely ordinary shutdown
+);
+CREATE INDEX IF NOT EXISTS idx_vigil_runs_started ON vigil_runs(started_at);
+
+-- Append-only. Every detected gap is stored, including very short
+-- restarts -- folding short ones into a summary line is a display
+-- decision made at export time, not a storage decision made here.
+CREATE TABLE IF NOT EXISTS monitoring_gaps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    gap_start TIMESTAMP NOT NULL,
+    gap_end TIMESTAMP NOT NULL,
+    reason TEXT NOT NULL,
+    detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_monitoring_gaps_start ON monitoring_gaps(gap_start);
+
 CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_id);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);

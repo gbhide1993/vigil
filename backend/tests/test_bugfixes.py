@@ -860,6 +860,13 @@ async def test_export_pdf_marks_sessions_that_began_before_the_period(test_db):
             ],
             "alerts": [],
             "report_notes": export_module.REPORT_NOTES,
+            "coverage_available": False,
+            "tracking_started_at": None,
+            "active_seconds": 0,
+            "period_seconds_measured": 0,
+            "gaps": [],
+            "short_gap_count": 0,
+            "short_gap_seconds": 0,
         }
 
     app = FastAPI()

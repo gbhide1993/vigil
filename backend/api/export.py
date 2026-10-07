@@ -143,8 +143,108 @@ REPORT_NOTES = [
     "A session's start time is when Vigil first observed that agent in its current run. It can be later than when the agent actually started.",
     "Most file events carry the time the activity happened. Events from the polling fallback are timed when Vigil recorded them, which can be 5 to 20 seconds later.",
     "Events are counted by their own time. Sessions are listed if they overlap this period, so a session that began earlier can contribute events here.",
-    "Vigil records only while it is running. Periods when it was not running, for example when the computer was asleep, contain no records and are not yet marked in this report.",
+    "Vigil records only while it is running. Periods when it was not running, for example when the computer was asleep, are listed under Monitoring coverage in this report.",
 ]
+
+# A gap at or above this duration is listed individually in the
+# "Monitoring coverage" section; anything shorter (a quick restart, a
+# rebuild-and-relaunch) is folded into one summary line instead, so a
+# machine that restarted several times in a day doesn't get a report
+# dominated by near-instant gaps. This is a display decision only --
+# core/monitoring_coverage.py stores every gap regardless of duration.
+SHORT_GAP_DISPLAY_THRESHOLD_SECONDS = 60
+
+
+def _parse_utc(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace(" ", "T")).replace(tzinfo=timezone.utc)
+
+
+def _sql_ts(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_duration_hm(seconds: float) -> str:
+    total_minutes = int(seconds // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def _format_duration_ms(seconds: float) -> str:
+    total_seconds = int(seconds)
+    minutes, secs = divmod(total_seconds, 60)
+    return f"{minutes}m {secs}s"
+
+
+async def _compute_coverage(
+    db, period_start_utc: datetime, period_end_utc: datetime, generated_at_utc: datetime,
+) -> dict:
+    """How much of this report's period Vigil was actually running, and
+    every gap inside the measured span. The measured span is clipped on
+    both ends: it never extends past "now" (generated_at) -- a report
+    generated mid-day can't measure time that hasn't happened yet -- and
+    it never starts before the earliest vigil_runs.started_at ever
+    recorded, since there is no coverage data at all before coverage
+    tracking itself began. coverage_available=False means nothing in
+    this period is measurable at all (no run has ever been recorded, or
+    every run started at or after the point we're measuring up to)."""
+    measured_end = min(period_end_utc, generated_at_utc)
+
+    cur = await db.execute("SELECT MIN(started_at) m FROM vigil_runs")
+    row = await cur.fetchone()
+    tracking_started_at = _parse_utc(row["m"]) if row and row["m"] else None
+
+    if tracking_started_at is None or tracking_started_at >= measured_end:
+        return {
+            "coverage_available": False,
+            "tracking_started_at": tracking_started_at.isoformat() if tracking_started_at else None,
+            "active_seconds": 0,
+            "period_seconds_measured": 0,
+            "gaps": [],
+            "short_gap_count": 0,
+            "short_gap_seconds": 0,
+        }
+
+    measured_start = max(period_start_utc, tracking_started_at)
+    period_seconds_measured = max(0.0, (measured_end - measured_start).total_seconds())
+
+    cur = await db.execute(
+        "SELECT gap_start, gap_end, reason FROM monitoring_gaps "
+        "WHERE gap_start < ? AND gap_end > ? ORDER BY gap_start ASC",
+        (_sql_ts(measured_end), _sql_ts(measured_start)),
+    )
+    rows = await cur.fetchall()
+
+    gaps = []
+    short_gap_count = 0
+    short_gap_seconds = 0.0
+    gap_seconds_total = 0.0
+    for gap_row in rows:
+        g_start = max(_parse_utc(gap_row["gap_start"]), measured_start)
+        g_end = min(_parse_utc(gap_row["gap_end"]), measured_end)
+        duration = (g_end - g_start).total_seconds()
+        if duration <= 0:
+            continue
+        gap_seconds_total += duration
+        if duration >= SHORT_GAP_DISPLAY_THRESHOLD_SECONDS:
+            gaps.append({
+                "start": g_start.isoformat(), "end": g_end.isoformat(),
+                "duration_seconds": duration, "reason": gap_row["reason"],
+            })
+        else:
+            short_gap_count += 1
+            short_gap_seconds += duration
+
+    active_seconds = max(0.0, period_seconds_measured - gap_seconds_total)
+
+    return {
+        "coverage_available": True,
+        "tracking_started_at": tracking_started_at.isoformat(),
+        "active_seconds": active_seconds,
+        "period_seconds_measured": period_seconds_measured,
+        "gaps": gaps,
+        "short_gap_count": short_gap_count,
+        "short_gap_seconds": short_gap_seconds,
+    }
 
 
 async def _build_summary(date: str, tz=None) -> dict:
@@ -184,12 +284,15 @@ async def _build_summary(date: str, tz=None) -> dict:
     )
     event_count = (await cur.fetchone())["c"]
 
+    generated_at_utc = datetime.now(timezone.utc)
+    coverage = await _compute_coverage(db, start_utc, end_utc, generated_at_utc)
+
     return {
         # Always the resolved real calendar date, never the literal
         # string "today" -- this is also what drives the download
         # filenames below, so "today" never leaks into a saved file name.
         "date": day.isoformat(),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": generated_at_utc.isoformat(),
         "period_start": start_utc.isoformat(),
         "period_end": end_utc.isoformat(),
         "timezone": start_utc.astimezone(tz).strftime("%Z") if tz is not None else start_utc.astimezone().strftime("%Z"),
@@ -197,6 +300,7 @@ async def _build_summary(date: str, tz=None) -> dict:
         "sessions": sessions,
         "alerts": alerts,
         "report_notes": REPORT_NOTES,
+        **coverage,
     }
 
 
@@ -288,6 +392,59 @@ async def export_pdf(date: str = Query(default="today")):
     for alert in summary["alerts"]:
         line = f"[{alert['severity'].upper()}] {alert['title']} (status={alert['status']})"
         y = draw(y, line, "Helvetica", 9, 0.2 * inch)
+    y -= 0.2 * inch
+
+    c.setFont("Helvetica-Bold", 12)
+    y = draw(y, "Monitoring coverage", "Helvetica-Bold", 12, 0.25 * inch)
+    c.setFont("Helvetica", 9)
+    if not summary["coverage_available"]:
+        if summary["tracking_started_at"] is not None:
+            tracking_started_local = datetime.fromisoformat(summary["tracking_started_at"]).astimezone()
+            y = draw(
+                y,
+                f"Coverage was not recorded before {tracking_started_local.strftime('%d %b %Y %H:%M')} "
+                "(local); this entire report period is before that.",
+                "Helvetica", 9, 0.2 * inch,
+            )
+        else:
+            y = draw(y, "Coverage was not recorded for any part of this period.", "Helvetica", 9, 0.2 * inch)
+    else:
+        active_seconds = summary["active_seconds"]
+        period_seconds_measured = summary["period_seconds_measured"]
+        percent = (active_seconds / period_seconds_measured * 100) if period_seconds_measured > 0 else 0.0
+        y = draw(
+            y,
+            f"Vigil active: {_format_duration_hm(active_seconds)} of "
+            f"{_format_duration_hm(period_seconds_measured)} ({percent:.1f}%)",
+            "Helvetica", 9, 0.2 * inch,
+        )
+
+        tracking_started_at_utc = datetime.fromisoformat(summary["tracking_started_at"])
+        if tracking_started_at_utc > period_start_utc:
+            tracking_started_local = tracking_started_at_utc.astimezone()
+            y = draw(
+                y,
+                f"Coverage was not recorded before {tracking_started_local.strftime('%d %b %Y %H:%M')} (local).",
+                "Helvetica", 9, 0.2 * inch,
+            )
+
+        for gap in summary["gaps"]:
+            gap_start_local = datetime.fromisoformat(gap["start"]).astimezone()
+            gap_end_local = datetime.fromisoformat(gap["end"]).astimezone()
+            line = (
+                f"{gap_start_local.strftime('%d %b %Y %H:%M')} to {gap_end_local.strftime('%d %b %Y %H:%M')} "
+                f"({_format_duration_hm(gap['duration_seconds'])}) - {gap['reason']}"
+            )
+            y = draw(y, line, "Helvetica", 9, 0.2 * inch)
+
+        if summary["short_gap_count"] > 0:
+            plural = "s" if summary["short_gap_count"] != 1 else ""
+            y = draw(
+                y,
+                f"{summary['short_gap_count']} short restart{plural}, "
+                f"total {_format_duration_ms(summary['short_gap_seconds'])}",
+                "Helvetica", 9, 0.2 * inch,
+            )
     y -= 0.2 * inch
 
     c.setFont("Helvetica-Bold", 12)

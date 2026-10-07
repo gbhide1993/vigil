@@ -200,6 +200,14 @@ class ProcessWatcher:
         now pure Python dict access over that subprocess's results; only DB
         writes and alert firing (already async) stay on the loop.
 
+        Also the heartbeat for core/monitoring_coverage.py's Monitoring
+        coverage tracking (see record_coverage_tick() there, and the
+        comment at this job's scheduler.add_job() call in main.py) --
+        called first, before any of this method's own fallible scan
+        logic, and fully self-contained (it never raises), so a coverage
+        write failure can never affect this poll and a scan failure here
+        can never suppress the heartbeat.
+
         The 45s timeout below covers ONLY the subprocess scan
         (_snapshot_pids) -- it deliberately does not wrap the DB-write phase
         that follows (_poll_write_phase). A cancellation landing mid
@@ -211,6 +219,9 @@ class ProcessWatcher:
         _POLL_WRITE_TIMEOUT_SECONDS -- so a truly-stuck write is still
         eventually reported, just not torn down mid-transaction on the
         scan's tighter cadence."""
+        from core.monitoring_coverage import record_coverage_tick
+        await record_coverage_tick()
+
         try:
             async with asyncio.timeout(45):
                 current_pids = await self._snapshot_pids()
