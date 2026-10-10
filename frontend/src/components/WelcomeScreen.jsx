@@ -1,6 +1,5 @@
 const WATCH_ITEMS = [
   { icon: '📁', label: 'Files your agents read and write' },
-  { icon: '🌐', label: 'Network connections they open' },
   { icon: '⚙️', label: 'Processes they spawn' },
   { icon: '🔑', label: 'Credential files they access' },
 ]

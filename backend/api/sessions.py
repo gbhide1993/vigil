@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from core.alerter import Alerter
+from core.monitoring_status import network_monitoring
 from core.red_lines import SESSION_LAUNCH_DIR
 from core.verification import build_verification_report, touches_credential_path
 from db.database import get_read_db
@@ -296,6 +297,9 @@ async def _build_session_report_data(db, session_id: str) -> dict:
         "files_touched_count": len(files_touched),
         "network_connections": network_connections,
         "network_connections_count": len(network_connections),
+        # Real watcher state (core/monitoring_status.py): while "off", a count of 0
+        # means "not measured", never "no connections".
+        "network_monitoring": network_monitoring(),
         "process_spawns": process_spawns,
         "red_lines": alerts,
         "red_lines_count": len(alerts),
@@ -318,6 +322,7 @@ async def get_session_report_preview(session_id: str):
         "duration_minutes": report["duration_minutes"],
         "files_touched": report["files_touched_count"],
         "network_connections": report["network_connections_count"],
+        "network_monitoring": report["network_monitoring"],
         "process_spawns": report["process_spawns"],
         "red_lines": report["red_lines_count"],
         "events": events,
@@ -365,10 +370,13 @@ async def get_session_report_pdf(session_id: str):
     c.line(margin, y, width - margin, y)
     y -= 0.3 * inch
 
+    # While network monitoring is off a count of 0 means "not measured".
+    net_off = report.get("network_monitoring") == "off" and report["network_connections_count"] == 0
+
     # SUMMARY ROW
     box_labels = [
         ("Files Touched", report["files_touched_count"]),
-        ("Network Connections", report["network_connections_count"]),
+        ("Network Connections", "off" if net_off else report["network_connections_count"]),
         ("Process Spawns", report["process_spawns"]),
         ("Red Lines", report["red_lines_count"]),
     ]
@@ -417,10 +425,16 @@ async def get_session_report_pdf(session_id: str):
     if y < margin:
         y = new_page()
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(margin, y, f"Network Connections ({report['network_connections_count']})")
+    if net_off:
+        c.drawString(margin, y, "Network Connections (not monitored in this version)")
+    else:
+        c.drawString(margin, y, f"Network Connections ({report['network_connections_count']})")
     y -= 0.22 * inch
     c.setFont("Helvetica", 9)
-    if not report["network_connections"]:
+    if net_off and not report["network_connections"]:
+        c.drawString(margin, y, "Network monitoring is off, so connections are not recorded.")
+        y -= 0.2 * inch
+    elif not report["network_connections"]:
         c.drawString(margin, y, "(none)")
         y -= 0.2 * inch
     for n in report["network_connections"]:

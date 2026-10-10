@@ -94,7 +94,6 @@ function WelcomeState() {
         </div>
         <div style={{ fontSize: 12.5, color: 'var(--color-navy-muted)', lineHeight: 2 }}>
           <div>● File activity</div>
-          <div>● Network connections</div>
           <div>● Process spawns</div>
           <div>● MCP tool calls</div>
         </div>
@@ -136,6 +135,7 @@ export default function History() {
   const [events, setEvents] = useState([])
   const [error, setError] = useState(null)
   const [sessions, setSessions] = useState(null)
+  const [networkMonitoring, setNetworkMonitoring] = useState(null)
   const [query, setQuery] = useState('')
   const [filteredEvents, setFilteredEvents] = useState([])
 
@@ -144,15 +144,17 @@ export default function History() {
 
     async function load() {
       try {
-        const [statsData, eventsData, sessionsData] = await Promise.all([
+        const [statsData, eventsData, sessionsData, healthData] = await Promise.all([
           api.getStats(),
           api.getEvents({ limit: 50 }),
           api.getSessions(),
+          api.getHealth(),
         ])
         if (cancelled) return
         setStats(statsData)
         setEvents(eventsData.events)
         setSessions(sessionsData.sessions)
+        setNetworkMonitoring(healthData.network_monitoring ?? null)
         setError(null)
       } catch (err) {
         if (!cancelled) setError(err.message)
@@ -218,8 +220,8 @@ export default function History() {
         />
         <StatCard
           label="Net Egress (MB)"
-          value={stats?.net_egress_mb_today ?? '—'}
-          valueClassName={stats ? (stats.net_egress_mb_today > 0 ? 'bad-high' : 'good') : ''}
+          value={networkMonitoring === 'off' ? 'off' : (stats?.net_egress_mb_today ?? '—')}
+          valueClassName={stats && networkMonitoring === 'on' ? (stats.net_egress_mb_today > 0 ? 'bad-high' : 'good') : ''}
           today={stats?.net_egress_mb_today}
           yesterday={stats?.net_egress_mb_yesterday}
           formatDelta={(d) => `${Math.abs(d).toFixed(2)} MB`}
@@ -294,7 +296,11 @@ export default function History() {
           <div className="panel-header">Network Egress</div>
           <div className="panel-body">
             {netEvents.length === 0 ? (
-              <div className="empty-state">No network activity yet.</div>
+              <div className="empty-state">
+                {networkMonitoring === 'off'
+                  ? 'Network monitoring is off in this version.'
+                  : 'No network connections recorded.'}
+              </div>
             ) : (
               <table>
                 <thead>

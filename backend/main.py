@@ -3,8 +3,10 @@
 2. Load policy from vlaw-policy.json
 3. Validate RSA license (14-day trial grace period if no license file)
 4. Start PollingObserver for file watching
-5. Start APScheduler jobs: process_watcher (3s), network_watcher (5s),
-   aggregator flush (5s), baseline update (hourly)
+5. Start APScheduler jobs: process_watcher (30s), aggregator flush,
+   baseline update (hourly), evidence chain seal. The network and MCP
+   watchers are currently disabled (see the comments at their disabled
+   job registrations below).
 6. Serve on port 7422
 """
 
@@ -98,6 +100,7 @@ from core.feature_flags import CORE_ONLY
 from core.insights import get_insights
 from core.instance_lock import InstanceAlreadyRunning, acquire_instance_lock, release_instance_lock
 from core.log_setup import configure_logging
+from core.monitoring_status import network_monitoring
 from core.red_lines import SESSION_LAUNCH_DIR
 from db.database import DB_PATH, close_db, get_db, get_read_db, init_db
 from license.license_service import LicenseService
@@ -380,7 +383,31 @@ async def lifespan(app: FastAPI):
         max_instances=1, coalesce=True, replace_existing=True,
         next_run_time=_now + timedelta(seconds=5),
     )
-    # NetworkWatcher disabled pending event-loop audit — resolution phase contains blocking I/O.
+    # NetworkWatcher is deliberately DISABLED (not forgotten). It was turned
+    # off in e821731 together with the watcher-starvation deadlock fix: its
+    # resolution phase does blocking I/O (reverse lookups, per-connection
+    # process lookups) on or next to the event loop, and with the other
+    # watchers sharing the loop and the single DB writer that was one of the
+    # sources of multi-second stalls (/health included). Consequences, shown
+    # to the user rather than hidden: no net_connect events are recorded, so
+    # no unrecognised-destination alerts are produced, and the report and
+    # /health say "network monitoring: off" (core/monitoring_status.py reads
+    # this job's presence, so re-adding it flips them to "on" by itself).
+    #
+    # A safe re-enable needs ALL of:
+    #   1. Bounded work per tick: a hard cap on connections handled and
+    #      names resolved per poll (the rest carried to the next tick), the
+    #      resolution moved off the loop into a killable subprocess with a
+    #      timeout, as ProcessWatcher does (see _process_scan_worker.py),
+    #      and an asyncio.timeout around the whole poll.
+    #   2. An off-switch: a setting/env var (for example
+    #      VLAW_NETWORK_WATCHER=0) that skips registering the job, plus an
+    #      automatic back-off that disables it for the rest of the run if
+    #      a tick overruns its budget repeatedly.
+    #   3. Loop-delay measurement before turning it on by default: /health
+    #      latency and event-loop lag with the watcher running under load
+    #      (tests/test_perf_gate.py is the place for the gate), compared
+    #      with it off.
     # scheduler.add_job(
     #     network_watcher.poll, "interval", seconds=30, id="network_watcher",
     #     max_instances=1, coalesce=True, replace_existing=True,
@@ -413,6 +440,8 @@ async def lifespan(app: FastAPI):
     # )
     scheduler.start()
     _state["scheduler"] = scheduler
+    from core.monitoring_status import bind_scheduler
+    bind_scheduler(scheduler)
     logger.info("scheduler started")
 
     yield
@@ -756,6 +785,9 @@ async def health():
         "baseline_active": baseline_active,
         "agents_watching": agents_watching,
         "file_watcher_alive": observer.is_alive() if observer else False,
+        # Read from the scheduler's real state ("off" while the watcher's
+        # job is not registered), never a constant.
+        "network_monitoring": network_monitoring(),
     }
 
 

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+from core.monitoring_status import network_monitoring
 from db.database import get_db
 
 router = APIRouter()
@@ -165,6 +166,21 @@ REPORT_NOTES = [
     "Alert times are when Vigil detected the issue. After a restart this can be later than the activity itself.",
     "Vigil checks which programs are running about every 30 seconds. A program that starts and finishes between checks is not recorded. For recorded programs the command text is shown, with common secret patterns (passwords, tokens, keys) replaced by [REDACTED] on a best-effort basis, so very unusual secrets may still appear.",
 ]
+
+# Added to the notes only while the network watcher is not running (see
+# core/monitoring_status.py): it flips off automatically if the watcher's
+# scheduler job is registered again.
+NETWORK_OFF_NOTE = (
+    "Network connections are not monitored in this version. "
+    "Unrecognised-destination alerts are therefore not produced."
+)
+
+
+def current_report_notes() -> list[str]:
+    notes = list(REPORT_NOTES)
+    if network_monitoring() == "off":
+        notes.append(NETWORK_OFF_NOTE)
+    return notes
 
 # Alerts whose description ends in the spawned command line (see
 # RedLines.check_dangerous_command and ProcessWatcher's generic
@@ -525,6 +541,8 @@ async def _build_summary(date: str, tz=None) -> dict:
 
     generated_at_utc = datetime.now(timezone.utc)
     coverage = await _compute_coverage(db, start_utc, end_utc, generated_at_utc)
+    # Read from live scheduler state, not a constant (core/monitoring_status.py).
+    coverage["network_monitoring"] = network_monitoring()
 
     return {
         # Always the resolved real calendar date, never the literal
@@ -538,7 +556,7 @@ async def _build_summary(date: str, tz=None) -> dict:
         "event_count": event_count,
         "sessions": sessions,
         "alerts": alerts,
-        "report_notes": REPORT_NOTES,
+        "report_notes": current_report_notes(),
         **coverage,
     }
 
@@ -769,6 +787,8 @@ async def export_pdf(date: str = Query(default="today")):
                 f"total {_format_duration(summary['short_gap_seconds'])}",
                 "Helvetica", 9, 0.2 * inch,
             )
+    if summary.get("network_monitoring") is not None:
+        y = draw(y, f"Network monitoring: {summary['network_monitoring']}", "Helvetica", 9, 0.2 * inch)
     y -= 0.2 * inch
 
     c.setFont("Helvetica-Bold", 12)

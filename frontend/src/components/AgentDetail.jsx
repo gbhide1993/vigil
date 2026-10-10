@@ -78,7 +78,7 @@ function MiniStats({ sessions }) {
         <div className="agent-ministat-value">{stats.files.toLocaleString()}</div>
       </div>
       <div>
-        <div className="agent-ministat-label">Network calls</div>
+        <div className="agent-ministat-label">MCP connections</div>
         <div className="agent-ministat-value">{stats.network.toLocaleString()}</div>
       </div>
       <div>

@@ -30,7 +30,7 @@ def generate_summary(agent_name: str, session: dict) -> str:
         parts.append(f"touched credential paths {cred_accesses} time{'s' if cred_accesses != 1 else ''}")
 
     if not parts:
-        return f"{agent_name} had a quiet session with no notable file, network, or process activity."
+        return f"{agent_name} had a quiet session with no notable file or process activity."
 
     body = "; ".join(parts)
     sentence = f"{agent_name} {body} this session."

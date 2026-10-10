@@ -1131,8 +1131,11 @@ async def test_export_json_includes_report_notes():
     resp = client.get("/export/json")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["report_notes"] == export_module.REPORT_NOTES
-    assert len(data["report_notes"]) == 9
+    # Network monitoring is off in tests (no scheduler bound), so the
+    # "not monitored" note is appended after the 9 fixed notes.
+    assert data["report_notes"] == export_module.current_report_notes()
+    assert data["report_notes"][:9] == export_module.REPORT_NOTES
+    assert len(data["report_notes"]) == 10
     assert any("[REDACTED]" in n and "best-effort" in n for n in data["report_notes"])
     assert not any("not its exact command text" in n for n in data["report_notes"])
 

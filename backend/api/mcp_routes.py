@@ -66,7 +66,7 @@ TOOLS = [
         "name": "get_red_line_events",
         "description": (
             "Returns Red Line security alerts observed by Vigil. Red Lines are high-risk events "
-            "like credential access, unexpected network connections, or MCP auto-approvals."
+            "like credential access, dangerous commands, or MCP auto-approvals."
         ),
         "inputSchema": {
             "type": "object",
