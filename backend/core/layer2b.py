@@ -106,24 +106,40 @@ async def _session_metrics(session_id: str, agent_id: int, db) -> dict[str, floa
 
 
 async def get_session_history(agent_id: int, exclude_session_id: str, db, limit: int = 5) -> list[dict]:
-    """Last `limit` closed sessions for this agent (excluding the
+    """Last `limit` closed, real sessions for this agent (excluding the
     current one), each with its event counts and duration. Returns []
-    if fewer than 3 exist — Layer 2b stays silent until then."""
+    if fewer than 3 exist — Layer 2b stays silent until then.
+
+    Skips resumed=1 sessions (ProcessWatcher's first poll after a
+    restart rediscovering an already-running process -- their
+    started_at/duration reflect Vigil's own restart, not the agent's
+    real behaviour, see core/sessions.py::touch) and sessions with no
+    file, network, or duration activity at all (nothing real to
+    measure). Both would otherwise skew the median every other
+    session is compared against. Fetches more candidates than `limit`
+    up front so filtering those out still leaves a full window when
+    enough real history exists."""
     cur = await db.execute(
         """
         SELECT id FROM sessions
-        WHERE agent_id = ? AND id != ? AND ended_at IS NOT NULL
+        WHERE agent_id = ? AND id != ? AND ended_at IS NOT NULL AND resumed = 0
         ORDER BY ended_at DESC LIMIT ?
         """,
-        (agent_id, exclude_session_id, limit),
+        (agent_id, exclude_session_id, limit * 4),
     )
     rows = await cur.fetchall()
-    if len(rows) < 3:
-        return []
 
     history = []
     for row in rows:
-        history.append(await _session_metrics(row["id"], agent_id, db))
+        metrics = await _session_metrics(row["id"], agent_id, db)
+        if metrics["file_event_count"] == 0 and metrics["network_event_count"] == 0 and metrics["duration_seconds"] == 0:
+            continue
+        history.append(metrics)
+        if len(history) >= limit:
+            break
+
+    if len(history) < 3:
+        return []
     return history
 
 

@@ -26,9 +26,21 @@ class SessionManager:
         # agent_id -> {"session_id": str, "last_activity": datetime}
         self._active: dict[int, dict] = {}
 
-    async def touch(self, agent_id: int) -> str:
+    async def touch(self, agent_id: int, resumed: bool = False) -> str:
         """Record activity for an agent, opening a new session if none is
-        active. Returns the current session_id for this agent."""
+        active. Returns the current session_id for this agent.
+
+        resumed=True marks a session opened for a process ProcessWatcher
+        is only just discovering, not one that actually just started --
+        see watchers/process_watcher.py's first-poll-after-restart flag.
+        Its started_at is the moment Vigil (re)started watching, not the
+        agent's real start time, so callers that build baselines/history
+        from closed sessions (core/layer2b.py, core/baseline.py) exclude
+        resumed=1 rows rather than treating this timestamp as real.
+        Ignored once a session is already active for this agent (the
+        existing-session return path below) -- a resumed session that
+        later sees a genuine new spawn keeps its original resumed flag,
+        it doesn't get overwritten or split into a second session."""
         db = await get_db()
         now = datetime.now(timezone.utc)
 
@@ -41,9 +53,9 @@ class SessionManager:
         from core.identity import get_operator_identity
         operator_username, operator_hostname = get_operator_identity()
         await db.execute(
-            "INSERT INTO sessions (id, agent_id, started_at, operator_username, operator_hostname) "
-            "VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?)",
-            (session_id, agent_id, operator_username, operator_hostname),
+            "INSERT INTO sessions (id, agent_id, started_at, operator_username, operator_hostname, resumed) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?)",
+            (session_id, agent_id, operator_username, operator_hostname, 1 if resumed else 0),
         )
         await db.execute(
             "UPDATE agents SET session_count = session_count + 1 WHERE id = ?",

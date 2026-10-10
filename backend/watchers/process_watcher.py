@@ -126,6 +126,16 @@ class ProcessWatcher:
         self.alerter = Alerter()
         self.red_lines = RedLines()
         self._known_pids: set[int] = set()
+        # True until the first successful (non-failed) scan completes --
+        # that scan's new_pids is every agent-matching process already
+        # running when this ProcessWatcher started, not anything that
+        # just spawned. Sessions opened from it are marked resumed=True
+        # (see _poll_write_body) so baselines don't treat Vigil's own
+        # restart as the agent's real start time. Stays True across a
+        # failed first scan (see _poll_write_body) so a transient scan
+        # failure doesn't let a later, still-first, successful scan be
+        # mistaken for a genuine new spawn.
+        self._is_first_poll = True
         # PIDs _gather_spawn_info has already resolved to a non-None agent
         # name (includes "unidentified_agent") — lets
         # _scan_all_agent_processes_for_env_redirect re-check only PIDs
@@ -261,18 +271,24 @@ class ProcessWatcher:
             # of flagging every still-running PID as newly spawned. RL7
             # (env-redirect scan, below) is unaffected and still runs —
             # it re-checks self._known_agent_pids, which this cycle's
-            # failure doesn't touch.
+            # failure doesn't touch. self._is_first_poll is also left
+            # untouched -- a failed scan never actually saw "everything
+            # already running", so the next successful scan is still the
+            # real first poll.
             new_pids = set()
+            resumed = False
         else:
             new_pids = current_pids - self._known_pids
+            resumed = self._is_first_poll
             self._known_pids = current_pids
+            self._is_first_poll = False
 
-        logger.info("ProcessWatcher new_pids this cycle: %d", len(new_pids))
+        logger.info("ProcessWatcher new_pids this cycle: %d (resumed=%s)", len(new_pids), resumed)
 
         env_redirect_hits = self._scan_all_agent_processes_for_env_redirect()
         for hit in env_redirect_hits:
             agent_id = await self.attributor.get_or_create_agent(hit["agent_name"], hit["pid"])
-            session_id = await self.attributor.sessions.touch(agent_id)
+            session_id = await self.attributor.sessions.touch(agent_id, resumed=resumed)
             if not CORE_ONLY:
                 await self.red_lines.check_env_var_redirect(
                     agent_id, hit["agent_name"], session_id, hit["agent_env"], pid=hit["pid"]
@@ -312,7 +328,7 @@ class ProcessWatcher:
             confidence = self.attributor.get_behaviour_score_for_pid(pid) if is_unidentified else None
 
             agent_id = await self.attributor.get_or_create_agent(agent_name, pid, confidence=confidence)
-            session_id = await self.attributor.sessions.touch(agent_id)
+            session_id = await self.attributor.sessions.touch(agent_id, resumed=resumed)
 
             if not CORE_ONLY:
                 await self.red_lines.check_dangerous_command(agent_id, agent_name, cmdline, exe_name, session_id=session_id)

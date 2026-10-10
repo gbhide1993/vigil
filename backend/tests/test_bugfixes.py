@@ -995,6 +995,7 @@ async def test_export_pdf_marks_sessions_that_began_before_the_period(test_db):
                     "agent_name": "claude_code",
                     "event_count_in_period": 3,
                     "no_activity": False,
+                    "resumed": False,
                 },
                 {
                     "id": "inside-session-id",
@@ -1005,6 +1006,7 @@ async def test_export_pdf_marks_sessions_that_began_before_the_period(test_db):
                     "agent_name": "codex",
                     "event_count_in_period": 1,
                     "no_activity": False,
+                    "resumed": False,
                 },
             ],
             "alerts": [],
@@ -1231,3 +1233,312 @@ def test_unprefixed_routers_gated_by_frozen_flag(monkeypatch, tmp_path):
         # of the above, so no later test importing from main inherits the
         # frozen reload's app/FRONTEND_DIR.
         reload_as(frozen=False)
+
+
+# ---------------------------------------- 10. resumed (rediscovered) sessions
+
+@pytest.mark.asyncio
+async def test_touch_marks_resumed_sessions_and_reuses_them(test_db):
+    """resumed=True on touch() is persisted on the new row. A later touch
+    for the same agent while its session is still active reuses that same
+    session_id -- a rediscovered agent that goes on to spawn something real
+    doesn't get a second session, the original resumed=1 row absorbs it."""
+    agent_id = await _make_agent(test_db, _uniq("resumed_touch_agent"))
+    sm = SessionManager()
+
+    resumed_session_id = await sm.touch(agent_id, resumed=True)
+    cur = await test_db.execute("SELECT resumed FROM sessions WHERE id = ?", (resumed_session_id,))
+    row = await cur.fetchone()
+    assert row["resumed"] == 1
+
+    same_session_id = await sm.touch(agent_id, resumed=False)
+    assert same_session_id == resumed_session_id
+    cur = await test_db.execute("SELECT resumed FROM sessions WHERE id = ?", (resumed_session_id,))
+    row = await cur.fetchone()
+    assert row["resumed"] == 1, "the existing session's resumed flag must not be overwritten by a later touch"
+
+
+@pytest.mark.asyncio
+async def test_touch_default_is_not_resumed(test_db):
+    agent_id = await _make_agent(test_db, _uniq("fresh_touch_agent"))
+    sm = SessionManager()
+    session_id = await sm.touch(agent_id)
+    cur = await test_db.execute("SELECT resumed FROM sessions WHERE id = ?", (session_id,))
+    row = await cur.fetchone()
+    assert row["resumed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_process_watcher_marks_first_poll_sessions_resumed(test_db):
+    """ProcessWatcher's very first poll after construction (a restart)
+    treats every already-running agent-matching PID as "new" since
+    self._known_pids starts empty -- those sessions are opened with
+    resumed=True. A PID that genuinely spawns later, after the first real
+    snapshot is in hand, is not."""
+    from watchers.process_watcher import ProcessWatcher
+
+    class _FakeSessions:
+        def __init__(self):
+            self.calls: list[tuple[int, bool]] = []
+
+        async def touch(self, agent_id, resumed=False):
+            self.calls.append((agent_id, resumed))
+            return _uniq("fake-session")
+
+    class _FakeAttributor:
+        def __init__(self, db):
+            self._db = db
+            self.sessions = _FakeSessions()
+            self._name_by_pid: dict[int, str] = {}
+            self._agent_ids: dict[str, int] = {}
+
+        def get_named_agent_for_pid(self, pid, pid_snapshot=None):
+            return self._name_by_pid.get(pid)
+
+        def get_behaviour_score_for_pid(self, pid):
+            return None
+
+        async def get_or_create_agent(self, name, pid=None, confidence=None):
+            if name not in self._agent_ids:
+                self._agent_ids[name] = await _make_agent(self._db, _uniq(name))
+            return self._agent_ids[name]
+
+    attributor = _FakeAttributor(test_db)
+    attributor._name_by_pid[111] = "claude_code"
+    watcher = ProcessWatcher(attributor, aggregator=None)
+    watcher._pid_snapshot = {111: {"name": "claude.exe", "ppid": 1, "status": "running"}}
+
+    # First poll: current_pids == {111}, self._known_pids starts empty --
+    # exactly the "already running when Vigil started" case.
+    await watcher._poll_write_body({111})
+    assert watcher._is_first_poll is False
+    agent_id = attributor._agent_ids["claude_code"]
+    assert attributor.sessions.calls == [(agent_id, True)]
+
+    # A later poll: 111 is no longer new, but a genuinely new pid 222 for
+    # the same agent must be resumed=False.
+    attributor._name_by_pid[222] = "claude_code"
+    watcher._pid_snapshot[222] = {"name": "claude.exe", "ppid": 111, "status": "running"}
+    await watcher._poll_write_body({111, 222})
+    assert attributor.sessions.calls[-1] == (agent_id, False)
+
+
+@pytest.mark.asyncio
+async def test_baseline_skips_resumed_and_zero_activity_sessions(test_db):
+    """update_from_session() must not fold a resumed=1 session's stats
+    (its duration/timing reflects Vigil's restart, not the agent) or a
+    genuinely empty session's into the running baseline -- only a session
+    with real activity and resumed=0 should move sample_count."""
+    agent_id = await _make_agent(test_db, _uniq("baseline_resumed_agent"))
+    baseline = Baseline()
+
+    resumed_session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, file_reads, file_writes, "
+        "net_egress_bytes, proc_spawns, resumed) VALUES "
+        "(?, ?, '2026-01-01 10:00:00', '2026-01-01 10:05:00', 500, 500, 0, 10, 1)",
+        (resumed_session_id, agent_id),
+    )
+    empty_session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, file_reads, file_writes, "
+        "net_egress_bytes, proc_spawns, resumed) VALUES "
+        "(?, ?, '2026-01-01 11:00:00', '2026-01-01 11:00:00', 0, 0, 0, 0, 0)",
+        (empty_session_id, agent_id),
+    )
+    await test_db.commit()
+
+    await baseline.update_from_session(resumed_session_id)
+    await baseline.update_from_session(empty_session_id)
+
+    cur = await test_db.execute(
+        "SELECT sample_count FROM baseline WHERE agent_id = ? AND metric_name = 'file_read_count' AND metric_scope IS NULL",
+        (agent_id,),
+    )
+    assert await cur.fetchone() is None, "neither the resumed nor the empty session should have been folded in"
+
+    real_session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, file_reads, file_writes, "
+        "net_egress_bytes, proc_spawns, resumed) VALUES "
+        "(?, ?, '2026-01-01 12:00:00', '2026-01-01 12:10:00', 5, 5, 0, 2, 0)",
+        (real_session_id, agent_id),
+    )
+    await test_db.commit()
+    await baseline.update_from_session(real_session_id)
+
+    cur = await test_db.execute(
+        "SELECT sample_count FROM baseline WHERE agent_id = ? AND metric_name = 'file_read_count' AND metric_scope IS NULL",
+        (agent_id,),
+    )
+    row = await cur.fetchone()
+    assert row is not None and row["sample_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_layer2b_history_skips_resumed_and_zero_activity_sessions(test_db):
+    """get_session_history() must exclude resumed=1 rows and sessions with
+    no file/network/duration activity at all, so the rolling-window
+    median it feeds mad_score() isn't pulled toward zero/duplicate-
+    restart artifacts that never reflect real agent behaviour."""
+    from core.layer2b import get_session_history
+
+    agent_id = await _make_agent(test_db, _uniq("layer2b_resumed_agent"))
+
+    async def _insert_session(started, ended, resumed, file_events=0):
+        session_id = _uniq("sess")
+        await test_db.execute(
+            "INSERT INTO sessions (id, agent_id, started_at, ended_at, resumed) VALUES (?, ?, ?, ?, ?)",
+            (session_id, agent_id, started, ended, 1 if resumed else 0),
+        )
+        for _ in range(file_events):
+            await test_db.execute(
+                "INSERT INTO events (agent_id, session_id, event_type, path, created_at) "
+                "VALUES (?, ?, 'file_write', 'x', ?)",
+                (agent_id, session_id, started),
+            )
+        await test_db.commit()
+        return session_id
+
+    await _insert_session("2026-01-01 09:00:00", "2026-01-01 09:00:00", resumed=True)
+    await _insert_session("2026-01-01 09:05:00", "2026-01-01 09:05:00", resumed=True)
+    await _insert_session("2026-01-01 09:10:00", "2026-01-01 09:10:00", resumed=False)  # empty, resumed=0
+    await _insert_session("2026-01-01 10:00:00", "2026-01-01 10:10:00", resumed=False, file_events=5)
+    await _insert_session("2026-01-01 11:00:00", "2026-01-01 11:10:00", resumed=False, file_events=8)
+    await _insert_session("2026-01-01 12:00:00", "2026-01-01 12:10:00", resumed=False, file_events=3)
+
+    history = await get_session_history(agent_id, _uniq("current-session"), test_db)
+
+    assert len(history) == 3
+    assert {h["file_event_count"] for h in history} == {5, 8, 3}
+
+
+@pytest.mark.asyncio
+async def test_resumed_column_migration_is_idempotent():
+    """A DB created before `resumed` existed (the exact pre-this-task
+    sessions schema) gets the column added by _migrate(), and running
+    _migrate() again on the same connection must not raise or duplicate
+    the column -- the same idempotency every other ALTER TABLE in
+    _migrate() already relies on."""
+    import tempfile
+    from pathlib import Path
+
+    import aiosqlite
+
+    tmp_dir = tempfile.mkdtemp(prefix="vlaw_migration_test_")
+    db_path = Path(tmp_dir) / "legacy.db"
+
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        schema_sql = database.SCHEMA_PATH.read_text()
+        await conn.executescript(schema_sql)
+        # Replace the (already-migrated) sessions table with the exact
+        # pre-this-task column set, reproducing what a real live DB
+        # looks like before this change ships.
+        await conn.execute("DROP TABLE sessions")
+        await conn.execute(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                agent_id INTEGER REFERENCES agents(id),
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                ended_at TIMESTAMP,
+                file_reads INTEGER DEFAULT 0,
+                file_writes INTEGER DEFAULT 0,
+                net_egress_bytes INTEGER DEFAULT 0,
+                proc_spawns INTEGER DEFAULT 0,
+                cred_accesses INTEGER DEFAULT 0,
+                mcp_connects INTEGER DEFAULT 0,
+                alert_count INTEGER DEFAULT 0,
+                anomaly_score REAL DEFAULT 0,
+                summary TEXT,
+                operator_username TEXT,
+                operator_hostname TEXT
+            )
+            """
+        )
+        await conn.commit()
+
+        cur = await conn.execute("PRAGMA table_info(sessions)")
+        columns_before = {row["name"] for row in await cur.fetchall()}
+        assert "resumed" not in columns_before
+
+        await database._migrate(conn)
+        await database._migrate(conn)  # idempotent -- must not raise on a second run
+
+        cur = await conn.execute("PRAGMA table_info(sessions)")
+        columns_after = {row["name"] for row in await cur.fetchall()}
+        assert "resumed" in columns_after
+
+        session_id = str(uuid.uuid4())
+        await conn.execute(
+            "INSERT INTO sessions (id, agent_id, started_at) VALUES (?, NULL, CURRENT_TIMESTAMP)",
+            (session_id,),
+        )
+        await conn.commit()
+        cur = await conn.execute("SELECT resumed FROM sessions WHERE id = ?", (session_id,))
+        row = await cur.fetchone()
+        assert row["resumed"] == 0, "backfilled pre-existing rows default to not-resumed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_and_json_label_resumed_sessions(test_db):
+    """A resumed=1 session is listed, not folded like a no-activity
+    session, but carries "(already running when Vigil started)" in the
+    PDF instead of its started_at being taken at face value. The JSON
+    export carries the same fact as resumed: true/false."""
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    agent_name = _uniq("claude_code_resumedtest")
+    agent_id = await _make_agent(test_db, agent_name)
+
+    resumed_session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, resumed) "
+        "VALUES (?, ?, CURRENT_TIMESTAMP, NULL, 1)",
+        (resumed_session_id, agent_id),
+    )
+    await test_db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path) VALUES (?, ?, 'proc_spawn', 'x.exe')",
+        (agent_id, resumed_session_id),
+    )
+    await test_db.commit()
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    json_resp = client.get("/export/json")
+    assert json_resp.status_code == 200
+    by_id = {s["id"]: s for s in json_resp.json()["sessions"]}
+    assert by_id[resumed_session_id]["resumed"] is True
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    with patch.object(canvas.Canvas, "drawString", capture):
+        pdf_resp = client.get("/export/pdf")
+    assert pdf_resp.status_code == 200
+
+    # The full session line (id, agent, operator, started/ended, events,
+    # and the resumed marker) can itself be split across several wrapped
+    # drawString calls -- same reasoning as the existing "(began before
+    # this period)" marker test above: join a small window of drawn
+    # lines starting from the one that has this session's own id, rather
+    # than assuming the marker lands in the same drawString call.
+    start = next(i for i, t in enumerate(drawn) if resumed_session_id[:8] in t)
+    window = " ".join(drawn[start:start + 4])
+    assert "(already running when Vigil started)" in window

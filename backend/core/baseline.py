@@ -37,6 +37,18 @@ class Baseline:
         agent_id = session["agent_id"]
         duration_minutes = self._session_duration_minutes(session)
 
+        if session["resumed"] or (
+            session["file_reads"] == 0 and session["file_writes"] == 0
+            and session["net_egress_bytes"] == 0 and duration_minutes == 0
+        ):
+            # Rediscovered-on-restart (resumed=1, see core/sessions.py::touch)
+            # or a genuinely empty session -- neither reflects real agent
+            # behaviour, so folding it into the running mean/stddev would
+            # pollute what every other session gets compared against. Same
+            # exclusion core/layer2b.py's get_session_history applies to its
+            # rolling window.
+            return
+
         metrics = {
             "file_read_count": session["file_reads"],
             "file_write_count": session["file_writes"],

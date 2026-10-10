@@ -117,6 +117,15 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     if "operator_hostname" not in columns:
         await db.execute("ALTER TABLE sessions ADD COLUMN operator_hostname TEXT")
         await db.commit()
+    if "resumed" not in columns:
+        # SQLite's ALTER TABLE ... ADD COLUMN requires a constant default,
+        # not CURRENT_TIMESTAMP-style magic -- 0 is correct here anyway:
+        # every session that already existed before this column was added
+        # was opened under the pre-fix touch(), which never passed
+        # resumed=True, so treating pre-existing rows as "not resumed" is
+        # accurate, not just a safe default.
+        await db.execute("ALTER TABLE sessions ADD COLUMN resumed INTEGER NOT NULL DEFAULT 0")
+        await db.commit()
 
 
 async def _seed_policy(db: aiosqlite.Connection) -> None:

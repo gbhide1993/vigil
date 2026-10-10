@@ -313,6 +313,14 @@ async def _build_summary(date: str, tz=None) -> dict:
             and session["started_at"] == session["ended_at"]
             and session["event_count_in_period"] == 0
         )
+        # resumed=1 means ProcessWatcher's first poll after a restart
+        # rediscovered an already-running process (core/sessions.py::touch)
+        # -- its started_at is when Vigil started watching, not when the
+        # agent actually started. Still listed (not folded like no_activity
+        # sessions above): a resumed session can carry real activity after
+        # the rediscovery, just not a real start time. bool() so the JSON
+        # export reads resumed: true/false, not the raw 0/1 column value.
+        session["resumed"] = bool(session["resumed"])
 
     cur = await db.execute(
         """
@@ -435,6 +443,8 @@ async def export_pdf(date: str = Query(default="today")):
         ).replace(tzinfo=timezone.utc)
         if session_started_utc < period_start_utc:
             line += "  (began before this period)"
+        if session["resumed"]:
+            line += "  (already running when Vigil started)"
         y = draw(y, line, "Helvetica", 9, 0.2 * inch)
     if no_activity_sessions:
         plural = "s" if len(no_activity_sessions) != 1 else ""

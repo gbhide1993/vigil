@@ -125,7 +125,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     summary TEXT,                 -- plain-English digest, set when the
                                    -- session closes (core/digest.py)
     operator_username TEXT,       -- OS user this session ran under (core/identity.py)
-    operator_hostname TEXT        -- machine hostname this session ran on
+    operator_hostname TEXT,       -- machine hostname this session ran on
+    resumed INTEGER NOT NULL DEFAULT 0  -- 1 if opened on the first poll after a
+                                         -- restart, rediscovering an already-
+                                         -- running process (core/sessions.py::touch)
 );
 
 -- User-defined suppressions for recurring false positives, e.g. a specific

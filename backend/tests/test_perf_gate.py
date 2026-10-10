@@ -59,12 +59,17 @@ async def seeded_db():
     db = await database.get_db()
     # Deletion order matters: event_chain.event_id and alerts.event_id both
     # reference events(id) with no ON DELETE CASCADE (PRAGMA foreign_keys
-    # is ON -- see db/database.py), and events/alerts/sessions all
+    # is ON -- see db/database.py), and events/alerts/sessions/baseline all
     # reference agents(id). test_evidence_chain.py runs earlier
     # alphabetically in the same shared DB file (see conftest.py) and
     # seals real events into event_chain, so deleting events before its
-    # referencing rows fails with FOREIGN KEY constraint failed.
-    for table in ("event_chain", "alerts", "events", "sessions", "agents"):
+    # referencing rows fails with FOREIGN KEY constraint failed. baseline
+    # must clear before agents for the same reason -- test_bugfixes.py's
+    # resumed-session tests are the first in the suite to fold a real
+    # session into core.baseline.Baseline (every pre-existing session
+    # test uses a _NoopBaseline stub instead), so baseline rows
+    # referencing those agents can now genuinely be left behind here too.
+    for table in ("event_chain", "alerts", "events", "sessions", "baseline", "agents"):
         await db.execute(f"DELETE FROM {table}")
     await db.commit()
 
