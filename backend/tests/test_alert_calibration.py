@@ -304,11 +304,8 @@ async def test_time_anomaly_is_capped_unless_corroborated(test_db, monkeypatch):
     prior = get_prior(name)
 
     plain = await _session(test_db, agent_id, "2026-01-01 22:30:00", "2026-01-01 22:40:00")
-    (aid,) = await check_time_anomaly(plain, agent_id, name, "2026-01-01 22:30:00", prior, test_db)
-    cur = await test_db.execute("SELECT severity FROM alerts WHERE id = ?", (aid,))
-    assert (await cur.fetchone())["severity"] == "medium"
+    assert await check_time_anomaly(plain, agent_id, name, "2026-01-01 22:30:00", prior, test_db) == []
 
-    layer2a._alerter._last_fired.clear()
     corroborated = await _session(test_db, agent_id, "2026-01-02 22:30:00", "2026-01-02 22:40:00")
     await test_db.execute(
         "INSERT INTO events (agent_id, session_id, event_type, path) VALUES (?, ?, 'cred_access', '/x/.env')",
@@ -317,7 +314,9 @@ async def test_time_anomaly_is_capped_unless_corroborated(test_db, monkeypatch):
     await test_db.commit()
     (aid,) = await check_time_anomaly(corroborated, agent_id, name, "2026-01-02 22:30:00", prior, test_db)
     cur = await test_db.execute("SELECT severity FROM alerts WHERE id = ?", (aid,))
-    assert (await cur.fetchone())["severity"] in ("high", "critical")
+    # Base severity "critical" (a 22h gap since the previous session) capped
+    # to HIGH: credential access corroborates, but only a red line allows CRITICAL.
+    assert (await cur.fetchone())["severity"] == "high"
 
 
 # ------------------------------------------------ rule 4: duration dropped

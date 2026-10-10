@@ -78,6 +78,17 @@ async def _make_agent(db, name: str) -> int:
     return cur.lastrowid
 
 
+async def _corroborate(db, agent_id: int, session_id: str) -> None:
+    """A credential-access event in the session: the corroborating signal a
+    time anomaly now needs before it becomes an alert (an unusual hour on its
+    own is only an info line in the report)."""
+    await db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path) VALUES (?, ?, 'cred_access', '/x/.env')",
+        (agent_id, session_id),
+    )
+    await db.commit()
+
+
 def _uniq(label: str) -> str:
     return f"{label}_{uuid.uuid4().hex[:8]}"
 
@@ -166,8 +177,10 @@ async def test_time_anomaly_boundary(test_db, monkeypatch):
     prior = get_prior(agent_name)
     assert prior["normal_hours"] == [6, 22]
 
+    fire_session = _uniq("sess")
+    await _corroborate(test_db, agent_id, fire_session)
     fires = await check_time_anomaly(
-        _uniq("sess"), agent_id, agent_name, "2026-01-01 22:30:00", prior, test_db,
+        fire_session, agent_id, agent_name, "2026-01-01 22:30:00", prior, test_db,
     )
     assert len(fires) == 1, "22:30 (hour == normal_hours upper bound) should fire"
 
@@ -199,8 +212,10 @@ async def test_time_anomaly_respects_local_timezone(test_db, monkeypatch):
     )
     assert no_fire == [], "05:34 UTC is 11:04 AM in Asia/Kolkata, inside normal hours"
 
+    kolkata_session = _uniq("sess")
+    await _corroborate(test_db, agent_id, kolkata_session)
     fires = await check_time_anomaly(
-        _uniq("sess"), agent_id, agent_name, "2026-01-01 22:00:00", prior, test_db,
+        kolkata_session, agent_id, agent_name, "2026-01-01 22:00:00", prior, test_db,
     )
     assert len(fires) == 1, "22:00 UTC is 03:30 AM in Asia/Kolkata, outside normal hours"
 
@@ -212,8 +227,10 @@ async def test_time_anomaly_respects_local_timezone(test_db, monkeypatch):
 
     monkeypatch.setattr(layer2a, "_local_tz", lambda: timezone.utc)
 
+    utc_session = _uniq("sess")
+    await _corroborate(test_db, agent_id, utc_session)
     fires_utc = await check_time_anomaly(
-        _uniq("sess"), agent_id, agent_name, "2026-01-01 22:30:00", prior, test_db,
+        utc_session, agent_id, agent_name, "2026-01-01 22:30:00", prior, test_db,
     )
     assert len(fires_utc) == 1, "with tz pinned to UTC, 22:30 behaves exactly as before"
 
@@ -248,6 +265,7 @@ async def test_close_idle_sessions_alert_count_and_summary(test_db, monkeypatch)
         (agent_id, session_id, "/tmp/whatever.py"),
     )
     await test_db.commit()
+    await _corroborate(test_db, agent_id, session_id)
 
     sm = SessionManager()
     sm._active[agent_id] = {
@@ -379,6 +397,7 @@ async def test_recover_orphaned_sessions_scores(test_db, monkeypatch):
         (session_id, agent_id, "2026-01-01 22:30:00"),
     )
     await test_db.commit()
+    await _corroborate(test_db, agent_id, session_id)
 
     sm = SessionManager()
     count = await sm.recover_orphaned_sessions(_NoopBaseline())

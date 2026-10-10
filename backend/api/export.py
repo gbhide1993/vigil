@@ -409,6 +409,43 @@ async def _checkpoint_counts_by_session(db, start_sql: str, end_sql: str) -> dic
     return counts
 
 
+async def _sessions_with_time_alert(db, session_ids: list[str]) -> set[str]:
+    if not session_ids:
+        return set()
+    marks = ",".join("?" * len(session_ids))
+    cur = await db.execute(
+        f"SELECT DISTINCT session_id FROM alerts WHERE reason = 'time_anomaly' AND session_id IN ({marks})",
+        tuple(session_ids),
+    )
+    return {row["session_id"] for row in await cur.fetchall()}
+
+
+async def _add_calibration_info(db, session: dict, time_alerted: set[str]) -> None:
+    """Facts that used to be (noisy) alerts and are now report info lines:
+
+    - unusual_hour: "23:40" (local) when the session started outside the
+      agent's normal hours and no time-anomaly alert was raised for it
+      (an alert needs a corroborating signal, see Layer 2a). Not set for
+      resumed sessions: their started_at is when Vigil began watching,
+      not when the agent started.
+    - repeat_unknown_destinations: how many unrecognised destinations the
+      session used that an earlier session of the same agent already used
+      within 30 days (no alert is raised for those).
+    """
+    from core.layer2a import unknown_destination_split, unusual_hour_label
+    from core.priors import get_prior
+
+    agent_name = session.get("agent_name") or ""
+    session["unusual_hour"] = None
+    if not session.get("resumed") and session["id"] not in time_alerted and session.get("started_at"):
+        session["unusual_hour"] = unusual_hour_label(session["started_at"], agent_name)
+
+    session["repeat_unknown_destinations"] = 0
+    if session.get("agent_id") is not None:
+        _new, repeat = await unknown_destination_split(session["id"], session["agent_id"], get_prior(agent_name), db)
+        session["repeat_unknown_destinations"] = len(repeat)
+
+
 async def _build_summary(date: str, tz=None) -> dict:
     db = await get_db()
     day = _resolve_local_day(date, tz)
@@ -445,9 +482,11 @@ async def _build_summary(date: str, tz=None) -> dict:
     )
     event_counts_by_session = {row["session_id"]: row["c"] for row in await cur.fetchall()}
     checkpoint_counts = await _checkpoint_counts_by_session(db, start_sql, end_sql)
+    time_alerted = await _sessions_with_time_alert(db, [s["id"] for s in sessions])
     for session in sessions:
         session["event_count_in_period"] = event_counts_by_session.get(session["id"], 0)
         session["checkpoint_writes"] = checkpoint_counts.get(session["id"], 0)
+        await _add_calibration_info(db, session, time_alerted)
         # A session whose started_at/ended_at are identical and which
         # contributed no events this period is the artifact a restart
         # produces (see the duplicate-session investigation): opened and
@@ -640,6 +679,19 @@ async def export_pdf(date: str = Query(default="today")):
             y = draw(y, "(began before this period)", "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
         if session["resumed"]:
             y = draw(y, "(already running when Vigil started)", "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
+        if session.get("unusual_hour"):
+            y = draw(
+                y, f"(info: started at an unusual hour: {session['unusual_hour']} local)",
+                "Helvetica", 9, 0.2 * inch, indent=0.3 * inch,
+            )
+        if session.get("repeat_unknown_destinations"):
+            n = session["repeat_unknown_destinations"]
+            y = draw(
+                y,
+                f"(info: {n} unrecognised destination{'s' if n != 1 else ''} also used by earlier sessions "
+                "within 30 days, not alerted again)",
+                "Helvetica", 9, 0.2 * inch, indent=0.3 * inch,
+            )
         if session.get("checkpoint_writes"):
             n = session["checkpoint_writes"]
             y = draw(

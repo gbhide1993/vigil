@@ -8,12 +8,20 @@ The database is only read (all work is SELECTs), and the script refuses to
 run on the live database path. Copy the live files first, including
 vlaw.db-wal and vlaw.db-shm, and point this script at the copy.
 
-What is recomputed: the Layer 2a threshold, time and ratio alerts and the
-Layer 2b rolling alerts (old and new rules), plus the checkpoint alerts
-(old: the ones already in the database; new: none). Everything else
-(red-line alerts, unknown-destination alerts, policy alerts) is not
-recomputed by either side and is reported as "unchanged" from the alerts
-table, so the totals compare like with like.
+What is recomputed: the Layer 2a threshold, time and ratio alerts, the
+Layer 2b rolling alerts, the unknown-destination alerts (old: one per
+distinct unrecognised destination per session; new: only destinations not
+seen by an earlier non-resumed session of the same agent in the last 30
+days) and the checkpoint alerts (old: the ones already in the database;
+new: none). Uncorroborated unusual-hour sessions and repeat destinations are
+counted as report info lines, not alerts. Everything else (red-line and
+policy alerts) is not recomputed by either side and is reported as
+"unchanged" from the alerts table, so the totals compare like with like.
+
+Network corroboration in the new logic is recomputed too: a session counts
+as network-corroborated if it has a first-seen unrecognised destination or
+a low-severity red-line destination alert, not because of an old-logic
+unknown-destination alert row.
 
 Not modelled: Alerter dedup windows and open-duplicate suppression (both
 sides are shown without them), and the live "which alerts were open" state.
@@ -39,6 +47,7 @@ from core.activity_filter import (  # noqa: E402
     MIN_HISTORY_SESSIONS, cap_severity, evaluate_prior_volume, evaluate_rolling_volume,
     get_corroboration, session_volume_metrics, SEVERITY_ORDER,
 )
+from core.layer2a import unknown_destination_split, unusual_hour_label  # noqa: E402
 from core.layer2b import MAD_THRESHOLD, mad_score  # noqa: E402
 from core.priors import get_prior  # noqa: E402
 
@@ -124,6 +133,15 @@ def old_2b(current, history):
     return out
 
 
+async def has_low_red_line(db, sid, aid) -> bool:
+    cur = await db.execute(
+        "SELECT 1 FROM alerts WHERE agent_id = ? AND rule_type = 'red_line' AND severity = 'low' "
+        "AND (session_id = ? OR event_id IN (SELECT id FROM events WHERE session_id = ?)) LIMIT 1",
+        (aid, sid, sid),
+    )
+    return await cur.fetchone() is not None
+
+
 # --------------------------------------------------------------------- main
 
 async def main(db_path: str, days: int | None, list_limit: int) -> int:
@@ -148,13 +166,16 @@ async def main(db_path: str, days: int | None, list_limit: int) -> int:
             new_metrics[s["id"]] = await session_volume_metrics(db, s["id"], s["agent_id"])
 
         old_alerts, new_alerts = [], []   # (session, severity, kind, description)
+        info_hour, info_repeat = [], []   # report info lines that replace alerts: (session, text)
         by_agent_old = defaultdict(list)  # chronological closed sessions per agent (old history)
         by_agent_new = defaultdict(list)
 
         for s in sessions:
             sid, aid = s["id"], s["agent_id"]
             prior = get_prior(s["agent_name"])
+            new_dests, repeat_dests = await unknown_destination_split(sid, aid, prior, db)
             corro = await get_corroboration(db, sid, aid)
+            corro.network = (await has_low_red_line(db, sid, aid)) or bool(new_dests)
 
             # ---- old
             cur_old = old_metrics[sid]
@@ -162,6 +183,8 @@ async def main(db_path: str, days: int | None, list_limit: int) -> int:
                 old_alerts.append((s, sev, kind, desc))
             for sev, kind, desc in await old_time_anomaly(db, s, aid, prior):
                 old_alerts.append((s, sev, kind, desc))
+            for dest in new_dests + repeat_dests:
+                old_alerts.append((s, "medium", "unknown_destination", dest))
             if not s["resumed"]:
                 hist_old = []
                 for h in reversed(by_agent_old[aid]):
@@ -195,7 +218,14 @@ async def main(db_path: str, days: int | None, list_limit: int) -> int:
                     desc += f" [corroborated by: {', '.join(corro.names())}]"
                 new_alerts.append((s, cap_severity(base, corro), "volume_anomaly", desc))
             for sev, kind, desc in await old_time_anomaly(db, s, aid, prior):
-                new_alerts.append((s, cap_severity(sev, corro), kind, desc))
+                if corro.any:
+                    new_alerts.append((s, cap_severity(sev, corro), kind, f"{desc} [corroborated by: {', '.join(corro.names())}]"))
+                elif not s["resumed"]:
+                    info_hour.append((s, f"started at an unusual hour: {unusual_hour_label(s['started_at'], s['agent_name'])} local"))
+            for dest in new_dests:
+                new_alerts.append((s, "medium", "unknown_destination", dest))
+            if repeat_dests:
+                info_repeat.append((s, f"{len(repeat_dests)} repeat unrecognised destination(s)"))
 
             if not s["resumed"]:  # history only ever contains non-resumed sessions
                 by_agent_old[aid].append(sid)
@@ -207,6 +237,8 @@ async def main(db_path: str, days: int | None, list_limit: int) -> int:
             keep = lambda s: _parse(s["ended_at"]).timestamp() >= cutoff  # noqa: E731
             old_alerts = [a for a in old_alerts if keep(a[0])]
             new_alerts = [a for a in new_alerts if keep(a[0])]
+            info_hour = [a for a in info_hour if keep(a[0])]
+            info_repeat = [a for a in info_repeat if keep(a[0])]
             window_clause = " AND created_at >= datetime('now', ?)"
             window_args = (f"-{days} days",)
             scope = f"last {days} days"
@@ -221,8 +253,9 @@ async def main(db_path: str, days: int | None, list_limit: int) -> int:
         table = [dict(r) for r in await cur.fetchall()]
         checkpoint_old = sum(r["n"] for r in table if r["rule_type"] == "checkpoint_activity")
         recomputed_types = {"volumetric_threshold", "rolling_anomaly", "time_anomaly", "ratio_anomaly",
-                            "checkpoint_activity", "volume_anomaly"}
+                            "checkpoint_activity", "volume_anomaly", "unknown_destination"}
         unchanged = [r for r in table if r["rule_type"] not in recomputed_types]
+        unknown_dest_in_table = sum(r["n"] for r in table if r["rule_type"] == "unknown_destination")
 
         def sev_counts(rows, key=lambda r: r[1]):
             c = Counter(key(r) for r in rows)
@@ -252,7 +285,15 @@ async def main(db_path: str, days: int | None, list_limit: int) -> int:
         for t in sorted(set(old_types) | set(new_types)):
             print(f"  {t:22} {old_types.get(t, 0):>6} -> {new_types.get(t, 0):>6}")
         print()
-        print("Not recomputed (identical before and after; red-line, policy, unknown destination ...):")
+        print(f"Unknown-destination alerts: {unknown_dest_in_table} exist in the alerts table for this window; "
+              f"old logic recomputed {sum(1 for a in old_alerts if a[2] == 'unknown_destination')}, "
+              f"new logic {sum(1 for a in new_alerts if a[2] == 'unknown_destination')} "
+              f"(distinct destinations covered: {len({a[3] for a in old_alerts if a[2] == 'unknown_destination'})}).")
+        print(f"Report info lines instead of alerts: {len(info_hour)} unusual-hour sessions, "
+              f"{len(info_repeat)} sessions with repeat unrecognised destinations "
+              f"({sum(int(t.split()[0]) for _, t in info_repeat)} destinations).")
+        print()
+        print("Not recomputed (identical before and after; red-line and policy alerts):")
         for r in sorted(unchanged, key=lambda r: (-r["n"], r["rule_type"])):
             print(f"  {r['rule_type']:24} {r['severity']:9} {r['n']:>6}")
         print(f"  total unchanged by severity: {unchanged_sev}")
@@ -269,6 +310,19 @@ async def main(db_path: str, days: int | None, list_limit: int) -> int:
             print(f"  ... {len(new_alerts) - list_limit} more (raise --list-limit)")
         if days:
             print(f"\nDistinct days with a remaining recomputed alert: {len(day_set)}")
+            print(f"Unusual-hour info lines in this window ({len(info_hour)}):")
+            for s, text in sorted(info_hour, key=lambda a: a[0]["ended_at"])[:list_limit]:
+                print(f"  {s['ended_at'][:16]}  {s['agent_name']:12} {s['id'][:8]}  {text}")
+            skip = ",".join("?" * len(recomputed_types))
+            cur = await db.execute(
+                "SELECT created_at, severity, rule_type, title FROM alerts "
+                f"WHERE rule_type NOT IN ({skip}) AND created_at >= datetime('now', ?) ORDER BY created_at",
+                (*sorted(recomputed_types), f"-{days} days"),
+            )
+            rows = await cur.fetchall()
+            print(f"Remaining alerts that were not recomputed (red-line and policy), {len(rows)} in this window:")
+            for r in rows[:list_limit]:
+                print(f"  {r['created_at'][:16]}  {r['severity']:8} {r['rule_type']:12} {r['title'][:110]}")
         return 0
     finally:
         await db.close()
