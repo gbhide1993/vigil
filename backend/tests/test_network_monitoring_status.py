@@ -103,7 +103,10 @@ def test_off_note_is_present_only_while_the_watcher_is_off():
     bind_scheduler(_FakeScheduler(running=True, job_ids={NETWORK_WATCHER_JOB_ID}))
     on_notes = export_module.current_report_notes()
     assert export_module.NETWORK_OFF_NOTE not in on_notes
-    assert on_notes == export_module.REPORT_NOTES
+    assert on_notes == export_module.REPORT_NOTES + [export_module.MCP_OFF_NOTE]   # MCP still off
+
+    bind_scheduler(_FakeScheduler(running=True, job_ids={NETWORK_WATCHER_JOB_ID, "mcp_watcher"}))
+    assert export_module.current_report_notes() == export_module.REPORT_NOTES
 
 
 def _client_for(summary):
@@ -165,7 +168,7 @@ async def test_json_and_pdf_show_off_status_and_note_then_flip_to_on(test_db):
 
     text_on = _pdf_text(summary_on)
     assert "Network monitoring: on" in text_on
-    assert "not monitored in this version" not in text_on
+    assert "Network connections are not monitored" not in text_on
 
 
 # ------------------------------------------------------------ session report

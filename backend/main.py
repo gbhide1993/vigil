@@ -100,7 +100,7 @@ from core.feature_flags import CORE_ONLY
 from core.insights import get_insights
 from core.instance_lock import InstanceAlreadyRunning, acquire_instance_lock, release_instance_lock
 from core.log_setup import configure_logging
-from core.monitoring_status import network_monitoring
+from core.monitoring_status import mcp_monitoring, network_monitoring
 from core.red_lines import SESSION_LAUNCH_DIR
 from db.database import DB_PATH, close_db, get_db, get_read_db, init_db
 from license.license_service import LicenseService
@@ -413,7 +413,20 @@ async def lifespan(app: FastAPI):
     #     max_instances=1, coalesce=True, replace_existing=True,
     #     next_run_time=_now + timedelta(seconds=15),
     # )
-    # McpWatcher disabled pending async subprocess refactor — WMI contention with ProcessWatcher.
+    # McpWatcher is deliberately DISABLED (e821731, with the watcher-starvation
+    # deadlock fix): it scans processes and connections through the same
+    # PowerShell/WMI queries ProcessWatcher uses, and the two contended for
+    # them. Consequences, shown to the user rather than hidden: no
+    # mcp_connect events are recorded, no unapproved-MCP-server alerts are
+    # produced, and the RL8 red line (MCP auto-approval) cannot fire, because
+    # it needs an MCP *connection* to pair with a .mcp.json write (it is only
+    # ever evaluated from mcp_watcher.py). The report and /health say
+    # "mcp monitoring: off" (core/monitoring_status.py reads this job's
+    # presence, so re-adding it flips them to "on" by itself).
+    # A safe re-enable needs the same three things as the network watcher
+    # above: bounded work per tick, an off-switch, and a loop-delay
+    # measurement, plus the async subprocess refactor named in the original
+    # note so it no longer shares ProcessWatcher's scan.
     # scheduler.add_job(
     #     mcp_watcher.poll, "interval", seconds=30, id="mcp_watcher",
     #     max_instances=1, coalesce=True, replace_existing=True,
@@ -788,6 +801,7 @@ async def health():
         # Read from the scheduler's real state ("off" while the watcher's
         # job is not registered), never a constant.
         "network_monitoring": network_monitoring(),
+        "mcp_monitoring": mcp_monitoring(),
     }
 
 

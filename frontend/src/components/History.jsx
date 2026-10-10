@@ -95,7 +95,6 @@ function WelcomeState() {
         <div style={{ fontSize: 12.5, color: 'var(--color-navy-muted)', lineHeight: 2 }}>
           <div>● File changes</div>
           <div>● Process spawns</div>
-          <div>● MCP configuration changes</div>
         </div>
         <div style={{ fontSize: 12, color: 'var(--color-navy-muted)', marginTop: 24 }}>
           Zero data leaves this machine.

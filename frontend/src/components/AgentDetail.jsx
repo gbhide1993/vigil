@@ -31,11 +31,10 @@ function sessionMiniStats(sessions) {
   return sessions.reduce(
     (acc, s) => {
       acc.files += (s.file_reads || 0) + (s.file_writes || 0)
-      acc.network += s.mcp_connects || 0
       acc.commands += s.proc_spawns || 0
       return acc
     },
-    { files: 0, network: 0, commands: 0 }
+    { files: 0, commands: 0 }
   )
 }
 
@@ -74,12 +73,8 @@ function MiniStats({ sessions }) {
   return (
     <div className="agent-card-ministats">
       <div>
-        <div className="agent-ministat-label">Files accessed</div>
+        <div className="agent-ministat-label">Files changed</div>
         <div className="agent-ministat-value">{stats.files.toLocaleString()}</div>
-      </div>
-      <div>
-        <div className="agent-ministat-label">MCP connections</div>
-        <div className="agent-ministat-value">{stats.network.toLocaleString()}</div>
       </div>
       <div>
         <div className="agent-ministat-label">Commands run</div>

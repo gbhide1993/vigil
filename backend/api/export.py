@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from core.monitoring_status import network_monitoring
+from core.monitoring_status import mcp_monitoring, network_monitoring
 from db.database import get_db
 
 router = APIRouter()
@@ -176,10 +176,19 @@ NETWORK_OFF_NOTE = (
 )
 
 
+MCP_OFF_NOTE = (
+    "MCP server connections are not monitored in this version. "
+    "Unapproved-MCP-server alerts, and the red line for MCP auto-approval that needs a connection, "
+    "are therefore not produced."
+)
+
+
 def current_report_notes() -> list[str]:
     notes = list(REPORT_NOTES)
     if network_monitoring() == "off":
         notes.append(NETWORK_OFF_NOTE)
+    if mcp_monitoring() == "off":
+        notes.append(MCP_OFF_NOTE)
     return notes
 
 # Alerts whose description ends in the spawned command line (see
@@ -543,6 +552,7 @@ async def _build_summary(date: str, tz=None) -> dict:
     coverage = await _compute_coverage(db, start_utc, end_utc, generated_at_utc)
     # Read from live scheduler state, not a constant (core/monitoring_status.py).
     coverage["network_monitoring"] = network_monitoring()
+    coverage["mcp_monitoring"] = mcp_monitoring()
 
     return {
         # Always the resolved real calendar date, never the literal
@@ -789,6 +799,8 @@ async def export_pdf(date: str = Query(default="today")):
             )
     if summary.get("network_monitoring") is not None:
         y = draw(y, f"Network monitoring: {summary['network_monitoring']}", "Helvetica", 9, 0.2 * inch)
+    if summary.get("mcp_monitoring") is not None:
+        y = draw(y, f"MCP monitoring: {summary['mcp_monitoring']}", "Helvetica", 9, 0.2 * inch)
     y -= 0.2 * inch
 
     c.setFont("Helvetica-Bold", 12)

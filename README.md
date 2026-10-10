@@ -28,14 +28,23 @@ Vigil runs a local backend that monitors your machine at the OS level — indepe
 
 ## Red Lines
 
-Eight rules that always run and cannot be disabled:
+There are nine red-line rules (RL1 to RL8, plus RL7b). They cannot be disabled, but only five can fire in this version, because the other four depend on signals Vigil does not currently produce.
 
-- AI agent changes SSH keys or `.env` files outside the project (file reads are not recorded)
-- Agent launches `curl`, `wget`, `ssh`, or `nc`
-- `ANTHROPIC_BASE_URL` redirect detected (potential prompt injection)
-- Untrusted MCP server auto-approved
+Active:
 
-Network monitoring, and the red line for connections to unrecognized destinations that depends on it, are planned and not active in this version.
+- Changes inside your `.ssh` directory
+- Claude's hidden cache folder written when no session is active
+- Agent launches a sensitive command (`curl`, `wget`, `ssh`, `nc`, `git push --force`, recursive deletes, and similar)
+- `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL` pointed at an unrecognized host (checked about every 30 seconds)
+- A project config file (`.claude`, `.cursor`, `.vscode`) written and then followed by a spawn or write elsewhere
+
+Not active in this version:
+
+- `.env` file read outside the project and cross-project file read (file reads are not recorded)
+- Connection to an unrecognized network destination (network monitoring is off)
+- MCP server auto-approval (MCP connection monitoring is off)
+
+See [docs/COVERAGE.md](docs/COVERAGE.md) for what Vigil does and does not see.
 
 ## Requirements
 

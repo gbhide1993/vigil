@@ -25,7 +25,7 @@ Vigil: *Here's the session record.*
 
 ## What Vigil shows you
 
-**🔌 MCP configuration** — changes to MCP configuration files and auto-approvals (monitoring of individual MCP connections is planned and off in this version)
+**🔌 MCP activity** — planned. MCP connection monitoring is off in this version
 
 **🌐 Network connections** — planned. Network monitoring is not part of this version
 

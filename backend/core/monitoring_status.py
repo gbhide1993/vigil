@@ -1,4 +1,5 @@
-"""Which optional monitors are actually running, read from live state.
+"""Which optional monitors (network, MCP connections) are actually running,
+read from live state.
 
 The answer comes from the scheduler (main.py binds it once the jobs are
 registered and started), not from a constant: if the network watcher's job
@@ -9,6 +10,7 @@ reads "off", which is the safe, honest default.
 """
 
 NETWORK_WATCHER_JOB_ID = "network_watcher"
+MCP_WATCHER_JOB_ID = "mcp_watcher"
 
 _scheduler = None
 
@@ -32,3 +34,10 @@ def network_monitoring() -> str:
     """"on" if the network watcher's job is registered in a running
     scheduler, else "off"."""
     return "on" if _job_running(NETWORK_WATCHER_JOB_ID) else "off"
+
+
+def mcp_monitoring() -> str:
+    """"on" if the MCP watcher's job is registered in a running scheduler,
+    else "off". (MCP *connections* are what this covers; changes to MCP
+    config files are ordinary file events and do not depend on it.)"""
+    return "on" if _job_running(MCP_WATCHER_JOB_ID) else "off"
