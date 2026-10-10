@@ -25,7 +25,7 @@ import db.database as database
 from db.database import get_db
 
 from core.priors import get_prior
-from core.layer2a import check_network_destinations, check_time_anomaly
+from core.layer2a import check_network_destinations, check_ratio_anomaly, check_time_anomaly
 import core.layer2a as layer2a
 from core.sessions import SessionManager
 from core.baseline import Baseline
@@ -106,6 +106,47 @@ async def test_network_destination_host_matching(test_db):
             assert len(fired) == 1, f"expected {dest!r} to fire an alert, it did not"
         else:
             assert fired == [], f"expected {dest!r} NOT to fire an alert, it did"
+
+
+@pytest.mark.asyncio
+async def test_ratio_anomaly_write_heavy_branch_gated_off_reads_not_observable(test_db, monkeypatch):
+    """FILE_READS_OBSERVABLE = False: the write-heavy ("wrote N but read
+    only 0") branch must never fire, since reads are never observable on
+    Windows and the check would otherwise fire on every qualifying
+    session. The read-heavy branch is untouched and must still fire."""
+    layer2a._alerter._last_fired.clear()
+
+    agent_name = _uniq("claude_code_ratiotest")
+    agent_id = await _make_agent(test_db, agent_name)
+    prior = get_prior(agent_name)
+    assert prior["read_write_ratio"]["critical"] == 25.0
+
+    write_heavy_session = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path, file_count) VALUES (?, ?, 'file_write', '/x', 30)",
+        (agent_id, write_heavy_session),
+    )
+    await test_db.commit()
+    fired = await check_ratio_anomaly(write_heavy_session, agent_id, agent_name, prior, test_db)
+    assert fired == [], "write-heavy branch must stay gated off while FILE_READS_OBSERVABLE is False"
+
+    monkeypatch.setattr(layer2a, "FILE_READS_OBSERVABLE", True)
+    fired_if_enabled = await check_ratio_anomaly(write_heavy_session, agent_id, agent_name, prior, test_db)
+    assert len(fired_if_enabled) == 1, "flipping the constant back on must restore the old behavior"
+    monkeypatch.undo()
+
+    read_heavy_session = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path, file_count) VALUES (?, ?, 'file_read', '/x', 30)",
+        (agent_id, read_heavy_session),
+    )
+    await test_db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path, file_count) VALUES (?, ?, 'file_write', '/x', 1)",
+        (agent_id, read_heavy_session),
+    )
+    await test_db.commit()
+    fired = await check_ratio_anomaly(read_heavy_session, agent_id, agent_name, prior, test_db)
+    assert len(fired) == 1, "the read-heavy branch is untouched by this gate and must still fire"
 
 
 # ---------------------------------------------------------- 2. time anomaly
@@ -866,6 +907,12 @@ async def test_export_folds_no_activity_sessions_pdf_and_json(test_db):
 
 @pytest.mark.asyncio
 async def test_export_pdf_alert_line_prefixed_with_time_and_session(test_db):
+    """Superseded by grouping (see test_export_pdf_groups_alerts_by_session):
+    an alert with a session_id no longer carries its own time/session
+    prefix -- that moved to the group's header line, shared by every
+    alert in the group. This test now checks the header carries the
+    session id and a local time, and the alert's own line still carries
+    its severity and title."""
     from unittest.mock import patch
 
     from fastapi import FastAPI
@@ -899,12 +946,13 @@ async def test_export_pdf_alert_line_prefixed_with_time_and_session(test_db):
         resp = client.get("/export/pdf")
     assert resp.status_code == 200
 
+    header_idx = next(i for i, t in enumerate(drawn) if t.startswith(f"Session {session_id[:8]}"))
+    header_window = " ".join(drawn[header_idx:header_idx + 6])
+    assert "detected" in header_window
+
     alert_lines = [t for t in drawn if "prefix test alert" in t]
     assert len(alert_lines) == 1
-    line = alert_lines[0]
-    assert f"session={session_id[:8]}" in line
-    # starts with a local timestamp, e.g. "2026-10-07 18:35:11"
-    assert line[:4].isdigit()
+    assert alert_lines[0] == "[CRITICAL] prefix test alert (status=open)"
 
 
 @pytest.mark.asyncio
@@ -1063,7 +1111,7 @@ async def test_export_json_includes_report_notes():
     assert resp.status_code == 200
     data = resp.json()
     assert data["report_notes"] == export_module.REPORT_NOTES
-    assert len(data["report_notes"]) == 5
+    assert len(data["report_notes"]) == 7
 
 
 # ------------------------------------------ 8. writer wedge-replace failure
@@ -1266,6 +1314,219 @@ async def test_touch_default_is_not_resumed(test_db):
     cur = await test_db.execute("SELECT resumed FROM sessions WHERE id = ?", (session_id,))
     row = await cur.fetchone()
     assert row["resumed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_touch_splits_session_on_long_gap(test_db, monkeypatch):
+    """A gap since last_activity past SESSION_IDLE_TIMEOUT_SECONDS closes
+    the stale session (backdated to that last_activity, not now) through
+    the real scoring pipeline exactly once, then opens a genuinely new,
+    non-resumed session -- simulating the sleep-spanning-session bug
+    from the resumed-session investigation."""
+    from core.baseline import Baseline
+
+    agent_id = await _make_agent(test_db, _uniq("gapsplit_agent"))
+    sm = SessionManager()
+
+    call_count = {"n": 0}
+    original_update = Baseline.update_from_session
+
+    async def counting_update(self, session_id):
+        call_count["n"] += 1
+        return await original_update(self, session_id)
+
+    monkeypatch.setattr(Baseline, "update_from_session", counting_update)
+
+    old_session_id = await sm.touch(agent_id)
+    stale_time = datetime.now(timezone.utc) - timedelta(hours=10)
+    sm._active[agent_id]["last_activity"] = stale_time
+
+    cur = await test_db.execute("SELECT session_count FROM agents WHERE id = ?", (agent_id,))
+    count_before = (await cur.fetchone())["session_count"]
+
+    new_session_id = await sm.touch(agent_id)
+    assert new_session_id != old_session_id
+
+    cur = await test_db.execute("SELECT ended_at FROM sessions WHERE id = ?", (old_session_id,))
+    row = await cur.fetchone()
+    assert row["ended_at"] == stale_time.strftime("%Y-%m-%d %H:%M:%S"), "ended_at must be backdated, not CURRENT_TIMESTAMP"
+
+    cur = await test_db.execute("SELECT resumed FROM sessions WHERE id = ?", (new_session_id,))
+    assert (await cur.fetchone())["resumed"] == 0, "a gap split must never mark the new session resumed"
+
+    cur = await test_db.execute("SELECT session_count FROM agents WHERE id = ?", (agent_id,))
+    count_after = (await cur.fetchone())["session_count"]
+    assert count_after == count_before + 1
+
+    assert call_count["n"] == 1, "baseline scoring must run exactly once for the stale session"
+
+
+@pytest.mark.asyncio
+async def test_touch_split_scoring_failure_does_not_block_new_session(test_db, monkeypatch, caplog):
+    """If closing the stale session raises, the failure is logged but a
+    new session must still be opened -- a scoring failure must never
+    block new-session creation."""
+    agent_id = await _make_agent(test_db, _uniq("gapsplit_fail_agent"))
+    sm = SessionManager()
+
+    old_session_id = await sm.touch(agent_id)
+    sm._active[agent_id]["last_activity"] = datetime.now(timezone.utc) - timedelta(hours=10)
+
+    async def boom(self, db, session_id, agent_id):
+        raise RuntimeError("roll-up exploded")
+
+    monkeypatch.setattr(SessionManager, "_roll_up_session_stats", boom)
+
+    new_session_id = await sm.touch(agent_id)
+    assert new_session_id != old_session_id
+
+    cur = await test_db.execute("SELECT id FROM sessions WHERE id = ?", (new_session_id,))
+    assert await cur.fetchone() is not None, "the new session must exist even though closing the old one failed"
+    assert "closing stale session" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_touch_within_timeout_does_not_split(test_db):
+    agent_id = await _make_agent(test_db, _uniq("nosplit_agent"))
+    sm = SessionManager()
+    session_id = await sm.touch(agent_id)
+    sm._active[agent_id]["last_activity"] = datetime.now(timezone.utc) - timedelta(seconds=100)
+
+    same_session_id = await sm.touch(agent_id)
+    assert same_session_id == session_id
+
+    cur = await test_db.execute("SELECT ended_at FROM sessions WHERE id = ?", (session_id,))
+    assert (await cur.fetchone())["ended_at"] is None, "a normal touch within the timeout must not close the session"
+
+
+@pytest.mark.asyncio
+async def test_touch_concurrent_gap_split_creates_exactly_one_new_session(test_db, monkeypatch):
+    """8 concurrent touch() calls on the same stale agent must not race
+    into 8 duplicate replacement sessions: whichever call acquires the
+    per-agent lock first does the pop-and-create, every other call finds
+    that new session already registered and just returns it."""
+    from core.baseline import Baseline
+
+    agent_id = await _make_agent(test_db, _uniq("concurrent_gapsplit_agent"))
+    sm = SessionManager()
+
+    call_count = {"n": 0}
+    original_update = Baseline.update_from_session
+
+    async def counting_update(self, session_id):
+        call_count["n"] += 1
+        return await original_update(self, session_id)
+
+    monkeypatch.setattr(Baseline, "update_from_session", counting_update)
+
+    old_session_id = await sm.touch(agent_id)
+    stale_time = datetime.now(timezone.utc) - timedelta(hours=10)
+    sm._active[agent_id]["last_activity"] = stale_time
+
+    cur = await test_db.execute("SELECT session_count FROM agents WHERE id = ?", (agent_id,))
+    count_before = (await cur.fetchone())["session_count"]
+
+    results = await asyncio.gather(*[sm.touch(agent_id) for _ in range(8)])
+
+    assert len(set(results)) == 1, "all 8 concurrent calls must return the same new session id"
+    new_session_id = results[0]
+    assert new_session_id != old_session_id
+
+    cur = await test_db.execute(
+        "SELECT COUNT(*) c FROM sessions WHERE agent_id = ? AND id != ?", (agent_id, old_session_id),
+    )
+    assert (await cur.fetchone())["c"] == 1, "exactly one new session row, not 8"
+
+    cur = await test_db.execute("SELECT ended_at FROM sessions WHERE id = ?", (old_session_id,))
+    row = await cur.fetchone()
+    assert row["ended_at"] == stale_time.strftime("%Y-%m-%d %H:%M:%S")
+
+    cur = await test_db.execute("SELECT session_count FROM agents WHERE id = ?", (agent_id,))
+    count_after = (await cur.fetchone())["session_count"]
+    assert count_after == count_before + 1, "session_count must increment exactly once, not 8 times"
+
+    assert set(sm._active.keys()) == {agent_id}
+    assert sm._active[agent_id]["session_id"] == new_session_id
+    assert call_count["n"] == 1, "the stale session must be scored exactly once"
+
+
+@pytest.mark.asyncio
+async def test_close_idle_sessions_concurrent_with_touch_gap_split(test_db, monkeypatch):
+    """close_idle_sessions racing against touch()'s own gap-split for the
+    same stale agent must not raise, must not close the live new
+    session, and must close the stale one exactly once regardless of
+    which path actually wins the race."""
+    from core.baseline import Baseline
+
+    agent_id = await _make_agent(test_db, _uniq("race_closeidle_agent"))
+    sm = SessionManager()
+
+    call_count = {"n": 0}
+    original_update = Baseline.update_from_session
+
+    async def counting_update(self, session_id):
+        call_count["n"] += 1
+        return await original_update(self, session_id)
+
+    monkeypatch.setattr(Baseline, "update_from_session", counting_update)
+
+    old_session_id = await sm.touch(agent_id)
+    sm._active[agent_id]["last_activity"] = datetime.now(timezone.utc) - timedelta(hours=10)
+
+    baseline = Baseline()
+    new_session_id, _closed = await asyncio.gather(
+        sm.touch(agent_id),
+        sm.close_idle_sessions(baseline),
+    )
+
+    assert new_session_id != old_session_id
+
+    cur = await test_db.execute("SELECT ended_at FROM sessions WHERE id = ?", (old_session_id,))
+    assert (await cur.fetchone())["ended_at"] is not None, "the stale session must be closed by one path or the other"
+
+    cur = await test_db.execute("SELECT ended_at FROM sessions WHERE id = ?", (new_session_id,))
+    assert (await cur.fetchone())["ended_at"] is None, "the live new session must never be closed"
+
+    assert sm._active[agent_id]["session_id"] == new_session_id
+    assert call_count["n"] == 1, "the stale session must be scored exactly once, not by both paths"
+
+
+@pytest.mark.asyncio
+async def test_touch_gap_split_close_failure_still_registers_new_session(test_db, monkeypatch):
+    agent_id = await _make_agent(test_db, _uniq("gapsplit_raise_agent"))
+    sm = SessionManager()
+
+    old_session_id = await sm.touch(agent_id)
+    sm._active[agent_id]["last_activity"] = datetime.now(timezone.utc) - timedelta(hours=10)
+
+    async def boom(self, db, baseline, session_id, agent_id, ended_at=None):
+        raise RuntimeError("close exploded")
+
+    monkeypatch.setattr(SessionManager, "_close_session", boom)
+
+    new_session_id = await sm.touch(agent_id)
+    assert new_session_id != old_session_id
+    assert sm._active[agent_id]["session_id"] == new_session_id
+
+    cur = await test_db.execute("SELECT id FROM sessions WHERE id = ?", (new_session_id,))
+    assert await cur.fetchone() is not None
+
+
+@pytest.mark.asyncio
+async def test_touch_gap_split_close_does_not_swallow_cancelled_error(test_db, monkeypatch):
+    agent_id = await _make_agent(test_db, _uniq("gapsplit_cancel_agent"))
+    sm = SessionManager()
+
+    await sm.touch(agent_id)
+    sm._active[agent_id]["last_activity"] = datetime.now(timezone.utc) - timedelta(hours=10)
+
+    async def cancel_boom(self, db, baseline, session_id, agent_id, ended_at=None):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(SessionManager, "_close_session", cancel_boom)
+
+    with pytest.raises(asyncio.CancelledError):
+        await sm.touch(agent_id)
 
 
 @pytest.mark.asyncio
@@ -1542,3 +1803,198 @@ async def test_export_pdf_and_json_label_resumed_sessions(test_db):
     start = next(i for i, t in enumerate(drawn) if resumed_session_id[:8] in t)
     window = " ".join(drawn[start:start + 4])
     assert "(already running when Vigil started)" in window
+
+
+def _capture_drawn_lines(canvas_module):
+    """Shared helper for the PDF-grouping tests below: patches
+    Canvas.drawString to record every (x, text) actually drawn, returning
+    the list (filled in once the caller's `with` block exits) and the
+    context manager itself. x is captured (not just text) because
+    indentation in export_pdf is a real x-offset, not leading spaces in
+    the text -- _wrap_line's word-rejoin strips leading whitespace, so
+    indentation can only be verified by comparing x positions."""
+    from unittest.mock import patch
+
+    drawn: list[tuple[float, str]] = []
+    original = canvas_module.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append((x, text))
+        return original(self, x, y, text)
+
+    return drawn, patch.object(canvas_module.Canvas, "drawString", capture)
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_groups_alerts_by_session(test_db):
+    """Alerts sharing a session_id are grouped under one header line
+    ("Session <id8> (<agent>): N alerts, highest <SEVERITY>, detected
+    <time>") with one indented line per alert beneath it, instead of one
+    flat line per alert. An alert with no session_id falls into a final
+    "Other alerts" group."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    agent_name = _uniq("claude_code_grouptest")
+    agent_id = await _make_agent(test_db, agent_name)
+    session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (session_id, agent_id),
+    )
+    await test_db.execute(
+        "INSERT INTO alerts (agent_id, severity, title, description, status, rule_type, session_id) "
+        "VALUES (?, 'medium', 'grouped alert one', 'd', 'open', 'policy', ?)",
+        (agent_id, session_id),
+    )
+    await test_db.execute(
+        "INSERT INTO alerts (agent_id, severity, title, description, status, rule_type, session_id) "
+        "VALUES (?, 'critical', 'grouped alert two', 'd', 'open', 'policy', ?)",
+        (agent_id, session_id),
+    )
+    await test_db.execute(
+        "INSERT INTO alerts (agent_id, severity, title, description, status, rule_type, session_id) "
+        "VALUES (?, 'high', 'ungrouped alert', 'd', 'open', 'policy', NULL)",
+        (agent_id,),
+    )
+    await test_db.commit()
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    drawn, patcher = _capture_drawn_lines(canvas)
+    with patcher:
+        resp = client.get("/export/pdf")
+    assert resp.status_code == 200
+
+    # The header itself (session id + agent name + counts + severity +
+    # time) is long enough to wrap across several drawString calls, same
+    # as the pre-existing began-before-period marker test -- join a
+    # generous window rather than assuming it's one call.
+    header_idx = next(i for i, (x, t) in enumerate(drawn) if t.startswith(f"Session {session_id[:8]}"))
+    header_x = drawn[header_idx][0]
+    header_window = " ".join(t for x, t in drawn[header_idx:header_idx + 6])
+    assert f"({agent_name})" in header_window
+    assert "2 alerts" in header_window
+    assert "highest CRITICAL" in header_window, "the group header must report the highest severity in the group, not the first"
+
+    search_window = drawn[header_idx:header_idx + 8]
+    alert_one_x, _ = next((x, t) for x, t in search_window if "grouped alert one" in t)
+    alert_two_x, _ = next((x, t) for x, t in search_window if "grouped alert two" in t)
+    assert alert_one_x > header_x, "each alert line under a group header must be indented past it"
+    assert alert_two_x > header_x
+
+    # Other tests in the same shared DB can leave their own session-less
+    # alerts behind, landing in this same "Other alerts" bucket ahead of
+    # this test's own entry -- search generously rather than assuming
+    # it's the very next line (same reasoning as the no-activity-session
+    # fold test earlier in this file).
+    other_idx = next(i for i, (x, t) in enumerate(drawn) if t == "Other alerts")
+    assert any("ungrouped alert" in t for x, t in drawn[other_idx:other_idx + 50])
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_alert_group_labels_out_of_period_session(test_db):
+    """A session that ended before this report's period (so it is not
+    listed in the Sessions section) but has an alert that fired today
+    (see the resumed-session investigation: recovery can score a session
+    long after it actually ended) gets "(session ended ..., before this
+    period)" appended to its group header, using the session's real
+    ended_at converted to local time."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    agent_name = _uniq("codex_outofperiodtest")
+    agent_id = await _make_agent(test_db, agent_name)
+    old_session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, '2020-01-01 10:00:00', '2020-01-01 11:00:00')",
+        (old_session_id, agent_id),
+    )
+    await test_db.execute(
+        "INSERT INTO alerts (agent_id, severity, title, description, status, rule_type, session_id) "
+        "VALUES (?, 'high', 'late recovery alert', 'd', 'open', 'policy', ?)",
+        (agent_id, old_session_id),
+    )
+    await test_db.commit()
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    json_resp = client.get("/export/json")
+    assert old_session_id not in {s["id"] for s in json_resp.json()["sessions"]}, (
+        "the session must genuinely be outside this report's period for this test to mean anything"
+    )
+
+    drawn, patcher = _capture_drawn_lines(canvas)
+    with patcher:
+        resp = client.get("/export/pdf")
+    assert resp.status_code == 200
+
+    # Long header, same wrapping caveat as the grouping test above --
+    # join a window instead of assuming one drawString call.
+    header_idx = next(i for i, (x, t) in enumerate(drawn) if t.startswith(f"Session {old_session_id[:8]}"))
+    header_window = " ".join(t for x, t in drawn[header_idx:header_idx + 6])
+    assert f"({agent_name})" in header_window
+    # Computed the same way production code converts it (UTC -> local),
+    # rather than hardcoding a specific offset -- this machine's local
+    # zone shouldn't be assumed.
+    expected_local = datetime(2020, 1, 1, 11, 0, 0, tzinfo=timezone.utc).astimezone().strftime("%d %b %H:%M:%S")
+    assert f"(session ended {expected_local}, before this period)" in header_window
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_session_markers_each_on_their_own_line(test_db):
+    """Both the resumed marker and the began-before-period marker must
+    each start their own indented drawString line, never appended to the
+    (long) main session line."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    agent_name = _uniq("claude_code_markerlines")
+    agent_id = await _make_agent(test_db, agent_name)
+    session_id = _uniq("sess")
+    # started_at far enough in the past to guarantee it began before
+    # today's period, resumed=1 so both markers apply at once.
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, resumed) "
+        "VALUES (?, ?, '2020-01-01 10:00:00', CURRENT_TIMESTAMP, 1)",
+        (session_id, agent_id),
+    )
+    await test_db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path) VALUES (?, ?, 'file_write', '/x')",
+        (agent_id, session_id),
+    )
+    await test_db.commit()
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    drawn, patcher = _capture_drawn_lines(canvas)
+    with patcher:
+        resp = client.get("/export/pdf")
+    assert resp.status_code == 200
+
+    main_idx = next(i for i, (x, t) in enumerate(drawn) if t.startswith(session_id[:8]))
+    main_x, _ = drawn[main_idx]
+    began_idx = next(i for i, (x, t) in enumerate(drawn) if t == "(began before this period)")
+    resumed_idx = next(i for i, (x, t) in enumerate(drawn) if t == "(already running when Vigil started)")
+    # Each marker is its own exact, standalone drawString call -- not a
+    # substring appended to a longer line -- drawn at a greater x than
+    # the main session line (a real geometric indent, not leading
+    # spaces in the text, which _wrap_line would have stripped anyway).
+    assert drawn[began_idx][0] > main_x
+    assert drawn[resumed_idx][0] > main_x
+    assert resumed_idx in (began_idx + 1, began_idx - 1)

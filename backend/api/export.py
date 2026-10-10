@@ -159,6 +159,8 @@ REPORT_NOTES = [
     "Most file events carry the time the activity happened. Events from the polling fallback are timed when Vigil recorded them, which can be 5 to 20 seconds later.",
     "Events are counted by their own time. Sessions are listed if they overlap this period, so a session that began earlier can contribute events here.",
     "Vigil records only while it is running. Periods when it was not running, for example when the computer was asleep, are listed under Monitoring coverage in this report.",
+    "Vigil records files being created, changed, moved or deleted. It does not record files being read.",
+    "Alert times are when Vigil detected the issue. After a restart this can be later than the activity itself.",
 ]
 
 # A gap at or above this duration is listed individually in the
@@ -262,6 +264,100 @@ async def _compute_coverage(
         "short_gap_count": short_gap_count,
         "short_gap_seconds": short_gap_seconds,
     }
+
+
+# Used only to pick the "highest" severity when grouping a session's
+# alerts together in the PDF (see _draw_alerts_grouped_by_session) --
+# higher number wins.
+_SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+
+
+async def _draw_alerts_grouped_by_session(draw, y: float, summary: dict) -> float:
+    """PDF-only: groups summary["alerts"] by session_id into one header
+    line per session ("Session <id8> (<agent>): N alerts, highest
+    <SEVERITY>, detected <local time>") followed by one indented line per
+    alert, instead of one flat line per alert. Alerts with no session_id
+    fall into a final "Other alerts" group, rendered exactly as the flat
+    list used to be. The JSON export is untouched by this -- it stays
+    one flat row per alert, raw evidence, no grouping.
+
+    A session referenced by an alert but not present in this report's
+    own Sessions section (the alert fired today, but the session itself
+    ended before this period -- see the resumed-session investigation:
+    a session recovered and scored at the next startup carries that
+    startup's timestamp on its alerts, not its own) gets a direct
+    lookup here for its agent name and real ended_at, so the group
+    header can still say which agent it was and why it isn't listed
+    above."""
+    from reportlab.lib.units import inch
+
+    alerts = summary["alerts"]
+    if not alerts:
+        return y
+
+    sessions_in_report = {s["id"]: s for s in summary["sessions"]}
+
+    by_session: dict[str, list[dict]] = {}
+    other_alerts: list[dict] = []
+    for alert in alerts:
+        session_id = alert.get("session_id")
+        if session_id:
+            by_session.setdefault(session_id, []).append(alert)
+        else:
+            other_alerts.append(alert)
+
+    missing_ids = set(by_session.keys()) - set(sessions_in_report.keys())
+    extra_session_info: dict[str, dict] = {}
+    if missing_ids:
+        db = await get_db()
+        placeholders = ",".join("?" * len(missing_ids))
+        cur = await db.execute(
+            f"SELECT s.id, s.ended_at, a.name as agent_name FROM sessions s "
+            f"LEFT JOIN agents a ON a.id = s.agent_id WHERE s.id IN ({placeholders})",
+            tuple(missing_ids),
+        )
+        for row in await cur.fetchall():
+            extra_session_info[row["id"]] = dict(row)
+
+    # Oldest group first, matching the flat list's previous chronological order.
+    ordered_session_ids = sorted(by_session.keys(), key=lambda sid: min(a["created_at"] for a in by_session[sid]))
+
+    for session_id in ordered_session_ids:
+        group = sorted(by_session[session_id], key=lambda a: a["created_at"])
+        highest = max(group, key=lambda a: _SEVERITY_RANK.get(a["severity"], 0))
+        detected_local = _format_local(group[0]["created_at"])
+
+        out_of_period_suffix = ""
+        if session_id in sessions_in_report:
+            agent_name = sessions_in_report[session_id].get("agent_name") or "unidentified_agent"
+        else:
+            info = extra_session_info.get(session_id, {})
+            agent_name = info.get("agent_name") or "unidentified_agent"
+            ended_at = info.get("ended_at")
+            if ended_at:
+                ended_local = datetime.fromisoformat(ended_at.replace(" ", "T")).replace(
+                    tzinfo=timezone.utc
+                ).astimezone()
+                out_of_period_suffix = f" (session ended {ended_local.strftime('%d %b %H:%M:%S')}, before this period)"
+
+        plural = "s" if len(group) != 1 else ""
+        header = (
+            f"Session {session_id[:8]} ({agent_name}): {len(group)} alert{plural}, "
+            f"highest {highest['severity'].upper()}, detected {detected_local}{out_of_period_suffix}"
+        )
+        y = draw(y, header, "Helvetica-Bold", 9, 0.2 * inch)
+        for alert in group:
+            line = f"[{alert['severity'].upper()}] {alert['title']} (status={alert['status']})"
+            y = draw(y, line, "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
+
+    if other_alerts:
+        y = draw(y, "Other alerts", "Helvetica-Bold", 9, 0.2 * inch)
+        for alert in sorted(other_alerts, key=lambda a: a["created_at"]):
+            prefix = _format_local(alert["created_at"])
+            line = f"{prefix}  [{alert['severity'].upper()}] {alert['title']} (status={alert['status']})"
+            y = draw(y, line, "Helvetica", 9, 0.2 * inch)
+
+    return y
 
 
 async def _build_summary(date: str, tz=None) -> dict:
@@ -377,8 +473,15 @@ async def export_pdf(date: str = Query(default="today")):
     max_width = width - 2 * margin
     page_top_y = height - margin
 
-    def draw(y, text, font_name, font_size, line_height):
-        return _draw_wrapped(c, margin, y, text, font_name, font_size, max_width, line_height, page_top_y, margin)
+    def draw(y, text, font_name, font_size, line_height, indent=0.0):
+        # indent shifts the actual draw x-position, rather than
+        # prepending spaces to text -- _wrap_line's token-rejoin pass
+        # (`f"{current} {token}".strip()`) strips leading whitespace from
+        # the very first token, so a literal "    (marker)" string always
+        # loses its indent once it goes through word-wrapping.
+        return _draw_wrapped(
+            c, margin + indent, y, text, font_name, font_size, max_width - indent, line_height, page_top_y, margin,
+        )
 
     # period_start/period_end are UTC ISO; converting each back to local
     # time for display here (rather than storing a pre-formatted string in
@@ -438,14 +541,19 @@ async def export_pdf(date: str = Query(default="today")):
             f"started={_format_local(session['started_at'])}  ended={ended_label}  "
             f"events={session['event_count_in_period']}"
         )
+        y = draw(y, line, "Helvetica", 9, 0.2 * inch)
+        # Each marker always starts its own indented line rather than
+        # being appended to the (already long) main line -- appending
+        # left it at the mercy of _wrap_line's width-driven wrapping,
+        # which could split the marker's own words across two sub-lines
+        # depending on locale/zone-name width.
         session_started_utc = datetime.fromisoformat(
             session["started_at"].replace(" ", "T")
         ).replace(tzinfo=timezone.utc)
         if session_started_utc < period_start_utc:
-            line += "  (began before this period)"
+            y = draw(y, "(began before this period)", "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
         if session["resumed"]:
-            line += "  (already running when Vigil started)"
-        y = draw(y, line, "Helvetica", 9, 0.2 * inch)
+            y = draw(y, "(already running when Vigil started)", "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
     if no_activity_sessions:
         plural = "s" if len(no_activity_sessions) != 1 else ""
         y = draw(
@@ -457,12 +565,7 @@ async def export_pdf(date: str = Query(default="today")):
     c.setFont("Helvetica-Bold", 12)
     y = draw(y, "Alerts", "Helvetica-Bold", 12, 0.25 * inch)
     c.setFont("Helvetica", 9)
-    for alert in summary["alerts"]:
-        prefix = _format_local(alert["created_at"])
-        if alert.get("session_id"):
-            prefix += f"  session={alert['session_id'][:8]}"
-        line = f"{prefix}  [{alert['severity'].upper()}] {alert['title']} (status={alert['status']})"
-        y = draw(y, line, "Helvetica", 9, 0.2 * inch)
+    y = await _draw_alerts_grouped_by_session(draw, y, summary)
     y -= 0.2 * inch
 
     c.setFont("Helvetica-Bold", 12)

@@ -22,6 +22,18 @@ from core.priors import get_prior
 
 _alerter = Alerter()
 
+# file_read events are never produced on Windows with the current watcher
+# stack: watchdog's ReadDirectoryChangesW backend only reports file
+# creation/modification/move/delete, never a pure read -- confirmed against
+# the live DB, 0 file_read events exist across its entire history. With
+# reads structurally stuck at 0, check_ratio_anomaly's write-heavy branch
+# ("wrote N files but read only 0") would fire on every qualifying session,
+# always, which isn't an anomaly, it's the only possible outcome. Gated
+# behind this constant instead of deleted so it can be re-enabled the
+# moment a real read source exists (e.g. ETW file-read tracing, ReadFile
+# auditing) without having to reconstruct the check.
+FILE_READS_OBSERVABLE = False
+
 
 def _parse_ts(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace(" ", "T")).replace(tzinfo=timezone.utc)
@@ -178,7 +190,7 @@ async def check_ratio_anomaly(session_id: str, agent_id: int, agent_name: str, p
         )
         alert_ids.append(alert_id)
 
-    if writes > reads * 3:
+    if FILE_READS_OBSERVABLE and writes > reads * 3:
         title = f"{agent_name} wrote {writes} files but read only {reads} — unusual write-heavy pattern"
         alert_id = await _alerter.fire_alert(
             agent_id, "high",

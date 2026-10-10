@@ -431,10 +431,10 @@ async def test_export_endpoints_reflect_a_real_tracked_gap(test_db):
     assert data["period_seconds_measured"] > 0
     assert len(data["gaps"]) == 1
     assert data["gaps"][0]["reason"] == "monitoring paused (computer likely asleep, or Vigil was suspended)"
-    assert data["report_notes"][-1] == (
+    assert (
         "Vigil records only while it is running. Periods when it was not running, "
         "for example when the computer was asleep, are listed under Monitoring coverage in this report."
-    )
+    ) in data["report_notes"]
 
     resp_pdf = client.get("/export/pdf")
     assert resp_pdf.status_code == 200

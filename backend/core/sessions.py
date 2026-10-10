@@ -8,6 +8,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
+from core.baseline import Baseline
 from core.cross_agent import check_cross_agent_credential_access, check_cross_agent_file_conflict
 from core.digest import generate_summary
 from core.feature_flags import CORE_ONLY
@@ -25,6 +26,33 @@ class SessionManager:
     def __init__(self):
         # agent_id -> {"session_id": str, "last_activity": datetime}
         self._active: dict[int, dict] = {}
+        # agent_id -> asyncio.Lock, created lazily per agent the first
+        # time it's needed. Guards touch()'s own "decide whether to
+        # split, then create and register the replacement" critical
+        # section (see touch()) -- without it, several touch() calls
+        # arriving concurrently for the same stale agent would all see
+        # no active session (each awaits its own INSERT before any of
+        # them gets to register the new one in self._active) and each
+        # create its own duplicate replacement session. The lock makes
+        # that sequence atomic from every other touch() call's point of
+        # view; it does NOT guard the stale session's own close (see
+        # touch()'s docstring for why that happens outside the lock).
+        self._locks: dict[int, asyncio.Lock] = {}
+        # Used only by touch()'s gap-split (see below) to score the
+        # session it closes there. close_idle_sessions/recover_orphaned_
+        # sessions still take their own baseline argument from the caller
+        # (main.py) -- unchanged. Baseline itself holds no state of its
+        # own beyond its Alerter's short in-memory dedup window (all real
+        # state lives in the DB's baseline table), so a second instance
+        # here is functionally interchangeable with the caller's.
+        self._baseline = Baseline()
+
+    def _lock_for(self, agent_id: int) -> asyncio.Lock:
+        lock = self._locks.get(agent_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[agent_id] = lock
+        return lock
 
     async def touch(self, agent_id: int, resumed: bool = False) -> str:
         """Record activity for an agent, opening a new session if none is
@@ -40,30 +68,77 @@ class SessionManager:
         Ignored once a session is already active for this agent (the
         existing-session return path below) -- a resumed session that
         later sees a genuine new spawn keeps its original resumed flag,
-        it doesn't get overwritten or split into a second session."""
+        it doesn't get overwritten or split into a second session.
+
+        Gap split: if the agent already has an active session but the
+        gap since its last activity already exceeds the idle timeout,
+        that session was never actually closed on time -- self._active
+        is in-memory and survives a sleep (the process is suspended, not
+        restarted), so close_idle_sessions' own scheduled check never got
+        a chance to fire on the stale gap before this very call would
+        have refreshed last_activity and erased it (see the resumed-
+        session investigation: a 3-day session spanning several sleeps).
+        Closes the stale session through the same pipeline
+        close_idle_sessions uses, backdated to when it actually went
+        quiet, then opens a genuinely new one -- never resumed, this is
+        a real continuation of activity, not a restart rediscovery.
+
+        Concurrency: deciding to split and registering the replacement
+        session happens under this agent's lock (see _lock_for), so N
+        concurrent touch() calls arriving on the same stale agent
+        produce exactly one replacement session -- whichever call
+        acquires the lock first does the pop-and-create; every other
+        call then finds that brand new session already registered and
+        just returns it, the same as a normal touch within the timeout.
+        Closing the stale session happens AFTER releasing the lock, so
+        a slow or failing close (logged, never raised past here except
+        CancelledError) never makes a concurrent touch() wait for it --
+        only this specific call's own return is delayed by it."""
         db = await get_db()
         now = datetime.now(timezone.utc)
 
-        active = self._active.get(agent_id)
-        if active is not None:
-            active["last_activity"] = now
-            return active["session_id"]
+        stale = None
+        async with self._lock_for(agent_id):
+            active = self._active.get(agent_id)
+            if active is not None:
+                gap_seconds = (now - active["last_activity"]).total_seconds()
+                if gap_seconds <= SESSION_IDLE_TIMEOUT_SECONDS:
+                    active["last_activity"] = now
+                    return active["session_id"]
 
-        session_id = str(uuid.uuid4())
-        from core.identity import get_operator_identity
-        operator_username, operator_hostname = get_operator_identity()
-        await db.execute(
-            "INSERT INTO sessions (id, agent_id, started_at, operator_username, operator_hostname, resumed) "
-            "VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?)",
-            (session_id, agent_id, operator_username, operator_hostname, 1 if resumed else 0),
-        )
-        await db.execute(
-            "UPDATE agents SET session_count = session_count + 1 WHERE id = ?",
-            (agent_id,),
-        )
-        await db.commit()
+                stale = self._active.pop(agent_id)
+                resumed = False  # a gap split is a real continuation, never a restart rediscovery
 
-        self._active[agent_id] = {"session_id": session_id, "last_activity": now}
+            session_id = str(uuid.uuid4())
+            from core.identity import get_operator_identity
+            operator_username, operator_hostname = get_operator_identity()
+            await db.execute(
+                "INSERT INTO sessions (id, agent_id, started_at, operator_username, operator_hostname, resumed) "
+                "VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?)",
+                (session_id, agent_id, operator_username, operator_hostname, 1 if resumed else 0),
+            )
+            await db.execute(
+                "UPDATE agents SET session_count = session_count + 1 WHERE id = ?",
+                (agent_id,),
+            )
+            await db.commit()
+
+            self._active[agent_id] = {"session_id": session_id, "last_activity": now}
+
+        if stale is not None:
+            try:
+                await self._close_session(
+                    db, self._baseline, stale["session_id"], agent_id,
+                    ended_at=stale["last_activity"],
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "closing stale session %s on a long gap failed -- the new session %s is unaffected",
+                    stale["session_id"], session_id,
+                )
+
         return session_id
 
     async def close_idle_sessions(self, baseline) -> list[str]:
@@ -84,45 +159,49 @@ class SessionManager:
         events table, not just this session. asyncio.timeout(8) bounds the
         whole method so a slow cycle cancels cleanly instead of running
         indefinitely; sessions already closed (committed) before the
-        timeout fires stay closed — closed[] just stops growing."""
+        timeout fires stay closed — closed[] just stops growing.
+
+        The idle_candidates snapshot below is taken once, then this loop
+        awaits a full close per agent -- real time passes between
+        agents, during which touch() can run for one of them (a new
+        attributed event, or touch()'s own gap-split beating this loop
+        to it). A blind self._active.pop(agent_id) here would then
+        either raise KeyError (touch()'s gap-split already popped and
+        replaced it) or, worse, pop and close the *new* session touch()
+        just opened. Guarded instead: re-check the current entry right
+        before popping, and only pop if it's still there, still the same
+        session this snapshot saw, and still actually past the timeout
+        (not refreshed by a normal touch() in the meantime). No lock
+        needed here -- the lookup-compare-pop sequence has no await in
+        the middle, so nothing else can observe or mutate self._active
+        between the check and the pop; whichever of this loop or
+        touch()'s own lock-guarded section gets there first simply wins,
+        and the other correctly finds its target already gone or
+        changed."""
         closed: list[str] = []
         try:
             async with asyncio.timeout(CLOSE_IDLE_SESSIONS_TIMEOUT_SECONDS):
                 db = await get_db()
                 now = datetime.now(timezone.utc)
 
-                idle_agent_ids = [
-                    agent_id
+                idle_candidates = [
+                    (agent_id, info["session_id"])
                     for agent_id, info in self._active.items()
                     if (now - info["last_activity"]).total_seconds() >= SESSION_IDLE_TIMEOUT_SECONDS
                 ]
 
-                for agent_id in idle_agent_ids:
-                    info = self._active.pop(agent_id)
-                    session_id = info["session_id"]
-
-                    await self._roll_up_session_stats(db, session_id, agent_id)
-                    await db.execute(
-                        "UPDATE sessions SET ended_at = CURRENT_TIMESTAMP WHERE id = ?",
-                        (session_id,),
-                    )
-                    await db.commit()
-
-                    try:
-                        await baseline.update_from_session(session_id)
-                    except Exception as e:
-                        print(f"baseline update failed for session {session_id}: {e}")
-
-                    await self._score_layer2a(db, session_id, agent_id)
-                    await self._score_layer2b(db, session_id, agent_id)
-                    await self._check_cross_agent(db)
-                    # Alert-firing scoring above can add alerts that
-                    # _roll_up_session_stats' earlier count (taken before
-                    # scoring ran) couldn't see yet -- recount before writing
-                    # the summary so it reflects what actually got fired.
-                    await self._refresh_alert_count(db, session_id, agent_id)
-                    await self._write_summary(db, session_id, agent_id)
-                    closed.append(session_id)
+                for agent_id, candidate_session_id in idle_candidates:
+                    current = self._active.get(agent_id)
+                    if current is None:
+                        continue  # already closed/replaced elsewhere (e.g. touch()'s gap-split)
+                    if current["session_id"] != candidate_session_id:
+                        continue  # a different (newer) session is active now
+                    recheck_gap = (datetime.now(timezone.utc) - current["last_activity"]).total_seconds()
+                    if recheck_gap < SESSION_IDLE_TIMEOUT_SECONDS:
+                        continue  # touched again since the snapshot was taken
+                    self._active.pop(agent_id)
+                    await self._close_session(db, baseline, candidate_session_id, agent_id)
+                    closed.append(candidate_session_id)
         except TimeoutError:
             logger.warning(
                 "SessionManager.close_idle_sessions timed out after %ds -- %d session(s) closed before timeout",
@@ -130,6 +209,44 @@ class SessionManager:
             )
 
         return closed
+
+    async def _close_session(
+        self, db, baseline, session_id: str, agent_id: int, ended_at: datetime | None = None,
+    ) -> None:
+        """Shared close body for a single session: roll up its stat
+        columns, set ended_at, fold it into baseline, score Layer 2a/2b,
+        check cross-agent correlation, refresh the alert count, and write
+        the summary -- the exact pipeline close_idle_sessions ran per
+        session before this was factored out, now also used by touch()'s
+        gap split (see there).
+
+        ended_at=None uses CURRENT_TIMESTAMP (closing because the session
+        is idle right now). An explicit datetime backdates ended_at to
+        that moment instead, for a session closed well after the fact."""
+        await self._roll_up_session_stats(db, session_id, agent_id)
+        if ended_at is None:
+            await db.execute("UPDATE sessions SET ended_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
+        else:
+            await db.execute(
+                "UPDATE sessions SET ended_at = ? WHERE id = ?",
+                (ended_at.strftime("%Y-%m-%d %H:%M:%S"), session_id),
+            )
+        await db.commit()
+
+        try:
+            await baseline.update_from_session(session_id)
+        except Exception as e:
+            print(f"baseline update failed for session {session_id}: {e}")
+
+        await self._score_layer2a(db, session_id, agent_id)
+        await self._score_layer2b(db, session_id, agent_id)
+        await self._check_cross_agent(db)
+        # Alert-firing scoring above can add alerts that
+        # _roll_up_session_stats' earlier count (taken before scoring
+        # ran) couldn't see yet -- recount before writing the summary so
+        # it reflects what actually got fired.
+        await self._refresh_alert_count(db, session_id, agent_id)
+        await self._write_summary(db, session_id, agent_id)
 
     async def _roll_up_session_stats(self, db, session_id: str, agent_id: int) -> None:
         cur = await db.execute(
