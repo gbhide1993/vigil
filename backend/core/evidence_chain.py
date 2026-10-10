@@ -208,6 +208,7 @@ async def verify_chain() -> dict:
                     if chain_prev_hash != expected_prev:
                         return {
                             "valid": False, "checked_count": checked,
+                            "first_bad_event_id": chain_event_id,
                             "reason": "broken_link",
                             "detail": f"event_chain row id={chain_id} (event_id={chain_event_id}) "
                                       f"has prev_hash that doesn't match the previous row's row_hash",
@@ -220,6 +221,7 @@ async def verify_chain() -> dict:
                     if row_dict.get("id") is None:
                         return {
                             "valid": False, "checked_count": checked,
+                            "first_bad_event_id": chain_event_id,
                             "reason": "event_deleted",
                             "detail": f"event_id={chain_event_id} was sealed but no longer exists in events",
                         }
@@ -228,6 +230,7 @@ async def verify_chain() -> dict:
                     if recomputed != chain_row_hash:
                         return {
                             "valid": False, "checked_count": checked,
+                            "first_bad_event_id": chain_event_id,
                             "reason": "hash_mismatch",
                             "detail": f"event_id={chain_event_id} was modified after being sealed",
                         }
@@ -237,6 +240,6 @@ async def verify_chain() -> dict:
 
                 await asyncio.sleep(0)
 
-            return {"valid": True, "checked_count": checked, "reason": None, "detail": None}
+            return {"valid": True, "checked_count": checked, "first_bad_event_id": None, "reason": None, "detail": None}
         finally:
             await conn.close()

@@ -160,6 +160,7 @@ REPORT_NOTES = [
     "Most file events carry the time the activity happened. Events from the polling fallback are timed when Vigil recorded them, which can be 5 to 20 seconds later.",
     "Events are counted by their own time. Sessions are listed if they overlap this period, so a session that began earlier can contribute events here.",
     "Vigil records only while it is running. Periods when it was not running, for example when the computer was asleep, are listed under Monitoring coverage in this report.",
+    "The evidence chain check covers the events table only. It does not cover alerts, dismissals, policy, sessions or monitoring coverage. Vigil runs the check itself on its own database, and no copy of the chain is held anywhere else, so it shows that the stored events are consistent with each other, not that they could not have been rewritten.",
     "Vigil records files being created, changed, moved or deleted. It does not record files being read.",
     "Alert times are when Vigil detected the issue. After a restart this can be later than the activity itself.",
     "Vigil checks which programs are running about every 30 seconds. A program that starts and finishes between checks is not recorded. For recorded programs the command text is shown, with common secret patterns (passwords, tokens, keys) replaced by [REDACTED] on a best-effort basis, so very unusual secrets may still appear.",
@@ -481,9 +482,44 @@ async def _build_summary(date: str, tz=None) -> dict:
     }
 
 
+CHAIN_SCOPE = (
+    "Covers the events table only, not alerts, dismissals, policy, sessions or coverage. "
+    "Checked by Vigil itself; not externally anchored."
+)
+
+
+async def _chain_verification() -> dict:
+    """Runs verify_chain() (which opens its own dedicated connection) and
+    shapes the result for the exports. Shared by the JSON and PDF outputs
+    so they cannot word the same check differently."""
+    from core.evidence_chain import verify_chain
+
+    result = await verify_chain()
+    consistent = bool(result["valid"])
+    return {
+        "status": "consistent" if consistent else "inconsistent",
+        "events_checked": result["checked_count"],
+        "first_bad_event_id": None if consistent else result.get("first_bad_event_id"),
+        "scope": CHAIN_SCOPE,
+    }
+
+
+def _chain_header_text(chain: dict) -> str:
+    if chain["status"] == "consistent":
+        return (
+            f"Evidence chain: consistent ({chain['events_checked']} events checked). "
+            "Checked by Vigil itself; not yet independently anchored."
+        )
+    bad = chain["first_bad_event_id"]
+    where = f"event {bad}" if bad is not None else "an unknown event"
+    return f"Evidence chain: INCONSISTENT at {where}. Do not rely on this report."
+
+
 @router.get("/export/json")
 async def export_json(date: str = Query(default="today")):
-    return await _build_summary(date)
+    summary = await _build_summary(date)
+    summary["chain_verification"] = await _chain_verification()
+    return summary
 
 
 @router.get("/export/pdf")
@@ -507,6 +543,12 @@ async def export_pdf(date: str = Query(default="today")):
         # (`f"{current} {token}".strip()`) strips leading whitespace from
         # the very first token, so a literal "    (marker)" string always
         # loses its indent once it goes through word-wrapping.
+        # Set the font on every call: _draw_wrapped measures and wraps with
+        # font_name/font_size but only calls setFont itself on a page break,
+        # so without this a line is drawn in whatever font the previous
+        # section left active (e.g. alert rows in the bold heading font) and
+        # can run past the width it was wrapped for.
+        c.setFont(font_name, font_size)
         return _draw_wrapped(
             c, margin + indent, y, text, font_name, font_size, max_width - indent, line_height, page_top_y, margin,
         )
@@ -545,15 +587,9 @@ async def export_pdf(date: str = Query(default="today")):
         "Helvetica", 10, 0.4 * inch,
     )
 
-    from core.evidence_chain import verify_chain
-    # verify_chain() opens its own dedicated connection internally.
-    chain_result = await verify_chain()
-    chain_status = "VERIFIED INTACT" if chain_result["valid"] else f"INTEGRITY FAILURE: {chain_result['reason']}"
+    chain = await _chain_verification()
     c.setFont("Helvetica-Bold", 10)
-    y = draw(
-        y, f"Evidence chain: {chain_status} ({chain_result['checked_count']} events checked)",
-        "Helvetica-Bold", 10, 0.3 * inch,
-    )
+    y = draw(y, _chain_header_text(chain), "Helvetica-Bold", 10, 0.3 * inch)
 
     period_start_utc = datetime.fromisoformat(summary["period_start"])
 

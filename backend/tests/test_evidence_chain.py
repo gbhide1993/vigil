@@ -1,4 +1,4 @@
-"""Tests for core/evidence_chain.py's hash-chained tamper-evidence over
+"""Tests for core/evidence_chain.py's hash chain over
 the events table, plus core/sessions.py's touch() capturing operator
 identity (core/identity.py). See conftest.py for why VLAW_DATA_DIR is set
 there rather than here -- this module must only ever touch that isolated
@@ -57,7 +57,7 @@ def _uniq(label: str) -> str:
 @pytest.mark.asyncio
 async def test_seal_and_verify_empty(test_db):
     result = await verify_chain()
-    assert result == {"valid": True, "checked_count": 0, "reason": None, "detail": None}
+    assert result == {"valid": True, "checked_count": 0, "first_bad_event_id": None, "reason": None, "detail": None}
 
 
 # -------------------------------------------------------- 2. seal creates chain
@@ -229,3 +229,109 @@ async def test_session_captures_operator_identity(test_db, monkeypatch):
     row = await cur.fetchone()
     assert row["operator_username"] == "testuser"
     assert row["operator_hostname"] == "testhost"
+
+
+# ----------------------------------------- 7. export wording (PDF and JSON)
+
+def _export_client(patch_target):
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import api.export as export_module
+
+    async def fake_build_summary(date, tz=None):
+        return {
+            "date": "2026-03-15", "generated_at": "2026-03-15T12:00:00+00:00",
+            "period_start": "2026-03-15T00:00:00+00:00", "period_end": "2026-03-16T00:00:00+00:00",
+            "timezone": "UTC", "event_count": 0, "sessions": [], "alerts": [],
+            "report_notes": export_module.REPORT_NOTES, "coverage_available": False,
+            "tracking_started_at": None, "active_seconds": 0, "period_seconds_measured": 0,
+            "gaps": [], "short_gap_count": 0, "short_gap_seconds": 0,
+        }
+
+    app = FastAPI()
+    app.include_router(export_module.router)
+    return TestClient(app), patch.object(export_module, "_build_summary", fake_build_summary)
+
+
+def _pdf_text():
+    from unittest.mock import patch
+
+    from reportlab.pdfgen import canvas
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    client, build_patch = _export_client(None)
+    with build_patch, patch.object(canvas.Canvas, "drawString", capture):
+        assert client.get("/export/pdf").status_code == 200
+    return " ".join(drawn)
+
+
+def _json_export():
+    client, build_patch = _export_client(None)
+    with build_patch:
+        resp = client.get("/export/json")
+    assert resp.status_code == 200
+    return resp.json()
+
+
+@pytest.mark.asyncio
+async def test_exports_say_consistent_for_a_good_chain(test_db):
+    agent_id = await _make_agent(test_db, _uniq("claude_code_exportok"))
+    session_id = _uniq("sess")
+    for i in range(2):
+        await _insert_event(test_db, agent_id, session_id, f"/tmp/ok{i}.py")
+    sealed_total = await seal_new_events()
+    assert (await verify_chain())["valid"] is True
+
+    chain = _json_export()["chain_verification"]
+    assert chain["status"] == "consistent"
+    assert chain["first_bad_event_id"] is None
+    assert chain["events_checked"] >= 2
+    assert "events table only" in chain["scope"]
+    assert "not externally anchored" in chain["scope"]
+
+    text = _pdf_text()
+    assert "Evidence chain: consistent (" in text
+    assert "events checked). Checked by Vigil itself; not yet independently anchored." in text
+    assert "INCONSISTENT" not in text
+
+
+@pytest.mark.asyncio
+async def test_exports_flag_an_edited_middle_event(test_db):
+    agent_id = await _make_agent(test_db, _uniq("claude_code_exportbad"))
+    session_id = _uniq("sess")
+    ids = [await _insert_event(test_db, agent_id, session_id, f"/tmp/m{i}.py") for i in range(3)]
+    await seal_new_events()
+    middle = ids[1]
+
+    await test_db.execute("UPDATE events SET path = ? WHERE id = ?", ("/tmp/edited.py", middle))
+    await test_db.commit()
+    try:
+        chain = _json_export()["chain_verification"]
+        assert chain["status"] == "inconsistent"
+        assert chain["first_bad_event_id"] == middle
+
+        text = _pdf_text()
+        assert f"Evidence chain: INCONSISTENT at event {middle}. Do not rely on this report." in text
+        assert "consistent (" not in text
+    finally:
+        await test_db.execute("UPDATE events SET path = ? WHERE id = ?", (f"/tmp/m1.py", middle))
+        await test_db.commit()
+    assert (await verify_chain())["valid"] is True
+
+
+def test_report_notes_state_the_chain_scope():
+    import api.export as export_module
+
+    notes = [n for n in export_module.REPORT_NOTES if n.startswith("The evidence chain check covers")]
+    assert len(notes) == 1
+    assert "alerts, dismissals, policy, sessions or monitoring coverage" in notes[0]
+    assert "tamper" not in " ".join(export_module.REPORT_NOTES).lower()

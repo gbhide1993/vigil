@@ -1112,7 +1112,7 @@ async def test_export_json_includes_report_notes():
     assert resp.status_code == 200
     data = resp.json()
     assert data["report_notes"] == export_module.REPORT_NOTES
-    assert len(data["report_notes"]) == 8
+    assert len(data["report_notes"]) == 9
     assert any("[REDACTED]" in n and "best-effort" in n for n in data["report_notes"])
     assert not any("not its exact command text" in n for n in data["report_notes"])
 
