@@ -17,7 +17,7 @@ Use the `vigil` MCP server to generate and download a session PDF audit report.
    - Session ID (first 8 characters)
    - Agent name
    - Start time (local timezone)
-   - Summary counts: files touched, network connections, process spawns, red lines
+   - Summary counts: files touched, process spawns, red lines (network connections are not monitored in this version; if the report shows them as "off", say so rather than reporting zero)
    - Whether any red lines were triggered
 
 4. Provide the PDF download URL:
@@ -30,7 +30,7 @@ Use the `vigil` MCP server to generate and download a session PDF audit report.
 
 ## Notes
 
-- The PDF is generated independently of agent self-reporting — it reflects what the OS actually observed
-- Red lines indicate policy violations (credential file access, out-of-scope writes, unapproved network destinations)
+- The PDF is generated independently of agent self-reporting. It reflects what Vigil observed; file reads are not recorded and short-lived processes between checks can be missed, so absence of an entry is not proof something did not happen
+- Red lines indicate policy violations (credential file changes, out-of-scope writes, dangerous commands)
 - Timestamps are shown in local time (IST or your system timezone)
 - The Vigil backend must be running at `http://127.0.0.1:7422` for this to work

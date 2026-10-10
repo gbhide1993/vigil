@@ -1,7 +1,7 @@
 {
   "name": "vigil-ai-monitor",
   "displayName": "Vigil: Verify Coding Agent",
-  "description": "Independent OS-level evidence of what your coding agent actually does.",
+  "description": "Independent OS-level record of the file changes, processes and credential-file activity your coding agent causes.",
   "version": "0.2.24",
   "publisher": "vvault",
   "repository": {

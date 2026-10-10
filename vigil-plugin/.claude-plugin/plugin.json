@@ -1,6 +1,6 @@
 {
   "name": "vigil",
-  "description": "Real-time AI agent monitoring for Claude Code. Vigil captures every file touch, network connection, and process spawn your agent makes — and generates a tamper-evident session PDF you can share with security and compliance teams.",
+  "description": "AI agent monitoring for Claude Code. Vigil records the file changes, process spawns and credential-file activity your agent causes, and generates a session PDF report you can share with security and compliance teams. Network monitoring is planned.",
   "version": "1.0.0",
   "author": {
     "name": "Vvault Technologies",

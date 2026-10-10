@@ -1,7 +1,7 @@
 const WATCH_ITEMS = [
-  { icon: '📁', label: 'Files your agents read and write' },
+  { icon: '📁', label: 'Files your agents create, change and delete' },
   { icon: '⚙️', label: 'Processes they spawn' },
-  { icon: '🔑', label: 'Credential files they access' },
+  { icon: '🔑', label: 'Changes to credential files' },
 ]
 
 export default function WelcomeScreen() {

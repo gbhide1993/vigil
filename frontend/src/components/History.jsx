@@ -93,12 +93,12 @@ function WelcomeState() {
           and return here. Your first session will appear automatically.
         </div>
         <div style={{ fontSize: 12.5, color: 'var(--color-navy-muted)', lineHeight: 2 }}>
-          <div>● File activity</div>
+          <div>● File changes</div>
           <div>● Process spawns</div>
-          <div>● MCP tool calls</div>
+          <div>● MCP configuration changes</div>
         </div>
         <div style={{ fontSize: 12, color: 'var(--color-navy-muted)', marginTop: 24 }}>
-          All monitored. Zero data leaves this machine.
+          Zero data leaves this machine.
         </div>
       </div>
     </div>
@@ -193,7 +193,7 @@ export default function History() {
       <div className="page-header">
         <div>
           <div className="page-title">History</div>
-          <div className="page-subtitle">Real-time agent activity on this machine</div>
+          <div className="page-subtitle">Agent activity on this machine</div>
         </div>
       </div>
 

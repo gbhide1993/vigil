@@ -470,8 +470,7 @@ async function updateTrayTooltip() {
     }
 
     const files = (lastSession.file_reads || 0) + (lastSession.file_writes || 0)
-    const mb = formatMB(lastSession.net_egress_bytes || 0)
-    tray.setToolTip(`Vigil — Last session clean. ${files} files, ${mb} MB egress.`)
+    tray.setToolTip(`Vigil — Last session clean. ${files} files.`)
   } catch (err) {
     // non-fatal — tooltip just keeps its last known text until this succeeds again
   }

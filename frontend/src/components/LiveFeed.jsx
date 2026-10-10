@@ -74,12 +74,12 @@ function WelcomeState() {
           and return here. Your first session will appear automatically.
         </div>
         <div style={{ fontSize: 12.5, color: 'var(--color-navy-muted)', lineHeight: 2 }}>
-          <div>● File activity</div>
+          <div>● File changes</div>
           <div>● Process spawns</div>
-          <div>● MCP tool calls</div>
+          <div>● MCP configuration changes</div>
         </div>
         <div style={{ fontSize: 12, color: 'var(--color-navy-muted)', marginTop: 24 }}>
-          All monitored. Zero data leaves this machine.
+          Zero data leaves this machine.
         </div>
       </div>
     </div>
@@ -94,7 +94,7 @@ function FirstSessionCard({ session, topFinding, onDismiss }) {
   let text
   if (kind === 'red_line') {
     borderColor = 'var(--color-red)'
-    text = `First session complete. ${session.agent_name} accessed ${session.file_reads + session.file_writes} files ${session.net_connect_count > 0 ? ` and made ${session.net_connect_count} network connections` : ''}. 1 RED LINE alert caught.`
+    text = `First session complete. ${session.agent_name} accessed ${session.file_reads + session.file_writes} files${session.net_connect_count > 0 ? ` and made ${session.net_connect_count} network connections` : ''}. 1 RED LINE alert caught.`
   } else if (kind === 'anomaly') {
     borderColor = 'var(--color-amber)'
     text = `First session complete. ${session.agent_name} accessed ${session.file_reads + session.file_writes} files. ${alert.title}`
@@ -312,7 +312,7 @@ export default function LiveFeed() {
       <div className="page-header">
         <div>
           <div className="page-title">Live Feed</div>
-          <div className="page-subtitle">Real-time agent activity on this machine</div>
+          <div className="page-subtitle">Agent activity on this machine</div>
         </div>
       </div>
 

@@ -4,7 +4,7 @@
 
 Claude Code, Cursor, GitHub Copilot and Codex do a lot on your machine.
 
-**Vigil gives you independent OS-level evidence of what actually happened.**
+**Vigil gives you independent OS-level evidence of what the machine observed.**
 
 ![Vigil in action](https://download.getvvault.com/vigil_demo.gif)
 
@@ -25,13 +25,13 @@ Vigil: *Here's the session record.*
 
 ## What Vigil shows you
 
-**🔌 MCP activity** — every MCP server call your agent makes
+**🔌 MCP configuration** — changes to MCP configuration files and auto-approvals (monitoring of individual MCP connections is planned and off in this version)
 
-**🌐 Network connections** — outbound connections initiated during the session
+**🌐 Network connections** — planned. Network monitoring is not part of this version
 
 **⚙️ Process activity** — commands and processes spawned by your agent
 
-**📄 File activity** — files read, written, or deleted
+**📄 File activity** — files created, changed, moved or deleted (file reads are not recorded)
 
 **🚨 Red Lines** — hard limits you define; Vigil flags anything that crosses them
 
@@ -45,7 +45,7 @@ Vigil: *Here's the session record.*
 
 Vigil sits at the OS level, independent of your coding agent. It doesn't rely on what the agent reports — it observes what the machine actually does.
 
-The Vigil VS Code sidebar connects to a local backend that monitors file activity, network connections, and process spawns in real time. Claude Code (and other agents) can query Vigil directly via MCP to get a record of their own session activity.
+The Vigil VS Code sidebar connects to a local backend that records file changes and process spawns (processes are checked about every 30 seconds). Network monitoring is planned. Claude Code (and other agents) can query Vigil directly via MCP to get a record of their own session activity.
 
 **Vigil observes. Claude reasons. Developer decides.**
 
@@ -77,7 +77,7 @@ The Vigil VS Code sidebar connects to a local backend that monitors file activit
 Red Lines are conditions you define that Vigil should never let pass silently.
 
 Examples:
-- Network connection to an unexpected external host
+- Change to a credential file such as `.env` or an SSH key
 - Write to a file outside your project directory
 - Process spawn that looks like an exfiltration tool
 
