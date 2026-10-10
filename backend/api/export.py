@@ -1,4 +1,5 @@
 import io
+import re
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query
@@ -161,8 +162,28 @@ REPORT_NOTES = [
     "Vigil records only while it is running. Periods when it was not running, for example when the computer was asleep, are listed under Monitoring coverage in this report.",
     "Vigil records files being created, changed, moved or deleted. It does not record files being read.",
     "Alert times are when Vigil detected the issue. After a restart this can be later than the activity itself.",
-    "Vigil checks which programs are running about every 30 seconds. A program that starts and finishes between checks is not recorded. For most programs an agent runs, only the program's name is recorded, not its exact command text.",
+    "Vigil checks which programs are running about every 30 seconds. A program that starts and finishes between checks is not recorded. For recorded programs the command text is shown, with common secret patterns (passwords, tokens, keys) replaced by [REDACTED] on a best-effort basis, so very unusual secrets may still appear.",
 ]
+
+# Alerts whose description ends in the spawned command line (see
+# RedLines.check_dangerous_command and ProcessWatcher's generic
+# "Suspicious command spawned" alert). The command is already redacted at
+# capture, so the PDF just echoes it from the description.
+_COMMAND_ALERT_REASONS = {"red_line_dangerous_command", "suspicious_command"}
+_COMMAND_IN_DESCRIPTION = re.compile(r"(?:sensitive|suspicious) command: (.+)", re.DOTALL)
+_PDF_COMMAND_MAX_CHARS = 200
+
+
+def _alert_command_line(alert: dict) -> str | None:
+    if alert.get("reason") not in _COMMAND_ALERT_REASONS:
+        return None
+    m = _COMMAND_IN_DESCRIPTION.search(alert.get("description") or "")
+    if not m:
+        return None
+    command = " ".join(m.group(1).split())
+    if len(command) > _PDF_COMMAND_MAX_CHARS:
+        command = command[:_PDF_COMMAND_MAX_CHARS] + "..."
+    return command
 
 # A gap at or above this duration is listed individually in the
 # "Monitoring coverage" section; anything shorter (a quick restart, a
@@ -350,6 +371,9 @@ async def _draw_alerts_grouped_by_session(draw, y: float, summary: dict) -> floa
         for alert in group:
             line = f"[{alert['severity'].upper()}] {alert['title']} (status={alert['status']})"
             y = draw(y, line, "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
+            command = _alert_command_line(alert)
+            if command:
+                y = draw(y, command, "Helvetica", 8, 0.18 * inch, indent=0.6 * inch)
 
     if other_alerts:
         y = draw(y, "Other alerts", "Helvetica-Bold", 9, 0.2 * inch)
@@ -357,6 +381,9 @@ async def _draw_alerts_grouped_by_session(draw, y: float, summary: dict) -> floa
             prefix = _format_local(alert["created_at"])
             line = f"{prefix}  [{alert['severity'].upper()}] {alert['title']} (status={alert['status']})"
             y = draw(y, line, "Helvetica", 9, 0.2 * inch)
+            command = _alert_command_line(alert)
+            if command:
+                y = draw(y, command, "Helvetica", 8, 0.18 * inch, indent=0.3 * inch)
 
     return y
 

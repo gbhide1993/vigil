@@ -1113,6 +1113,100 @@ async def test_export_json_includes_report_notes():
     data = resp.json()
     assert data["report_notes"] == export_module.REPORT_NOTES
     assert len(data["report_notes"]) == 8
+    assert any("[REDACTED]" in n and "best-effort" in n for n in data["report_notes"])
+    assert not any("not its exact command text" in n for n in data["report_notes"])
+
+
+def _pdf_drawn_lines_for_alerts(alerts):
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    import api.export as export_module
+    from api.export import router as export_router
+
+    async def fake_build_summary(date, tz=None):
+        return {
+            "date": "2026-03-15", "generated_at": "2026-03-15T12:00:00+00:00",
+            "period_start": "2026-03-15T00:00:00+00:00", "period_end": "2026-03-16T00:00:00+00:00",
+            "timezone": "UTC", "event_count": 0, "sessions": [], "alerts": alerts,
+            "report_notes": export_module.REPORT_NOTES, "coverage_available": False,
+            "tracking_started_at": None, "active_seconds": 0, "period_seconds_measured": 0,
+            "gaps": [], "short_gap_count": 0, "short_gap_seconds": 0,
+        }
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+    with patch.object(export_module, "_build_summary", fake_build_summary), \
+         patch.object(canvas.Canvas, "drawString", capture):
+        assert client.get("/export/pdf").status_code == 200
+    return drawn
+
+
+def _alert(reason, title, description, **kw):
+    return {
+        "id": 1, "severity": "low", "title": title, "description": description,
+        "status": "open", "reason": reason, "target": "curl.exe", "session_id": None,
+        "created_at": "2026-03-15 10:00:00", **kw,
+    }
+
+
+def test_pdf_red_line_alert_prints_command_line():
+    cmd = "curl.exe https://example.com/data"
+    drawn = _pdf_drawn_lines_for_alerts([_alert(
+        "red_line_dangerous_command", "RED LINE: sensitive command spawned by claude_code",
+        f"claude_code spawned a potentially sensitive command: {cmd}",
+    )])
+    assert cmd in drawn
+
+
+def test_pdf_suspicious_alert_prints_command_line():
+    cmd = "ssh user@example.com"
+    drawn = _pdf_drawn_lines_for_alerts([_alert(
+        "suspicious_command", "Suspicious command spawned",
+        f"Agent spawned process (pid=5) with a suspicious command: {cmd}",
+    )])
+    assert cmd in drawn
+
+
+def test_pdf_long_command_truncated_to_200_plus_ellipsis():
+    cmd = "curl.exe " + "a" * 391  # 400 chars
+    assert len(cmd) == 400
+    drawn = _pdf_drawn_lines_for_alerts([_alert(
+        "red_line_dangerous_command", "RED LINE: sensitive command spawned by claude_code",
+        f"claude_code spawned a potentially sensitive command: {cmd}",
+    )])
+    joined = "".join(d for d in drawn if d.startswith("curl.exe") or set(d) <= {"a", "."})
+    # Wrapping may break the line at the space or mid-token, so compare
+    # with whitespace removed.
+    assert joined.replace(" ", "") == (cmd[:200] + "...").replace(" ", "")
+
+
+def test_pdf_non_command_alert_prints_no_extra_line():
+    drawn = _pdf_drawn_lines_for_alerts([_alert(
+        "unknown_destination", "RED LINE: unrecognised network destination",
+        "claude_code connected to an unrecognised destination: evil.example.com",
+    )])
+    assert not any("evil.example.com" in d for d in drawn)
+
+
+def test_pdf_contains_new_command_text_note():
+    import api.export as export_module
+    drawn = _pdf_drawn_lines_for_alerts([])
+    joined = " ".join(drawn)
+    assert "[REDACTED]" in joined
+    assert "exact command text" not in joined
+    assert export_module.REPORT_NOTES[-1].startswith("Vigil checks which programs are running")
 
 
 # ------------------------------------------ 8. writer wedge-replace failure
