@@ -27,6 +27,7 @@ from db.database import get_db
 from core.priors import get_prior
 from core.layer2a import check_network_destinations, check_ratio_anomaly, check_time_anomaly
 import core.layer2a as layer2a
+from core.layer2b import score_session_2b
 from core.sessions import SessionManager
 from core.baseline import Baseline
 from core.cross_agent import check_cross_agent_file_conflict
@@ -1672,6 +1673,92 @@ async def test_layer2b_history_skips_resumed_and_zero_activity_sessions(test_db)
 
     assert len(history) == 3
     assert {h["file_event_count"] for h in history} == {5, 8, 3}
+
+
+async def _insert_layer2b_session(db, agent_id, started, ended, file_events=0, resumed=False):
+    session_id = _uniq("sess")
+    await db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, resumed) VALUES (?, ?, ?, ?, ?)",
+        (session_id, agent_id, started, ended, 1 if resumed else 0),
+    )
+    for _ in range(file_events):
+        await db.execute(
+            "INSERT INTO events (agent_id, session_id, event_type, path, created_at) "
+            "VALUES (?, ?, 'file_write', 'x', ?)",
+            (agent_id, session_id, started),
+        )
+    await db.commit()
+    return session_id
+
+
+@pytest.mark.asyncio
+async def test_layer2b_upward_only_low_value_no_alert(test_db):
+    """A current value at or below the history's median must never fire
+    a rolling_anomaly alert, even when it deviates from the median by
+    far more than MAD_THRESHOLD -- mad_score is a two-sided magnitude,
+    but this alert only ever means "more than usual"."""
+    agent_id = await _make_agent(test_db, _uniq("layer2b_lowvalue_agent"))
+
+    # Small counts, same ratios as before -- seal_new_events() has its
+    # own batch cap, and this shared test DB accumulates unsealed events
+    # across every test in the run, so inserting hundreds of rows here
+    # starved an unrelated evidence-chain test of its expected seal count.
+    for i, count in enumerate((8, 9, 10, 11, 12)):
+        await _insert_layer2b_session(
+            test_db, agent_id, f"2026-01-01 0{i}:00:00", f"2026-01-01 0{i}:10:00", file_events=count,
+        )
+
+    current_session_id = await _insert_layer2b_session(
+        test_db, agent_id, "2026-01-01 20:00:00", "2026-01-01 20:10:00", file_events=2,
+    )
+
+    alert_ids = await score_session_2b(current_session_id, agent_id, "claude_code", test_db)
+    assert alert_ids == [], "a value well below the median must not fire, however large the raw deviation"
+
+
+@pytest.mark.asyncio
+async def test_layer2b_skips_resumed_current_session(test_db):
+    """A resumed=1 session's own metrics are partial (see
+    core/sessions.py::touch), so it must never be scored against
+    history by layer2b, even with real history and an extreme value --
+    consistent with core/baseline.py skipping resumed sessions too."""
+    agent_id = await _make_agent(test_db, _uniq("layer2b_resumed_current_agent"))
+
+    for i, count in enumerate((8, 9, 10, 11, 12)):
+        await _insert_layer2b_session(
+            test_db, agent_id, f"2026-01-01 0{i}:00:00", f"2026-01-01 0{i}:10:00", file_events=count,
+        )
+
+    current_session_id = await _insert_layer2b_session(
+        test_db, agent_id, "2026-01-01 20:00:00", "2026-01-01 20:10:00", file_events=50, resumed=True,
+    )
+
+    alert_ids = await score_session_2b(current_session_id, agent_id, "claude_code", test_db)
+    assert alert_ids == [], "a resumed=1 current session must never be scored by layer2b"
+
+
+@pytest.mark.asyncio
+async def test_layer2b_normal_high_deviation_still_alerts(test_db):
+    """The upward-only gate must not suppress a real, legitimate spike --
+    a value well above the median, with a large enough MAD score, must
+    still fire with correct 'more' wording."""
+    agent_id = await _make_agent(test_db, _uniq("layer2b_highvalue_agent"))
+
+    for i, count in enumerate((8, 9, 10, 11, 12)):
+        await _insert_layer2b_session(
+            test_db, agent_id, f"2026-01-01 0{i}:00:00", f"2026-01-01 0{i}:10:00", file_events=count,
+        )
+
+    current_session_id = await _insert_layer2b_session(
+        test_db, agent_id, "2026-01-01 20:00:00", "2026-01-01 20:10:00", file_events=20,
+    )
+
+    alert_ids = await score_session_2b(current_session_id, agent_id, "claude_code", test_db)
+    assert len(alert_ids) == 1
+
+    cur = await test_db.execute("SELECT title FROM alerts WHERE id = ?", (alert_ids[0],))
+    title = (await cur.fetchone())["title"]
+    assert "2.0x more files" in title
 
 
 @pytest.mark.asyncio

@@ -147,6 +147,16 @@ async def score_session_2b(session_id: str, agent_id: int, agent_name: str, db) 
     alert_ids: list[int] = []
 
     try:
+        cur = await db.execute("SELECT resumed FROM sessions WHERE id = ?", (session_id,))
+        row = await cur.fetchone()
+        if row is not None and row["resumed"]:
+            # Rediscovered-on-restart: this session's own metrics are
+            # partial (see core/sessions.py::touch), so comparing them
+            # against history is meaningless -- consistent with
+            # core/baseline.py's update_from_session, which skips
+            # folding/scoring resumed=1 sessions for the same reason.
+            return []
+
         history = await get_session_history(agent_id, session_id, db)
         if len(history) < 3:
             return []
@@ -163,12 +173,22 @@ async def score_session_2b(session_id: str, agent_id: int, agent_name: str, db) 
         for metric_name, noun, verb in metrics:
             current_value = current[metric_name]
             history_values = [h[metric_name] for h in history]
+            median = _median(history_values)
+
+            # Upward-only: mad_score is a two-sided deviation magnitude,
+            # so a value well BELOW the median would otherwise score just
+            # as high as one well above it, and could reach the "more X"
+            # wording below with a sub-1.0 multiplier (e.g. "0.3x more
+            # files") -- a value at or below the median is never the kind
+            # of anomaly this alert describes, regardless of how far it
+            # deviates.
+            if current_value <= median:
+                continue
 
             score = mad_score(current_value, history_values)
             if score <= MAD_THRESHOLD:
                 continue
 
-            median = _median(history_values)
             multiplier = round(current_value / max(median, 1), 1)
 
             severity = "high" if score > 6.0 else "medium"
