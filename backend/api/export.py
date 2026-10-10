@@ -389,6 +389,26 @@ async def _draw_alerts_grouped_by_session(draw, y: float, summary: dict) -> floa
     return y
 
 
+async def _checkpoint_counts_by_session(db, start_sql: str, end_sql: str) -> dict[str, int]:
+    """Writes into Claude's hidden file-history (checkpoint) folder, per
+    session. These used to raise one low "checkpoint write" alert per burst;
+    they are normal /rewind activity, so the report now shows a single info
+    line per session instead (see RedLines.check_claude_cache_write)."""
+    from core.red_lines import is_claude_cache_write
+
+    cur = await db.execute(
+        "SELECT session_id, path, file_count FROM events "
+        "WHERE event_type = 'file_write' AND created_at >= ? AND created_at < ? "
+        "AND (path LIKE '%file-history%')",
+        (start_sql, end_sql),
+    )
+    counts: dict[str, int] = {}
+    for row in await cur.fetchall():
+        if is_claude_cache_write(row["path"] or ""):
+            counts[row["session_id"]] = counts.get(row["session_id"], 0) + (row["file_count"] or 1)
+    return counts
+
+
 async def _build_summary(date: str, tz=None) -> dict:
     db = await get_db()
     day = _resolve_local_day(date, tz)
@@ -424,8 +444,10 @@ async def _build_summary(date: str, tz=None) -> dict:
         (start_sql, end_sql),
     )
     event_counts_by_session = {row["session_id"]: row["c"] for row in await cur.fetchall()}
+    checkpoint_counts = await _checkpoint_counts_by_session(db, start_sql, end_sql)
     for session in sessions:
         session["event_count_in_period"] = event_counts_by_session.get(session["id"], 0)
+        session["checkpoint_writes"] = checkpoint_counts.get(session["id"], 0)
         # A session whose started_at/ended_at are identical and which
         # contributed no events this period is the artifact a restart
         # produces (see the duplicate-session investigation): opened and
@@ -618,6 +640,13 @@ async def export_pdf(date: str = Query(default="today")):
             y = draw(y, "(began before this period)", "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
         if session["resumed"]:
             y = draw(y, "(already running when Vigil started)", "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
+        if session.get("checkpoint_writes"):
+            n = session["checkpoint_writes"]
+            y = draw(
+                y,
+                f"(info: {n} checkpoint write{'s' if n != 1 else ''} to the agent's hidden cache folder, normal /rewind activity)",
+                "Helvetica", 9, 0.2 * inch, indent=0.3 * inch,
+            )
     if no_activity_sessions:
         plural = "s" if len(no_activity_sessions) != 1 else ""
         y = draw(

@@ -4,7 +4,12 @@ against AGENT_PRIORS — researched starting distributions — so they fire
 useful alerts from session 1.
 
 Four independent checks, each firing its own alert(s) via Alerter:
-  1. Hard threshold breach (file/network/process volume vs typical/high/critical)
+  1. Hard threshold breach (file/network/process volume vs typical/high/critical),
+     calibrated by core/activity_filter.py: generated paths and helper
+     processes are not counted, absolute floors apply, and all volume
+     findings for a session are merged into one "Unusual activity volume"
+     alert. Every severity in this module is capped at MEDIUM unless the
+     session is corroborated (see activity_filter.cap_severity).
   2. Time-of-day anomaly (session outside normal_hours, escalated if the
      user has also been inactive for hours)
   3. Read/write ratio anomaly (read-heavy or write-heavy vs prior ratio)
@@ -17,6 +22,9 @@ triggered scoring.
 
 from datetime import datetime, timezone
 
+from core.activity_filter import (
+    cap_severity, evaluate_prior_volume, fire_volume_alert, get_corroboration, session_volume_metrics,
+)
 from core.alerter import Alerter
 from core.priors import get_prior
 
@@ -48,59 +56,10 @@ def _local_tz():
 
 
 async def check_hard_thresholds(session_id: str, agent_id: int, agent_name: str, prior: dict, db) -> list[int]:
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM events WHERE session_id = ? AND event_type IN ('file_read', 'file_write')",
-        (session_id,),
-    )
-    file_count = (await cur.fetchone())["c"]
-
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM events WHERE session_id = ? AND event_type = 'net_connect'",
-        (session_id,),
-    )
-    net_count = (await cur.fetchone())["c"]
-
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM events WHERE session_id = ? AND event_type = 'proc_spawn'",
-        (session_id,),
-    )
-    proc_count = (await cur.fetchone())["c"]
-
-    metrics = [
-        ("file_events_per_session", file_count, "files this session", "wrote"),
-        ("network_events_per_session", net_count, "network connections this session", "made"),
-        ("process_spawns_per_session", proc_count, "processes this session", "spawned"),
-    ]
-
-    alert_ids: list[int] = []
-    for metric_name, value, noun, verb in metrics:
-        thresholds = prior[metric_name]
-        if value <= thresholds["high"]:
-            continue
-
-        multiplier = round(value / thresholds["typical"], 1) if thresholds["typical"] else 0
-
-        if value >= thresholds["critical"]:
-            severity = "critical"
-            title = f"{agent_name} {verb} {value} {noun} (critical threshold: {thresholds['critical']})"
-        else:
-            severity = "high"
-            title = f"{agent_name} {verb} {value} {noun} ({multiplier}x typical)"
-
-        alert_id = await _alerter.fire_alert(
-            agent_id,
-            severity,
-            title=title,
-            description=title,
-            reason="volumetric_threshold",
-            extra_detail={"metric": metric_name, "value": value, "session_id": session_id},
-            rule_type="volumetric_threshold",
-            target=metric_name,
-            session_id=session_id,
-        )
-        alert_ids.append(alert_id)
-
-    return alert_ids
+    metrics = await session_volume_metrics(db, session_id, agent_id)
+    contributions = evaluate_prior_volume(metrics, prior)
+    alert_id = await fire_volume_alert(_alerter, db, session_id, agent_id, agent_name, contributions)
+    return [alert_id] if alert_id is not None else []
 
 
 async def check_time_anomaly(session_id: str, agent_id: int, agent_name: str, session_start: str, prior: dict, db) -> list[int]:
@@ -142,6 +101,8 @@ async def check_time_anomaly(session_id: str, agent_id: int, agent_name: str, se
             severity = "critical"
             title = f"{agent_name} active at {time_label} with no user activity for {round(gap_hours)} hours"
 
+    severity = cap_severity(severity, await get_corroboration(db, session_id, agent_id))
+
     alert_id = await _alerter.fire_alert(
         agent_id,
         severity,
@@ -176,11 +137,12 @@ async def check_ratio_anomaly(session_id: str, agent_id: int, agent_name: str, p
     ratio = reads / max(writes, 1)
 
     alert_ids: list[int] = []
+    ratio_severity = cap_severity("high", await get_corroboration(db, session_id, agent_id))
 
     if ratio > critical_ratio:
         title = f"{agent_name} read {reads} files but wrote {writes} — unusual read-heavy pattern"
         alert_id = await _alerter.fire_alert(
-            agent_id, "high",
+            agent_id, ratio_severity,
             title=title, description=title,
             reason="ratio_anomaly",
             extra_detail={"session_id": session_id, "reads": reads, "writes": writes, "ratio": round(ratio, 2)},
@@ -193,7 +155,7 @@ async def check_ratio_anomaly(session_id: str, agent_id: int, agent_name: str, p
     if FILE_READS_OBSERVABLE and writes > reads * 3:
         title = f"{agent_name} wrote {writes} files but read only {reads} — unusual write-heavy pattern"
         alert_id = await _alerter.fire_alert(
-            agent_id, "high",
+            agent_id, ratio_severity,
             title=title, description=title,
             reason="ratio_anomaly",
             extra_detail={"session_id": session_id, "reads": reads, "writes": writes},
@@ -262,6 +224,12 @@ async def score_session_2a(session_id: str, agent_id: int, agent_name: str, sess
     prior = get_prior(agent_name)
     results: list[int] = []
 
+    # Network first: an unknown-destination alert is one of the signals
+    # that lets the checks below keep a higher severity.
+    try:
+        results += await check_network_destinations(session_id, agent_id, agent_name, prior, db)
+    except Exception as e:
+        print(f"Layer2a network check failed: {e}")
     try:
         results += await check_hard_thresholds(session_id, agent_id, agent_name, prior, db)
     except Exception as e:
@@ -274,9 +242,5 @@ async def score_session_2a(session_id: str, agent_id: int, agent_name: str, sess
         results += await check_ratio_anomaly(session_id, agent_id, agent_name, prior, db)
     except Exception as e:
         print(f"Layer2a ratio check failed: {e}")
-    try:
-        results += await check_network_destinations(session_id, agent_id, agent_name, prior, db)
-    except Exception as e:
-        print(f"Layer2a network check failed: {e}")
 
     return results

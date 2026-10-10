@@ -531,11 +531,8 @@ class RedLines:
 
           - Write correlates with an active/recently-active session for
             this agent (see has_active_or_recent_session): normal
-            checkpoint activity. Fires severity="low",
-            rule_type="checkpoint_activity" — informational, logged for
-            audit, but dismissible like any regular alert (NOT gated by
-            the red_line non-disableable check in api/alerts.py, since
-            that gate keys on rule_type == "red_line" specifically).
+            checkpoint activity. No alert is created; the report shows
+            one info line per session instead.
           - No active/recent session at all: genuinely anomalous — a cache
             write with no corresponding Claude Code session in progress.
             Fires severity="high", rule_type="red_line" exactly as RL3
@@ -550,16 +547,11 @@ class RedLines:
         directory = str(Path(path.replace("\\", "/")).parent)
 
         if await has_active_or_recent_session(agent_id, db):
-            await self._fire(
-                agent_id, "checkpoint_activity", "low",
-                title=f"{agent_name} checkpoint write (normal /rewind activity)",
-                description=f"{agent_name} wrote to its hidden cache directory during an active session — "
-                             "consistent with normal /rewind checkpoint behavior.",
-                extra_detail={"path": path},
-                target=directory,
-                rule_type="checkpoint_activity",
-                session_id=session_id,
-            )
+            # Normal /rewind checkpoint activity: no alert is created (one
+            # per burst of snapshot files was pure noise). The write is
+            # still recorded as an ordinary file event, and the report
+            # shows one info line per session counting them (see
+            # api/export.py::_checkpoint_counts_by_session).
             return
 
         # No active/recent session exists — leaving session_id unset here
