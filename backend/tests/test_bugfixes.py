@@ -1112,7 +1112,7 @@ async def test_export_json_includes_report_notes():
     assert resp.status_code == 200
     data = resp.json()
     assert data["report_notes"] == export_module.REPORT_NOTES
-    assert len(data["report_notes"]) == 7
+    assert len(data["report_notes"]) == 8
 
 
 # ------------------------------------------ 8. writer wedge-replace failure

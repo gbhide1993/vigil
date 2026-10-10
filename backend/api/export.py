@@ -161,6 +161,7 @@ REPORT_NOTES = [
     "Vigil records only while it is running. Periods when it was not running, for example when the computer was asleep, are listed under Monitoring coverage in this report.",
     "Vigil records files being created, changed, moved or deleted. It does not record files being read.",
     "Alert times are when Vigil detected the issue. After a restart this can be later than the activity itself.",
+    "Vigil checks which programs are running about every 30 seconds. A program that starts and finishes between checks is not recorded. For most programs an agent runs, only the program's name is recorded, not its exact command text.",
 ]
 
 # A gap at or above this duration is listed individually in the
