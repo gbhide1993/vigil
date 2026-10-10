@@ -16,6 +16,7 @@ from core.feature_flags import CORE_ONLY
 from core.red_lines import RedLines
 from core.redaction import redact_cmdline
 from db.database import get_db
+from watchers._process_scan_worker import _filter_env
 
 logger = logging.getLogger("vlaw")
 
@@ -164,6 +165,10 @@ class ProcessWatcher:
         # NAMED pids only (see _snapshot_pids), never cached across cycles:
         # RL7 (env-var-redirect detection) needs each such process's
         # *current* environment every time, not a stale first-seen copy.
+        # Holds only RL7's variables: *_BASE_URL values (credentials and
+        # query stripped) and True for *_API_KEY (see
+        # _process_scan_worker._filter_env). No other env value, and no
+        # API key value, is ever in this process's memory.
         self._env_snapshot: dict[int, dict] = {}
         # {pid: {"args", "exe_path"}} — cached permanently per pid once
         # fetched (see _snapshot_pids): unlike env, a process's cmdline/exe
@@ -538,7 +543,14 @@ class ProcessWatcher:
 
             return {
                 "processes": result.get("processes", []),
-                "envs": {int(pid): env for pid, env in result.get("envs", {}).items()},
+                # The worker already reduces each environment to RL7's
+                # variables; filtering again here (idempotent) means a
+                # worker that ever returned more can't put other values in
+                # this process's memory.
+                "envs": {
+                    int(pid): _filter_env(env) if isinstance(env, dict) else {}
+                    for pid, env in result.get("envs", {}).items()
+                },
                 "cmdlines": {int(pid): cl for pid, cl in result.get("cmdlines", {}).items()},
             }
 

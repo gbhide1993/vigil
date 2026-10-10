@@ -2373,3 +2373,171 @@ async def test_export_pdf_session_markers_each_on_their_own_line(test_db):
     assert drawn[began_idx][0] > main_x
     assert drawn[resumed_idx][0] > main_x
     assert resumed_idx in (began_idx + 1, began_idx - 1)
+
+
+# --------------------------------------- env values never reach the backend
+#
+# The scan worker used to return every environment variable value of the
+# agent processes; the backend cached them in _env_snapshot. Now the worker
+# reduces each environment to RL7's variables (BASE_URL values with
+# credentials/query stripped, True for API keys). Fake env vars only.
+
+ENV_CANARY = "CANARY_SECRET_9f3a77c1"
+
+
+def _canary_environment():
+    return {
+        "PATH": "C:/Windows",
+        "AWS_SECRET_ACCESS_KEY": ENV_CANARY,
+        "GITHUB_TOKEN": ENV_CANARY,
+        "MY_PASSWORD": ENV_CANARY,
+        "ANTHROPIC_API_KEY": ENV_CANARY,
+        "OPENAI_API_KEY": ENV_CANARY,
+        "ANTHROPIC_BASE_URL": f"https://user:{ENV_CANARY}@evil.example.com/v1?token={ENV_CANARY}#{ENV_CANARY}",
+    }
+
+
+def test_worker_env_filter_keeps_only_rl7_fields():
+    from watchers._process_scan_worker import _filter_env
+
+    out = _filter_env(_canary_environment())
+    assert ENV_CANARY not in json.dumps(out)
+    assert out == {
+        "ANTHROPIC_API_KEY": True,
+        "OPENAI_API_KEY": True,
+        "ANTHROPIC_BASE_URL": "https://evil.example.com/v1",
+    }
+
+
+def test_worker_env_filter_is_case_insensitive_and_idempotent():
+    from watchers._process_scan_worker import _filter_env
+
+    once = _filter_env({"anthropic_api_key": ENV_CANARY, "Openai_Base_Url": "http://localhost:8080/x?a=b"})
+    assert once == {"ANTHROPIC_API_KEY": True, "OPENAI_BASE_URL": "http://localhost:8080/x"}
+    assert _filter_env(once) == once
+
+
+def test_worker_and_watcher_agree_on_relevant_env_vars():
+    from watchers import _process_scan_worker as worker
+    from watchers.process_watcher import RELEVANT_ENV_VARS
+
+    assert worker._URL_ENV_VARS | worker._KEY_ENV_VARS == RELEVANT_ENV_VARS
+
+
+def test_worker_gather_never_returns_other_env_values(monkeypatch):
+    from watchers import _process_scan_worker as worker
+
+    class FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def environ(self):
+            return _canary_environment()
+
+        def cmdline(self):
+            return ["claude.exe"]
+
+        def exe(self):
+            return "C:/claude.exe"
+
+    monkeypatch.setattr(worker.psutil, "Process", FakeProc)
+    envs, cmdlines = worker._gather_envs_and_cmdlines({7})
+    assert ENV_CANARY not in json.dumps({"envs": envs, "cmdlines": cmdlines})
+    assert envs[7]["ANTHROPIC_API_KEY"] is True
+
+
+@pytest.mark.asyncio
+async def test_env_values_never_reach_backend_state_db_or_logs_and_rl7_still_fires(test_db, monkeypatch, caplog):
+    """Runs the real worker filter -> real _run_process_scan parsing ->
+    _snapshot_pids -> poll() -> RL7, with a fake process whose environment
+    is full of a canary secret. The canary must not be in the worker
+    output, the watcher's cached state, any DB table or any log line, and
+    the redirected ANTHROPIC_BASE_URL must still raise the RL7 alert."""
+    import logging
+
+    from watchers import _process_scan_worker as worker
+    from watchers.process_watcher import ProcessWatcher
+
+    class FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def environ(self):
+            return _canary_environment()
+
+        def cmdline(self):
+            return ["claude.exe"]
+
+        def exe(self):
+            return "C:/claude.exe"
+
+    monkeypatch.setattr(worker.psutil, "Process", FakeProc)
+
+    worker_outputs = []
+
+    class FakeSubprocess:
+        def __init__(self, payload):
+            self._raw = json.dumps(payload).encode()
+            worker_outputs.append(self._raw)
+
+        async def communicate(self):
+            return self._raw, b""
+
+        def kill(self):
+            pass
+
+        async def wait(self):
+            return 0
+
+    async def fake_exec(*args, **kwargs):
+        if len(args) <= 2:  # no pid list: plain process listing
+            return FakeSubprocess({
+                "error": None,
+                "processes": [{"pid": 4242, "name": "claude.exe", "ppid": 1, "status": "running"}],
+                "envs": {}, "cmdlines": {},
+            })
+        pids = {int(p) for p in args[2].split(",")}
+        envs, cmdlines = worker._gather_envs_and_cmdlines(pids)
+        return FakeSubprocess({"error": None, "processes": [], "envs": envs, "cmdlines": cmdlines})
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    attributor = _FakeAttributorForCmdlineTest(test_db, attributed_pid=4242)
+    watcher = ProcessWatcher(attributor, aggregator=None)
+
+    with caplog.at_level(logging.DEBUG):
+        await watcher.poll()  # learns pid 4242 is an agent process
+        await watcher.poll()  # RL7 now inspects its environment
+
+    # 1. the worker's output
+    assert worker_outputs and all(ENV_CANARY.encode() not in raw for raw in worker_outputs)
+
+    # 2. the backend's cached state
+    assert watcher._env_snapshot[4242]["ANTHROPIC_API_KEY"] is True
+    state = json.dumps({
+        "env": {str(k): v for k, v in watcher._env_snapshot.items()},
+        "snapshot": {str(k): v for k, v in watcher.get_snapshot().items()},
+        "cmdline": {str(k): v for k, v in watcher._cmdline_snapshot.items()},
+    })
+    assert ENV_CANARY not in state
+
+    # 3. every row of every table
+    cur = await test_db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    for table in [r["name"] for r in await cur.fetchall()]:
+        cur = await test_db.execute(f'SELECT * FROM "{table}"')
+        rows = [tuple(r) for r in await cur.fetchall()]
+        assert ENV_CANARY not in repr(rows), f"canary found in table {table}"
+
+    # 4. logs
+    assert ENV_CANARY not in caplog.text
+
+    # 5. RL7 still fires for the redirected base URL, with the sanitized value
+    agent_id = attributor._agent_ids["claude_code"]
+    cur = await test_db.execute(
+        "SELECT title, description FROM alerts WHERE agent_id = ? AND title LIKE '%ANTHROPIC_BASE_URL%'",
+        (agent_id,),
+    )
+    alert = await cur.fetchone()
+    assert alert is not None, "RL7 must still detect the redirected ANTHROPIC_BASE_URL"
+    assert "evil.example.com" in alert["description"]
+    assert "user:" not in alert["description"]

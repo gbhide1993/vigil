@@ -8,6 +8,8 @@ Optionally accepts a comma-separated list of agent-related PIDs as argv[1] —
 for exactly those PIDs (already narrowed down by the caller's name-filter,
 never "every process"), this worker also collects environ()/cmdline()/exe(),
 so those calls happen in this disposable process too, not the caller's.
+environ() is reduced to the few variables RL7 needs before anything is
+printed (see _filter_env): other values never leave this process.
 
 Process enumeration itself prefers a single Get-CimInstance Win32_Process
 WMI query (see _enum_processes_powershell) over psutil.process_iter
@@ -19,6 +21,7 @@ psutil.process_iter if the PowerShell query fails or returns nothing.
 import csv
 import io
 import json
+import re
 import subprocess
 import sys
 
@@ -89,6 +92,43 @@ def _enum_processes_psutil():
     return processes
 
 
+# Environment variables the backend's RL7 check (core/red_lines.py) and the
+# correlation engine's "LLM API key in env" signal need. Mirrors
+# watchers/process_watcher.py::RELEVANT_ENV_VARS (kept in sync by a test);
+# duplicated here because this file also runs as a standalone script with
+# no package context. Everything else in a process's environment is dropped
+# in this worker and never crosses the process boundary.
+_URL_ENV_VARS = {"ANTHROPIC_BASE_URL", "OPENAI_BASE_URL"}
+_KEY_ENV_VARS = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY"}
+
+_URL_USERINFO = re.compile(r"^([A-Za-z][\w+.\-]*://)[^/@\s]*@")
+
+
+def _sanitize_url(value: str) -> str:
+    """Keeps what the redirect check needs (scheme, host, port, path) and
+    drops credentials embedded in the URL (user:pass@) plus any query or
+    fragment, where tokens commonly end up."""
+    value = _URL_USERINFO.sub(r"\1", value)
+    for sep in ("?", "#"):
+        value = value.split(sep, 1)[0]
+    return value
+
+
+def _filter_env(env: dict) -> dict:
+    """Reduces a full process environment to what RL7 needs: *_BASE_URL
+    values (sanitized), and for *_API_KEY variables only True (present).
+    API key values are never returned, not even hashed: nothing consumes
+    them and a fingerprint would still let a stolen log confirm a guess."""
+    out = {}
+    for name, value in env.items():
+        upper = name.upper()
+        if upper in _URL_ENV_VARS:
+            out[upper] = _sanitize_url(value) if isinstance(value, str) else ""
+        elif upper in _KEY_ENV_VARS:
+            out[upper] = bool(value)
+    return out
+
+
 def _gather_envs_and_cmdlines(agent_pids: set[int]) -> tuple[dict, dict]:
     """environ()/cmdline()/exe() for agent_pids only (typically 0-5
     processes) — decoupled from process enumeration above so it runs the
@@ -104,7 +144,7 @@ def _gather_envs_and_cmdlines(agent_pids: set[int]) -> tuple[dict, dict]:
             continue
 
         try:
-            envs[pid] = proc.environ()
+            envs[pid] = _filter_env(proc.environ())
         except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
             envs[pid] = {}
         try:
