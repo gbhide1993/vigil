@@ -140,8 +140,18 @@ _PIPE_TO_SHELL = re.compile(r"\b(curl|wget)\b.*\|\s*(sh|bash|iex)\b", re.IGNOREC
 # PowerShell obfuscation/bypass flags, matched against the exe basename
 # (powershell/pwsh) plus the flag appearing anywhere in the cmdline.
 _POWERSHELL_EXES = {"powershell", "pwsh"}
-_POWERSHELL_BYPASS_FLAGS = re.compile(
-    r"-enc\b|-encodedcommand\b|-executionpolicy\s+bypass\b|-command\b", re.IGNORECASE
+_POWERSHELL_BYPASS_FLAGS = re.compile(r"-enc\b|-encodedcommand\b", re.IGNORECASE)
+
+# iex / Invoke-Expression only counts together with a download or network
+# indicator in the same cmdline. Claude Code's own shell wrapper
+# ("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+# -Command ... Invoke-Expression -Command $__claudeCodeScript") contains
+# -ExecutionPolicy Bypass, -Command and Invoke-Expression, so none of those
+# alone can be treated as dangerous.
+_IEX_WORD = re.compile(r"\b(iex|invoke-expression)\b", re.IGNORECASE)
+_NETWORK_INDICATOR = re.compile(
+    r"\b(iwr|invoke-webrequest|invoke-restmethod|downloadstring|downloadfile|curl|wget)\b|https?://",
+    re.IGNORECASE,
 )
 
 # Destructive delete: requires evidence of BOTH "recursive" and "force"
@@ -272,6 +282,9 @@ def is_dangerous_command(cmdline: str, exe_basename: str = "") -> tuple[str, str
 
     if exe in _POWERSHELL_EXES and _POWERSHELL_BYPASS_FLAGS.search(lowered):
         return "powershell_bypass_flag", "high"
+
+    if exe in _POWERSHELL_EXES and _IEX_WORD.search(lowered) and _NETWORK_INDICATOR.search(lowered):
+        return "powershell_iex_download", "high"
 
     if (
         _RM_WORD.search(lowered)
@@ -575,10 +588,12 @@ class RedLines:
             session_id=session_id,
         )
 
-    async def check_dangerous_command(self, agent_id: int, agent_name: str, cmdline: str, exe_basename: str = "", session_id: str | None = None) -> None:
+    async def check_dangerous_command(self, agent_id: int, agent_name: str, cmdline: str, exe_basename: str = "", session_id: str | None = None) -> bool:
+        """Returns True if the command matched a red-line pattern (an alert
+        was fired for it), so callers can skip a redundant generic alert."""
         matched = is_dangerous_command(cmdline, exe_basename)
         if matched is None:
-            return
+            return False
         matched_pattern, severity = matched
         await self._fire(
             agent_id, "dangerous_command", severity,
@@ -588,6 +603,7 @@ class RedLines:
             target=exe_basename or cmdline,
             session_id=session_id,
         )
+        return True
 
     async def check_cross_project_read(self, agent_id: int, agent_name: str, path: str, session_id: str | None = None) -> None:
         if not is_cross_project_read(path, get_agent_workspace_dir(agent_id)):

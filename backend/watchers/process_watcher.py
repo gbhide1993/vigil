@@ -341,8 +341,9 @@ class ProcessWatcher:
             agent_id = await self.attributor.get_or_create_agent(agent_name, pid, confidence=confidence)
             session_id = await self.attributor.sessions.touch(agent_id, resumed=resumed)
 
+            red_line_fired = False
             if not CORE_ONLY:
-                await self.red_lines.check_dangerous_command(agent_id, agent_name, cmdline, exe_name, session_id=session_id)
+                red_line_fired = await self.red_lines.check_dangerous_command(agent_id, agent_name, cmdline, exe_name, session_id=session_id)
 
                 await self._check_config_exec(agent_id, agent_name, exe_path or cmdline, session_id)
 
@@ -373,6 +374,8 @@ class ProcessWatcher:
                 "detail": detail,
                 "severity": severity,
                 "suspicious": suspicious,
+                # One alert per process: the red-line alert already covers it.
+                "suspicious_alert": suspicious and not red_line_fired,
                 "is_unidentified": is_unidentified,
                 "confidence": confidence,
             })
@@ -438,7 +441,7 @@ class ProcessWatcher:
         for row in pending_rows:
             event_id = event_id_by_pid.get(row["pid"])
 
-            if row["suspicious"]:
+            if row["suspicious_alert"]:
                 await self.alerter.fire_alert(
                     row["agent_id"],
                     "medium",

