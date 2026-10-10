@@ -44,6 +44,16 @@ _SCAN_TIMEOUT_SECONDS = 18
 # not a normal-case bound.
 _POLL_WRITE_TIMEOUT_SECONDS = 90
 
+# Bounds how many newly-observed (this cycle) PIDs get their cmdline
+# fetched in one cycle -- see _snapshot_pids. Normally a handful of new
+# PIDs appear per 30s poll; the one case that can be large is the first
+# poll after a restart (self._known_pids starts empty, so every already-
+# running PID on the box looks "new" at once). Capped so that cold-start
+# case can't turn into fetching cmdline for every process on the machine
+# in one subprocess call; the scan itself still has its own
+# _SCAN_TIMEOUT_SECONDS regardless of how many PIDs are requested.
+_NEW_PID_CMDLINE_FETCH_CAP = 50
+
 # Pre-filter gate applied before any expensive per-process psutil call
 # (environ()/cmdline() — on Windows these hold the GIL for the duration of
 # the underlying OpenProcess/ReadProcessMemory syscall, so even off the
@@ -601,6 +611,30 @@ class ProcessWatcher:
         agent_candidate_pids |= self._known_agent_pids
 
         cmdline_new_pids = agent_candidate_pids - set(self._cmdline_snapshot.keys())
+
+        # Also fetch cmdline for every PID newly observed this cycle, not
+        # only name-matched/already-known-agent ones. Without this, a
+        # process attributed only via parent-chain (cmd.exe, bash.exe,
+        # curl.exe, ... spawned under a known agent) never gets a
+        # cmdline: self._known_agent_pids only grows inside
+        # _gather_spawn_info, which runs after this method has already
+        # decided what to fetch this cycle, and the proc_spawn event for
+        # that PID is written exactly once, on this same cycle -- there
+        # is no later cycle that goes back and fills it in. Folded in
+        # here (not into agent_candidate_pids itself) so it only widens
+        # the cmdline fetch, not env_refresh_pids below -- RL7 has no
+        # reason to read the environment of an arbitrary new non-agent-
+        # named process.
+        new_pids_this_cycle = set(snapshot.keys()) - self._known_pids
+        if len(new_pids_this_cycle) > _NEW_PID_CMDLINE_FETCH_CAP:
+            logger.warning(
+                "ProcessWatcher: %d new PID(s) this cycle exceeds the cmdline fetch cap "
+                "(%d) -- only %d will get cmdline fetched this cycle",
+                len(new_pids_this_cycle), _NEW_PID_CMDLINE_FETCH_CAP, _NEW_PID_CMDLINE_FETCH_CAP,
+            )
+            new_pids_this_cycle = set(sorted(new_pids_this_cycle)[:_NEW_PID_CMDLINE_FETCH_CAP])
+        cmdline_new_pids |= new_pids_this_cycle - set(self._cmdline_snapshot.keys())
+
         env_refresh_pids = {
             pid for pid in agent_candidate_pids
             if _is_agent_process_name(snapshot.get(pid, {}).get("name", ""))
