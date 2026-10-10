@@ -96,6 +96,8 @@ from core.baseline import Baseline
 from core.config_auditor import audit_all_configs
 from core.feature_flags import CORE_ONLY
 from core.insights import get_insights
+from core.instance_lock import InstanceAlreadyRunning, acquire_instance_lock, release_instance_lock
+from core.log_setup import configure_logging
 from core.red_lines import SESSION_LAUNCH_DIR
 from db.database import DB_PATH, close_db, get_db, get_read_db, init_db
 from license.license_service import LicenseService
@@ -105,12 +107,7 @@ from watchers.network_watcher import NetworkWatcher
 from watchers.process_watcher import ProcessWatcher
 
 LOG_PATH = os.path.join(BASE_DIR, "vlaw-backend.log")
-logging.basicConfig(
-    level=os.environ.get("VLAW_LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger("vlaw")
+logger = configure_logging(LOG_PATH)
 logger.info("V-LAW backend starting. BASE_DIR=%s", BASE_DIR)
 
 VERSION = "0.9.0"
@@ -217,28 +214,14 @@ def _ensure_default_policy() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import os as _vigil_os
-    import sys as _vigil_sys
-
-    _lock_path = _vigil_os.path.join(_vigil_os.path.dirname(__file__),
-                                '..', 'data', 'vigil.lock')
-    _lock_path = _vigil_os.path.abspath(_lock_path)
-    _vigil_os.makedirs(_vigil_os.path.dirname(_lock_path), exist_ok=True)
-
+    # Lock lives next to vlaw.db (see core/instance_lock.py), not in the
+    # PyInstaller _MEI temp dir.
     try:
-        _lock_file = open(_lock_path, 'w')
-        if _vigil_os.name == 'nt':  # Windows
-            import msvcrt
-            msvcrt.locking(_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-        else:  # Unix
-            import fcntl
-            fcntl.flock(_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _lock_file.write(str(_vigil_os.getpid()))
-        _lock_file.flush()
-        logger.info("instance lock acquired (pid=%d)", _vigil_os.getpid())
-    except (IOError, OSError):
-        logger.error("Vigil is already running. Only one instance allowed.")
-        _vigil_sys.exit(1)
+        _lock_file = acquire_instance_lock(str(DB_PATH.parent))
+        logger.info("instance lock acquired (pid=%d)", os.getpid())
+    except InstanceAlreadyRunning as e:
+        logger.error("Vigil is already running (pid=%s). Only one instance allowed.", e.pid)
+        sys.exit(1)
 
     # 0. Recover from leftover WAL locks left by a previous unclean shutdown,
     # before aiosqlite opens its own connection in init_db().
@@ -442,11 +425,7 @@ async def lifespan(app: FastAPI):
     from core.monitoring_coverage import mark_clean_shutdown as _mark_coverage_clean_shutdown
     await _mark_coverage_clean_shutdown()
     await close_db()
-    try:
-        _lock_file.close()
-        _vigil_os.unlink(_lock_path)
-    except Exception:
-        pass
+    release_instance_lock(_lock_file)
     logger.info("vlaw shutdown complete")
 
 
