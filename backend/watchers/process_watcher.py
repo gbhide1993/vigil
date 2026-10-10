@@ -14,6 +14,7 @@ from core.alerter import Alerter
 from core.attributor import KNOWN_AGENTS, Attributor
 from core.feature_flags import CORE_ONLY
 from core.red_lines import RedLines
+from core.redaction import redact_cmdline
 from db.database import get_db
 
 logger = logging.getLogger("vlaw")
@@ -721,12 +722,25 @@ class ProcessWatcher:
 
             cmdline_info = self._cmdline_snapshot.get(pid)
             if cmdline_info is not None:
-                args = cmdline_info.get("args") or []
+                raw_args = cmdline_info.get("args") or []
                 exe_path = cmdline_info.get("exe_path") or exe_name
             else:
-                args = []
+                raw_args = []
                 exe_path = exe_name
-            cmdline = " ".join(args)
+            # Redacted here, the single place a cmdline is read out of
+            # the snapshot cache, so every consumer below (the stored
+            # event's detail.args, check_dangerous_command, _is_suspicious,
+            # and anything built from `cmdline`/`args` downstream) only
+            # ever sees the redacted text -- a real secret never enters
+            # the DB in the first place. args is re-derived from the
+            # redacted joined string (rather than redacting each raw
+            # argv element independently) so a flag and its value stay
+            # redacted together even when they were two separate argv
+            # elements (e.g. ["--password", "secret123"]) -- redacting
+            # them independently would never see the flag and value in
+            # the same string to match against.
+            cmdline = redact_cmdline(" ".join(raw_args))
+            args = cmdline.split()
 
             infos.append({
                 "pid": pid,

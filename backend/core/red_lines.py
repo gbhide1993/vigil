@@ -113,9 +113,64 @@ APPROVED_NETWORK_DESTINATIONS = {
 # Matched against the executable's basename, never the full argv blob — a
 # bare substring check against the whole cmdline false-positives constantly
 # (e.g. "nc" inside "sync", "function", "--renderer-client-id", which every
-# Electron subprocess spawn includes as ordinary flag text).
+# Electron subprocess spawn includes as ordinary flag text). Severity is
+# "low" for all of these alone: curl/wget/ssh/scp/nc are extremely common
+# for entirely legitimate reasons (downloading a file, a remote login,
+# port forwarding). curl/wget actually piped into a shell (_PIPE_TO_SHELL
+# below) is the pattern that's genuinely dangerous, and fires at "high"
+# regardless of this bare-exe tier.
 DANGEROUS_EXE_PATTERNS = {"curl", "wget", "nc", "ncat", "ssh", "scp"}
-DANGEROUS_INLINE_PATTERNS = ["python -c", "python3 -c", "powershell -enc", "powershell -command"]
+DANGEROUS_EXE_SEVERITY = "low"
+
+# python -c / python3 -c: inline code execution, common for legitimate
+# scripting too -- kept at its existing "medium" tier. The old literal
+# "powershell -enc"/"powershell -command" substrings are gone from here;
+# real invocations are "powershell.exe -Command ..." or a full path, so
+# a literal "powershell -command" (bare word, no .exe, no path) never
+# actually appears in a real cmdline -- see _POWERSHELL_BYPASS_FLAGS below,
+# which checks the exe basename and the flag separately instead.
+DANGEROUS_INLINE_PATTERNS = ["python -c", "python3 -c"]
+DANGEROUS_INLINE_SEVERITY = "medium"
+
+# Download-and-execute: curl/wget output piped straight into a shell or
+# PowerShell's Invoke-Expression. Unlike a bare curl/wget above, this is
+# the actual remote-code-execution shape, so it's "high" unconditionally.
+_PIPE_TO_SHELL = re.compile(r"\b(curl|wget)\b.*\|\s*(sh|bash|iex)\b", re.IGNORECASE)
+
+# PowerShell obfuscation/bypass flags, matched against the exe basename
+# (powershell/pwsh) plus the flag appearing anywhere in the cmdline.
+_POWERSHELL_EXES = {"powershell", "pwsh"}
+_POWERSHELL_BYPASS_FLAGS = re.compile(
+    r"-enc\b|-encodedcommand\b|-executionpolicy\s+bypass\b|-command\b", re.IGNORECASE
+)
+
+# Destructive delete: requires evidence of BOTH "recursive" and "force"
+# (either order, short or long flag form) -- a bare "rm file.txt" or
+# "Remove-Item x" must never match; only the combination does. The
+# negative lookbehind on the short-flag checks keeps them from firing
+# inside an unrelated long flag (e.g. "--dry-run" must never satisfy the
+# check for the letter 'r').
+_RM_WORD = re.compile(r"\brm\b", re.IGNORECASE)
+_SHORT_FLAG_R = re.compile(r"(?<!-)-[a-zA-Z]*r[a-zA-Z]*\b")
+_SHORT_FLAG_F = re.compile(r"(?<!-)-[a-zA-Z]*f[a-zA-Z]*\b")
+_LONG_RECURSIVE = re.compile(r"--recursive\b", re.IGNORECASE)
+_LONG_FORCE = re.compile(r"--force\b", re.IGNORECASE)
+
+_REMOVE_ITEM_WORD = re.compile(r"\bremove-item\b", re.IGNORECASE)
+_PS_RECURSE_FLAG = re.compile(r"-recurse\b", re.IGNORECASE)
+_PS_FORCE_FLAG = re.compile(r"-force\b", re.IGNORECASE)
+
+_RD_RECURSIVE = re.compile(r"\b(rd|rmdir)\b.*\s/s\b", re.IGNORECASE)
+_DEL_WORD = re.compile(r"\bdel\b", re.IGNORECASE)
+_DEL_FORCE_FLAG = re.compile(r"\s/f\b", re.IGNORECASE)
+_DEL_RECURSE_FLAG = re.compile(r"\s/s\b", re.IGNORECASE)
+
+_GIT_PUSH_FORCE = re.compile(r"\bgit\b.*\bpush\b.*(?:--force\b|\s-f\b)", re.IGNORECASE)
+_GIT_RESET_HARD = re.compile(r"\bgit\b.*\breset\b.*--hard\b", re.IGNORECASE)
+
+_REG_ADD_DELETE = re.compile(r"\breg\b\s+(add|delete)\b", re.IGNORECASE)
+_NET_USER = re.compile(r"\bnet\b\s+user\b", re.IGNORECASE)
+_SCHTASKS_CREATE = re.compile(r"\bschtasks\b.*\s/create\b", re.IGNORECASE)
 
 # Session launch directory: the working directory V-LAW itself was
 # started from. Used as the reference point for "outside the active
@@ -203,15 +258,63 @@ def is_unknown_destination(dest: str) -> bool:
     return dest not in APPROVED_NETWORK_DESTINATIONS
 
 
-def is_dangerous_command(cmdline: str, exe_basename: str = "") -> str | None:
-    """Returns the matched pattern, or None if the command is clean."""
+def is_dangerous_command(cmdline: str, exe_basename: str = "") -> tuple[str, str] | None:
+    """Returns (matched_pattern_name, severity), or None if the command
+    is clean. The compound checks (rm, Remove-Item, del, git, reg, ...)
+    run against the full lowered cmdline so flags and context all
+    participate; the bare exe-name and inline-substring tiers are
+    checked the same way they always were."""
     exe = re.sub(r"\.(exe|bin)$", "", exe_basename.lower())
-    if exe in DANGEROUS_EXE_PATTERNS:
-        return exe
     lowered = cmdline.lower()
+
+    if _PIPE_TO_SHELL.search(lowered):
+        return "download_pipe_to_shell", "high"
+
+    if exe in _POWERSHELL_EXES and _POWERSHELL_BYPASS_FLAGS.search(lowered):
+        return "powershell_bypass_flag", "high"
+
+    if (
+        _RM_WORD.search(lowered)
+        and (_SHORT_FLAG_R.search(lowered) or _LONG_RECURSIVE.search(lowered))
+        and (_SHORT_FLAG_F.search(lowered) or _LONG_FORCE.search(lowered))
+    ):
+        return "rm_recursive_force", "high"
+
+    if (
+        _REMOVE_ITEM_WORD.search(lowered)
+        and _PS_RECURSE_FLAG.search(lowered)
+        and _PS_FORCE_FLAG.search(lowered)
+    ):
+        return "remove_item_recurse_force", "high"
+
+    if _RD_RECURSIVE.search(lowered):
+        return "rd_recursive", "high"
+
+    if _DEL_WORD.search(lowered) and _DEL_FORCE_FLAG.search(lowered) and _DEL_RECURSE_FLAG.search(lowered):
+        return "del_force_recursive", "high"
+
+    if _GIT_PUSH_FORCE.search(lowered):
+        return "git_push_force", "high"
+
+    if _GIT_RESET_HARD.search(lowered):
+        return "git_reset_hard", "high"
+
+    if _REG_ADD_DELETE.search(lowered):
+        return "reg_add_delete", "high"
+
+    if _NET_USER.search(lowered):
+        return "net_user", "high"
+
+    if _SCHTASKS_CREATE.search(lowered):
+        return "schtasks_create", "high"
+
+    if exe in DANGEROUS_EXE_PATTERNS:
+        return exe, DANGEROUS_EXE_SEVERITY
+
     for pattern in DANGEROUS_INLINE_PATTERNS:
         if pattern in lowered:
-            return pattern
+            return pattern, DANGEROUS_INLINE_SEVERITY
+
     return None
 
 
@@ -476,11 +579,12 @@ class RedLines:
         matched = is_dangerous_command(cmdline, exe_basename)
         if matched is None:
             return
+        matched_pattern, severity = matched
         await self._fire(
-            agent_id, "dangerous_command", "medium",
+            agent_id, "dangerous_command", severity,
             title=f"RED LINE: sensitive command spawned by {agent_name}",
             description=f"{agent_name} spawned a potentially sensitive command: {cmdline}",
-            extra_detail={"command": cmdline, "matched_pattern": matched},
+            extra_detail={"command": cmdline, "matched_pattern": matched_pattern},
             target=exe_basename or cmdline,
             session_id=session_id,
         )
