@@ -264,7 +264,11 @@ function WatchedFoldersSection() {
       const result = await api.addScopeFolder(path.trim())
       setFolders(result.folders)
       setPath('')
-      setMessage(result.watching ? 'Folder added and now being watched.' : (result.note || 'Folder added.'))
+      setMessage(
+        result.applied_live
+          ? 'Folder added and now being watched.'
+          : (result.message || 'Saved. Restart Vigil to start watching this folder.')
+      )
     } catch (err) {
       setError(err.message)
     } finally {
@@ -279,7 +283,11 @@ function WatchedFoldersSection() {
     try {
       const result = await api.removeScopeFolder(folderPath)
       setFolders(result.folders)
-      setMessage('Folder removed. It is no longer watched.')
+      setMessage(
+        result.applied_live
+          ? 'Folder removed. It is no longer watched.'
+          : (result.message || 'Saved. Restart Vigil to stop watching this folder.')
+      )
     } catch (err) {
       setError(err.message)
     } finally {

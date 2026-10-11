@@ -1132,11 +1132,11 @@ async def test_export_json_includes_report_notes():
     assert resp.status_code == 200
     data = resp.json()
     # Network and MCP monitoring are off in tests (no scheduler bound), so
-    # their two "not monitored" notes and the watched-folders scope note
-    # follow the 9 fixed notes.
+    # their two "not monitored" notes, the watched-folders scope note and
+    # the attribution note follow the 9 fixed notes.
     assert data["report_notes"] == export_module.current_report_notes()
     assert data["report_notes"][:9] == export_module.REPORT_NOTES
-    assert len(data["report_notes"]) == 12
+    assert len(data["report_notes"]) == 13
     assert any("[REDACTED]" in n and "best-effort" in n for n in data["report_notes"])
     assert not any("not its exact command text" in n for n in data["report_notes"])
 

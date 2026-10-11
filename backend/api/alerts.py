@@ -22,10 +22,12 @@ def _invalidate_stats_cache() -> None:
     dismissing an alert here would otherwise not be reflected in
     needs_review/alerts_open for up to that long. Deferred import (not at
     module load time) avoids a circular import, since main.py is what
-    imports this router -- matches the existing pattern in
-    api/platform_routes.py's scheduler/aggregator introspection."""
-    import main as _main
-    _main._stats_cache["data"] = None
+    imports this router. The cache lives in core/runtime_state.py, shared
+    with main.py; routes must never `import main` (in the exe that loads a
+    second copy of main, with its own empty cache)."""
+    from core.runtime_state import stats_cache
+
+    stats_cache["data"] = None
 
 
 class ResolveAlertRequest(BaseModel):

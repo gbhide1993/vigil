@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Query
 
+from core.attribution import event_attribution
 from db.database import get_db
 
 router = APIRouter()
@@ -46,4 +47,10 @@ async def get_events(
         params,
     )
     rows = await cur.fetchall()
-    return {"events": [dict(r) for r in rows]}
+    events = []
+    for r in rows:
+        event = dict(r)
+        # File events: say how sure the agent attribution is (core/attribution.py).
+        event.update(event_attribution(event))
+        events.append(event)
+    return {"events": events}

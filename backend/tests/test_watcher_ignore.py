@@ -215,7 +215,7 @@ def test_etw_tier_drops_ignored_events_before_attribution(monkeypatch):
             return "claude_code"
 
     watcher = etw.ETWFileWatcher(Attrib())
-    monkeypatch.setattr(watcher, "_dispatch", lambda pid, path, kind, ts: dispatched.append(path))
+    monkeypatch.setattr(watcher, "_dispatch", lambda pid, path, kind, ts, change=None: dispatched.append(path))
 
     def make_event(path):
         return types.SimpleNamespace(

@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from core import ignore_rules, watch_stats
+from core.file_changes import session_changes, summarise
 from core.monitoring_status import file_watcher_tier, mcp_monitoring, network_monitoring
 from core.scope_store import get_scope_entries
 from db.database import get_db
@@ -195,6 +196,29 @@ FILE_SCOPE_NOTE_ETW = (
 )
 
 NO_WATCHED_FOLDERS_TEXT = "No project folders are watched yet. Add one in Settings."
+ATTRIBUTION_NOTE = (
+    "Without ETW, file changes are attributed to the agent running at the time. "
+    "A change made by you may be shown under an agent."
+)
+
+# Daily export bounds: how many file paths the PDF lists in total (JSON lists up to 50 per session).
+PDF_MAX_FILE_PATH_LINES = 200
+
+_NAIVE_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$")
+
+
+def with_utc_offsets(value):
+    """Copy of a summary in which every bare timestamp string (the database
+    stores UTC without an offset) carries an explicit +00:00."""
+    if isinstance(value, dict):
+        return {k: with_utc_offsets(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [with_utc_offsets(v) for v in value]
+    if isinstance(value, str) and _NAIVE_TIMESTAMP.match(value):
+        return value.replace(" ", "T") + "+00:00"
+    return value
+
+
 UNWATCHED_SESSION_TEXT = "(info: no project folder is watched, so file changes by this session were not recorded)"
 
 
@@ -213,6 +237,8 @@ def current_report_notes() -> list[str]:
     if mcp_monitoring() == "off":
         notes.append(MCP_OFF_NOTE)
     notes.append(FILE_SCOPE_NOTE_ETW if file_watcher_tier() == "etw" else FILE_SCOPE_NOTE)
+    if file_watcher_tier() != "etw":
+        notes.append(ATTRIBUTION_NOTE)
     # Only while the ignore rule is active, and only when it actually ignored something.
     ignored = watch_stats.ignored_total()
     if ignore_rules.is_enabled() and ignored > 0:
@@ -562,6 +588,12 @@ async def _build_summary(date: str, tz=None) -> dict:
         session["event_count_in_period"] = event_counts_by_session.get(session["id"], 0)
         session["checkpoint_writes"] = checkpoint_counts.get(session["id"], 0)
         await _add_calibration_info(db, session, time_alerted)
+        # Bounded summary of the session's file changes in this period: counts by change
+        # type, top directories and the first paths. The full list is in the session report.
+        changes, rows_total = await session_changes(
+            db, session["id"], session.get("agent_name"), since=start_sql, until=end_sql,
+        )
+        session["files_changed"] = {**summarise(changes), "recorded_rows": rows_total}
         session["unwatched_session"] = no_folder_watched and await _ran_processes_without_file_events(db, session["id"])
         # A session whose started_at/ended_at are identical and which
         # contributed no events this period is the artifact a restart
@@ -667,7 +699,7 @@ def _chain_header_text(chain: dict) -> str:
 async def export_json(date: str = Query(default="today")):
     summary = await _build_summary(date)
     summary["chain_verification"] = await _chain_verification()
-    return summary
+    return with_utc_offsets(summary)
 
 
 @router.get("/export/pdf")
@@ -744,6 +776,7 @@ async def export_pdf(date: str = Query(default="today")):
     c.setFont("Helvetica-Bold", 12)
     y = draw(y, "Sessions", "Helvetica-Bold", 12, 0.25 * inch)
     c.setFont("Helvetica", 9)
+    path_lines_left = PDF_MAX_FILE_PATH_LINES
     for session in active_sessions:
         operator = f"{session.get('operator_username') or 'unknown'}@{session.get('operator_hostname') or 'unknown'}"
         ended_label = _format_local(session["ended_at"]) if session.get("ended_at") else "ongoing"
@@ -766,6 +799,20 @@ async def export_pdf(date: str = Query(default="today")):
             y = draw(y, "(began before this period)", "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
         if session["resumed"]:
             y = draw(y, "(already running when Vigil started)", "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
+        files_changed = session.get("files_changed")
+        if files_changed and files_changed["total"]:
+            by_change = ", ".join(f"{k} {v}" for k, v in sorted(files_changed["by_change"].items()))
+            y = draw(
+                y, f"files changed: {files_changed['total']} ({by_change}); full list in the session report",
+                "Helvetica", 9, 0.2 * inch, indent=0.3 * inch,
+            )
+            for entry in files_changed["top_directories"]:
+                y = draw(y, f"{entry['count']:>5}  {entry['directory']}", "Helvetica", 8, 0.17 * inch, indent=0.5 * inch)
+            for path in files_changed["first_paths"]:
+                if path_lines_left <= 0:
+                    break
+                path_lines_left -= 1
+                y = draw(y, path, "Helvetica", 8, 0.17 * inch, indent=0.7 * inch)
         if session.get("unwatched_session"):
             y = draw(y, UNWATCHED_SESSION_TEXT, "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
         if session.get("unusual_hour"):

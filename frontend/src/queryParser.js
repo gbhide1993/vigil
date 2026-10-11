@@ -14,6 +14,12 @@ export function parseQuery(q, events, now = new Date()) {
   if (!q.trim()) return events
   const lower = q.toLowerCase().trim()
 
+  // A session id (or its first characters, as shown in reports and the feed) selects that session's events.
+  if (/^[0-9a-f-]{4,36}$/.test(lower)) {
+    const bySession = events.filter((e) => (e.session_id || '').toLowerCase().startsWith(lower))
+    if (bySession.length > 0) return bySession
+  }
+
   // ── TIME FILTERS ──────────────────────────────────────────────
 
   const afterMatch = lower.match(/after\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/)

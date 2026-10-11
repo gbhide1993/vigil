@@ -75,6 +75,11 @@ EVENT_TYPE_MAP = {
 # instead of queueing without limit. Ignored folders never reach this point.
 MAX_PENDING_FILE_DISPATCH = 2000
 
+# watchdog's raw event names -> the change type stored with the event
+# (EVENT_TYPE_MAP above folds created / modified / moved into "file_write",
+# so without this the create / write / move distinction would be lost).
+CHANGE_MAP = {"created": "create", "modified": "write", "moved": "move", "deleted": "delete"}
+
 # _refine_pid_by_open_handle's psutil.Process.open_files() calls run in a
 # disposable subprocess (watchers/_open_handle_worker.py), not in this
 # process at all -- not even on a dedicated thread pool, which is what an
@@ -274,10 +279,13 @@ async def _find_owning_agent_pid(pid_cache: _AgentPidCache, path: str | None = N
     down to exactly one (including on a subprocess timeout/failure -- see
     _refine_pid_by_open_handle), we still pick the first match but flag
     confidence as "low" so it's auditable rather than silently presented
-    as certain."""
+    as certain.
+
+    Confidence is never "high" for this (native / polling observer) tier; see
+    the comment where it is chosen below."""
     agent_map = pid_cache.snapshot()
     if not agent_map:
-        return None, "high"
+        return None, "low"      # no agent running: the caller drops the event
 
     matches = list(agent_map.keys())
     seen_agents = set(agent_map.values())
@@ -285,9 +293,13 @@ async def _find_owning_agent_pid(pid_cache: _AgentPidCache, path: str | None = N
     if path is not None and len(matches) > 1:
         refined = await _refine_pid_by_open_handle(matches, path)
         if refined is not None:
-            return refined, "high"
+            return refined, "medium"
 
-    confidence = "low" if len(seen_agents) > 1 else "high"
+    # Never "high" here: this tier does not know which process wrote the
+    # file, only which agents were running. "low" = more than one agent was
+    # running; "medium" = one agent was running, but the writer was not
+    # verified (a change you made yourself looks the same).
+    confidence = "low" if len(seen_agents) > 1 else "medium"
     return matches[0], confidence
 
 
@@ -484,7 +496,7 @@ class VlawFileHandler(FileSystemEventHandler):
             return
 
         future = asyncio.run_coroutine_threadsafe(
-            self._handle_polled_event(path, event_type), self.loop
+            self._handle_polled_event(path, event_type, CHANGE_MAP.get(event.event_type)), self.loop
         )
         future.add_done_callback(lambda f: self._dispatch_done(f, path))
 
@@ -493,7 +505,7 @@ class VlawFileHandler(FileSystemEventHandler):
             self._pending_dispatch -= 1
         _log_dispatch_exception(future, path)
 
-    async def _handle_polled_event(self, path: str, event_type: str) -> None:
+    async def _handle_polled_event(self, path: str, event_type: str, change: str | None = None) -> None:
         # _find_owning_agent_pid itself is now just a cache read (see
         # _AgentPidCache) plus, for tier 2, a possible subprocess call for
         # open-handle refinement -- see _refine_pid_by_open_handle and
@@ -502,14 +514,14 @@ class VlawFileHandler(FileSystemEventHandler):
         guess_path = path if self.use_pid_heuristic else None
         pid, confidence = await _find_owning_agent_pid(self.pid_cache, guess_path)
         event_source = "realtime_heuristic" if self.use_pid_heuristic else "poll"
-        await self.handle_file_event(path, event_type, event_source, pid, confidence, time.time())
+        await self.handle_file_event(path, event_type, event_source, pid, confidence, time.time(), change=change)
 
-    async def handle_etw_event(self, pid: int, path: str, event_type: str, timestamp: float) -> None:
+    async def handle_etw_event(self, pid: int, path: str, event_type: str, timestamp: float, change: str | None = None) -> None:
         """Tier 1 entry point — registered as ETWFileWatcher's callback.
         pid is already exact and already filtered to a known/suspected
         agent (see etw_file_watcher.ETWFileWatcher._process_event), so this
         skips the _find_owning_agent_pid guess entirely."""
-        await self.handle_file_event(path, event_type, "etw", pid, "high", timestamp)
+        await self.handle_file_event(path, event_type, "etw", pid, "high", timestamp, change=change)
 
     async def handle_file_event(
         self,
@@ -519,6 +531,7 @@ class VlawFileHandler(FileSystemEventHandler):
         pid: int | None,
         confidence: str,
         timestamp: float | None = None,
+        change: str | None = None,
     ) -> None:
         # Safety filter for every tier (native, polling and ETW): changes
         # inside Vigil's own install folder or data folder (its database,
@@ -560,6 +573,7 @@ class VlawFileHandler(FileSystemEventHandler):
             "path": path,
             "event_type": event_type,
             "attribution_confidence": confidence,
+            "change": change,
             "pid": pid,
             "event_source": event_source,
             "timestamp": timestamp if timestamp is not None else time.time(),
@@ -707,6 +721,14 @@ def _watch_registry(observer) -> dict:
         registry = {}
         observer._vlaw_watches = registry
     return registry
+
+
+def watched_paths(observer) -> list[str]:
+    """The folders this observer is recursively watching right now (what the
+    live scope API reports as `observed_paths`). Empty for an observer
+    without a folder list (the ETW tier)."""
+    registry = getattr(observer, "_vlaw_watches", None) or {}
+    return sorted(getattr(w, "path", key) for key, w in registry.items())
 
 
 def watch_folder(observer, handler, path: str) -> bool:

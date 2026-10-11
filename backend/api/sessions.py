@@ -6,14 +6,20 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+from collections import Counter
+
 from core.alerter import Alerter
+from core.file_changes import scope_label, session_changes
 from core.monitoring_status import network_monitoring
-from core.red_lines import SESSION_LAUNCH_DIR
+from core.scope_store import get_scope_directories
 from core.verification import build_verification_report, touches_credential_path
 from db.database import get_read_db
 
 router = APIRouter()
 _alerter = Alerter()
+
+# Most file-change rows listed in one session report (the rest are counted).
+MAX_FILE_CHANGE_ROWS = 200
 
 ANOMALY_RULE_TYPES = ("volumetric_threshold", "time_anomaly", "ratio_anomaly", "unknown_destination", "rolling_anomaly")
 
@@ -160,45 +166,10 @@ async def get_session_top_finding(session_id: str):
         await db.close()
 
 
-def _is_outside_workdir(path: str) -> bool:
-    """Mirrors core.red_lines' notion of "outside the active workspace":
-    SESSION_LAUNCH_DIR is the directory V-LAW itself was started from."""
-    try:
-        resolved = Path(path).resolve()
-    except (OSError, ValueError):
-        return False
-    try:
-        resolved.relative_to(SESSION_LAUNCH_DIR)
-        return False
-    except ValueError:
-        return True
-
-
 async def _get_policy_list(db, key: str) -> list[str]:
     cur = await db.execute("SELECT policy_value FROM policy WHERE policy_key = ?", (key,))
     row = await cur.fetchone()
     return json.loads(row["policy_value"]) if row else []
-
-
-async def _get_unique_file_paths(db, session_id: str) -> list[str]:
-    """File events are aggregated (core/aggregator.py) — individual paths
-    live in detail.paths (capped at 50 per aggregation window), not the
-    row's own `path` column, which holds the containing directory instead.
-    Same shape as core.verification.get_os_observed_files."""
-    cur = await db.execute(
-        "SELECT path, detail FROM events WHERE session_id = ? AND event_type IN ('file_write', 'file_create')",
-        (session_id,),
-    )
-    rows = await cur.fetchall()
-    paths: set[str] = set()
-    for row in rows:
-        detail = json.loads(row["detail"]) if row["detail"] else {}
-        detail_paths = detail.get("paths")
-        if detail_paths:
-            paths.update(detail_paths)
-        elif row["path"]:
-            paths.add(row["path"])
-    return sorted(paths)
 
 
 async def _get_unique_network_destinations(db, session_id: str) -> list[str]:
@@ -247,7 +218,15 @@ async def _build_session_report_data(db, session_id: str) -> dict:
         end_dt = datetime.fromisoformat(ended_at.replace(" ", "T")) if ended_at else datetime.utcnow()
         duration_minutes = round((end_dt - start_dt).total_seconds() / 60, 1)
 
-    file_paths = await _get_unique_file_paths(db, session_id)
+    # Every recorded file change of the session (creates, writes, moves AND deletes),
+    # with its time, change type and how sure the agent attribution is.
+    scope_dirs = await get_scope_directories(db)
+    changes, _rows_total = await session_changes(db, session_id, agent_name, limit=10000)
+    for change in changes:
+        change["scope"] = scope_label(change["path"], scope_dirs)
+        change["is_credential"] = touches_credential_path(change["path"])
+    by_change = dict(Counter(c["change"] for c in changes))
+    shown_changes = changes[:MAX_FILE_CHANGE_ROWS]
     net_destinations = await _get_unique_network_destinations(db, session_id)
     approved_destinations = set(await _get_policy_list(db, "approved_network_destinations"))
 
@@ -271,14 +250,17 @@ async def _build_session_report_data(db, session_id: str) -> dict:
     for alert in alerts:
         alert["created_at"] = _format_local(alert["created_at"])
 
-    files_touched = [
-        {
-            "path": p,
-            "outside_workdir": _is_outside_workdir(p),
-            "is_credential": touches_credential_path(p),
-        }
-        for p in file_paths
-    ]
+    # Unique paths (a file changed ten times is one entry here, ten in file_changes).
+    unique: dict[str, dict] = {}
+    for change in changes:
+        unique.setdefault(change["path"], {
+            "path": change["path"],
+            # Under a watched folder? None when no folder is watched: then no label is shown.
+            "scope": change["scope"],
+            "outside_workdir": change["scope"] == "outside_scope",     # kept for older clients
+            "is_credential": change["is_credential"],
+        })
+    files_touched = sorted(unique.values(), key=lambda f: f["path"])
     network_connections = [
         {"destination": d, "approved": d in approved_destinations}
         for d in net_destinations
@@ -295,6 +277,11 @@ async def _build_session_report_data(db, session_id: str) -> dict:
         "generated_at": now_local.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "files_touched": files_touched,
         "files_touched_count": len(files_touched),
+        "file_changes": shown_changes,
+        "file_changes_total": len(changes),
+        "file_changes_not_shown": len(changes) - len(shown_changes),
+        "file_changes_by_type": by_change,
+        "watched_folders": scope_dirs,
         "network_connections": network_connections,
         "network_connections_count": len(network_connections),
         # Real watcher state (core/monitoring_status.py): while "off", a count of 0
@@ -312,7 +299,7 @@ async def get_session_report_preview(session_id: str):
     the user downloads the actual file."""
     report = await _build_session_report(session_id)
     events = (
-        [{"kind": "file", **f} for f in report["files_touched"]]
+        [{"kind": "file", **c} for c in report["file_changes"]]
         + [{"kind": "network", **n} for n in report["network_connections"]]
     )
     return {
@@ -321,6 +308,10 @@ async def get_session_report_preview(session_id: str):
         "start_time": report["start_time"],
         "duration_minutes": report["duration_minutes"],
         "files_touched": report["files_touched_count"],
+        "file_changes_total": report["file_changes_total"],
+        "file_changes_not_shown": report["file_changes_not_shown"],
+        "file_changes_by_type": report["file_changes_by_type"],
+        "watched_folders": report["watched_folders"],
         "network_connections": report["network_connections_count"],
         "network_monitoring": report["network_monitoring"],
         "process_spawns": report["process_spawns"],
@@ -375,7 +366,7 @@ async def get_session_report_pdf(session_id: str):
 
     # SUMMARY ROW
     box_labels = [
-        ("Files Touched", report["files_touched_count"]),
+        ("Files Changed", report["files_touched_count"]),
         ("Network Connections", "off" if net_off else report["network_connections_count"]),
         ("Process Spawns", report["process_spawns"]),
         ("Red Lines", report["red_lines_count"]),
@@ -396,29 +387,46 @@ async def get_session_report_pdf(session_id: str):
         x += box_w + 0.15 * inch
     y -= box_h + 0.35 * inch
 
-    # FILES TOUCHED
+    # FILE CHANGES
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(margin, y, f"Files Touched ({report['files_touched_count']})")
+    c.drawString(margin, y, f"File changes ({report['file_changes_total']})")
     y -= 0.22 * inch
     c.setFont("Helvetica", 9)
-    if not report["files_touched"]:
-        c.drawString(margin, y, "(none)")
+    if report["file_changes_by_type"]:
+        by_type = ", ".join(f"{name} {count}" for name, count in sorted(report["file_changes_by_type"].items()))
+        c.drawString(margin, y, f"By change: {by_type}")
         y -= 0.2 * inch
-    for f in report["files_touched"]:
-        if y < margin:
+    if not report["watched_folders"]:
+        c.drawString(margin, y, "No project folder is watched, so no scope label is shown.")
+        y -= 0.2 * inch
+    if not report["file_changes"]:
+        c.drawString(margin, y, "(none recorded)")
+        y -= 0.2 * inch
+    for f in report["file_changes"]:
+        if y < margin + 0.4 * inch:
             y = new_page()
         if f["is_credential"]:
             marker = "[CREDENTIAL PATH] "
             c.setFillColor(colors.HexColor("#b00020"))
-        elif f["outside_workdir"]:
+        elif f["scope"] == "outside_scope":
             marker = "[OUTSIDE SCOPE] "
             c.setFillColor(colors.HexColor("#b25900"))
-        else:
+        elif f["scope"] == "in_scope":
             marker = "[OK] "
             c.setFillColor(colors.HexColor("#1a7a3c"))
-        c.drawString(margin, y, (marker + f["path"])[:120])
+        else:
+            marker = ""
+        c.setFont("Helvetica", 8)
+        c.drawString(margin, y, f"{marker}{f['time']}  {f['change']}  {f['path']}"[:150])
+        y -= 0.15 * inch
         c.setFillColor(colors.black)
-        y -= 0.18 * inch
+        confidence = f" ({f['attribution_confidence']})" if f["attribution_confidence"] and f["attribution"] != "exact" else ""
+        c.drawString(margin + 0.25 * inch, y, f"{f['attribution_label']}{confidence}"[:140])
+        y -= 0.17 * inch
+    c.setFont("Helvetica", 9)
+    if report["file_changes_not_shown"]:
+        c.drawString(margin, y, f"{report['file_changes_not_shown']} more not shown (the counts above include them).")
+        y -= 0.2 * inch
     y -= 0.2 * inch
 
     # NETWORK CONNECTIONS
@@ -484,9 +492,9 @@ async def get_session_report_pdf(session_id: str):
     legend_lines = [
         "[APPROVED] — destination is in your approved policy list",
         "[NOT IN POLICY] — destination not reviewed; verify if expected",
-        "[OK] — file within expected working directory",
-        "[OUTSIDE SCOPE] — file accessed outside working directory",
-        "[CREDENTIAL PATH] — sensitive credential file accessed",
+        "[OK] - change inside a watched folder",
+        "[OUTSIDE SCOPE] - change outside the watched folders (shown only when a folder is watched)",
+        "[CREDENTIAL PATH] - change to a sensitive credential file",
         "[CRITICAL] — immediate action required",
         "[HIGH] — review recommended",
         "[MEDIUM] — informational",

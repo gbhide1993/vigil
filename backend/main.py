@@ -111,14 +111,17 @@ from watchers.mcp_watcher import McpWatcher
 from watchers.network_watcher import NetworkWatcher
 from watchers.process_watcher import ProcessWatcher
 
-LOG_PATH = os.path.join(BASE_DIR, "vlaw-backend.log")
+# VLAW_LOG_FILE lets a test (or an operator) put the log somewhere else.
+LOG_PATH = os.environ.get("VLAW_LOG_FILE") or os.path.join(BASE_DIR, "vlaw-backend.log")
 logger = configure_logging(LOG_PATH)
 logger.info("V-LAW backend starting. BASE_DIR=%s", BASE_DIR)
 
 VERSION = "0.9.0"
 PORT = int(os.environ.get("VLAW_PORT", 7422))
 
-_state: dict = {}
+# Shared with the API routes through core/runtime_state.py (NOT through `import main`,
+# which in the exe would load a second copy of this module). Same objects, old names.
+from core.runtime_state import state as _state, stats_cache as _stats_cache  # noqa: E402
 
 
 DEFAULT_POLICY = {
@@ -588,7 +591,6 @@ app.include_router(scope.router, prefix="/api")
 
 
 _STATS_CACHE_TTL_SECONDS = 2.0
-_stats_cache = {"data": None, "computed_at": 0.0}
 
 
 @app.get("/stats")

@@ -80,6 +80,19 @@ EVENT_ID_TO_TYPE = {
     TASK_RENAME_PATH: "file_write",
 }
 
+# The change type stored with each event (EVENT_ID_TO_TYPE folds create, write
+# and rename into "file_write").
+EVENT_ID_TO_CHANGE = {
+    TASK_NAME_CREATE: "create",
+    TASK_NAME_DELETE: "delete",
+    TASK_WRITE: "write",
+    TASK_SET_INFORMATION: "write",
+    TASK_SET_DELETE: "delete",
+    TASK_RENAME: "move",
+    TASK_DELETE_PATH: "delete",
+    TASK_RENAME_PATH: "move",
+}
+
 # Events whose own properties are checked for a direct path, used to seed
 # the FileObject -> path correlation cache (see _process_event). Most
 # Kernel-File I/O events (Write, SetInformation, Rename, ...) only carry a
@@ -272,7 +285,7 @@ class ETWFileWatcher:
                 return
 
             timestamp = event.timestamp_unix
-            self._dispatch(pid, path, event_type, timestamp)
+            self._dispatch(pid, path, event_type, timestamp, EVENT_ID_TO_CHANGE.get(event_id))
         except Exception:
             logger.exception("ETW file watcher: failed to process one event, skipping it")
 
@@ -307,7 +320,7 @@ class ETWFileWatcher:
             self._file_object_cache.pop(next(iter(self._file_object_cache)))
         self._file_object_cache[file_object] = path
 
-    def _dispatch(self, pid: int, path: str, event_type: str, timestamp: float) -> None:
+    def _dispatch(self, pid: int, path: str, event_type: str, timestamp: float, change: str | None = None) -> None:
         if not self._inflight.acquire(blocking=False):
             self._dropped_count += 1
             watch_stats.add_dropped("overload")
@@ -320,12 +333,12 @@ class ETWFileWatcher:
             return
 
         asyncio.run_coroutine_threadsafe(
-            self._invoke_callback(pid, path, event_type, timestamp), self._loop
+            self._invoke_callback(pid, path, event_type, timestamp, change), self._loop
         )
 
-    async def _invoke_callback(self, pid: int, path: str, event_type: str, timestamp: float) -> None:
+    async def _invoke_callback(self, pid: int, path: str, event_type: str, timestamp: float, change: str | None = None) -> None:
         try:
-            await self._callback(pid, path, event_type, timestamp)
+            await self._callback(pid, path, event_type, timestamp, change)
         except Exception:
             logger.exception("ETW file watcher: callback failed for pid=%s path=%s", pid, path)
         finally:

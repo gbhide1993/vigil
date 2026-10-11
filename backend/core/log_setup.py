@@ -29,6 +29,17 @@ def configure_logging(log_path: str, level: str | int | None = None) -> logging.
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     root = logging.getLogger()
     root.setLevel(level)
+    # Idempotent: a second call for the same file (for example a second copy
+    # of main.py being imported) must not add a second set of handlers,
+    # which printed every line twice.
+    target = os.path.abspath(log_path)
+    if any(
+        isinstance(h, RotatingFileHandler) and os.path.abspath(h.baseFilename) == target
+        for h in root.handlers
+    ):
+        for name in QUIET_LOGGERS:
+            logging.getLogger(name).setLevel(logging.WARNING)
+        return logging.getLogger("vlaw")
     for handler in (
         RotatingFileHandler(
             log_path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8",

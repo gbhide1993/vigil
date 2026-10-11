@@ -66,7 +66,12 @@ function FeedRow({ event }) {
   return (
     <div className={`feed-row ${severityClass}`}>
       <span className="feed-time">{formatTime(event.created_at)}</span>
-      <span className="agent-pill">{event.agent_name || '—'}</span>
+      <span className="mono" title={event.session_id || undefined} style={{ opacity: 0.6, fontSize: 11 }}>
+        {(event.session_id || '').slice(0, 8)}
+      </span>
+      <span className="agent-pill" title={event.attribution_label || undefined}>
+        {event.agent_name || '—'}{event.attribution === 'best_guess' ? ' (best guess)' : ''}
+      </span>
       <TypeBadge type={event.event_type} />
       <span className="feed-path" title={path}>
         {showGlobe && <GlobeIcon />}
@@ -313,7 +318,7 @@ export default function History() {
                   {netEvents.map((e) => (
                     <tr key={e.id}>
                       <td>{formatTime(e.created_at)}</td>
-                      <td>{e.agent_name}</td>
+                      <td title={e.attribution_label || undefined}>{e.agent_name}{e.attribution === 'best_guess' ? ' (best guess)' : ''}</td>
                       <td className="mono-truncate" title={e.path}>
                         {isRawIp(e.path) && <GlobeIcon />} {e.path}
                       </td>
@@ -343,7 +348,7 @@ export default function History() {
                   {credEvents.map((e) => (
                     <tr key={e.id}>
                       <td>{formatTime(e.created_at)}</td>
-                      <td>{e.agent_name}</td>
+                      <td title={e.attribution_label || undefined}>{e.agent_name}{e.attribution === 'best_guess' ? ' (best guess)' : ''}</td>
                       <td className="mono-truncate" title={e.path}>{e.path}</td>
                     </tr>
                   ))}

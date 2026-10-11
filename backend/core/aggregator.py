@@ -424,7 +424,7 @@ class Aggregator:
                 "session_id": event["session_id"],
                 "event_type": event["event_type"],
                 "path": path,
-                "detail": {"attribution_confidence": confidence},
+                "detail": {"attribution_confidence": confidence, "change": event.get("change")},
                 "severity": "low",
                 "pid": event.get("pid"),
                 "event_source": event_source,
@@ -878,6 +878,7 @@ class Aggregator:
                     json.dumps({
                         "event_type": event["event_type"],
                         "attribution_confidence": event.get("attribution_confidence", "high"),
+                        "change": event.get("change"),
                     }),
                     pid,
                     event_source,
@@ -924,6 +925,7 @@ class Aggregator:
                     path,
                     json.dumps({
                         "attribution_confidence": event.get("attribution_confidence", "high"),
+                        "change": event.get("change"),
                     }),
                     event["pid"],
                     event["event_source"],
