@@ -394,7 +394,7 @@ async def test_daily_summary_has_a_bounded_files_changed_block(db):
     for d in range(15):
         for i in range(8):
             await _event(db, agent_id, sid, f"C:/proj/dir{d:02d}/f{i}.py", change="write",
-                         created="2026-10-11 06:00:00")
+                         created=_now_sql())
     await db.commit()
     try:
         summary = await export_module._build_summary("today")
@@ -542,3 +542,95 @@ def test_history_search_matches_a_session_id_prefix():
     out = json.loads(result.stdout.strip().splitlines()[-1])
     assert out["prefix8"] == ["/x/one.py"] and out["prefix4"] == ["/x/two.py"]
     assert out["text"] == ["/x/two.py"] and out["none"] == 0
+
+
+BS = chr(92)
+
+
+def _now_sql():
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------- daily file lists: checkpoints, order, slashes
+
+@pytest.mark.asyncio
+async def test_daily_files_changed_hides_checkpoint_paths_and_lists_watched_first(db, monkeypatch):
+    async def fake_scope(_db):
+        return ["C:/work/proj"]
+
+    monkeypatch.setattr(export_module, "get_scope_directories", fake_scope)
+    agent_id, name = await _agent(db)
+    sid = await _session(db, agent_id)
+    for i in range(55):
+        await _event(db, agent_id, sid, f"C:/Users/u/.claude/file-history/abc/v{i}".replace("/", BS), change="write",
+                     created=_now_sql())
+    await _event(db, agent_id, sid, "C:/elsewhere/other.txt".replace("/", BS), change="write", created=_now_sql())
+    for i in range(5):
+        await _event(db, agent_id, sid, f"C:/work/proj/src/f{i}.py".replace("/", BS), change="create", created=_now_sql())
+    await db.commit()
+    try:
+        summary = await export_module._build_summary("today")
+        changed = next(s for s in summary["sessions"] if s["id"] == sid)["files_changed"]
+        assert changed["first_paths"][:5] == [f"C:/work/proj/src/f{i}.py" for i in range(5)]
+        assert changed["first_paths"][5] == "C:/elsewhere/other.txt" and len(changed["first_paths"]) == 6
+        assert all("file-history" not in p for p in changed["first_paths"])
+        assert changed["checkpoint_note"] == "55 checkpoint writes in the agent's hidden cache, not listed"
+        assert changed["total"] == 61 and changed["by_change"] == {"write": 56, "create": 5}
+        counted = {d["directory"]: d["count"] for d in changed["top_directories"]}
+        assert counted["C:/Users/u/.claude/file-history/abc"] == 55
+        assert all("\\" not in p for p in changed["first_paths"]) and all("\\" not in d for d in counted)
+        assert changed["attribution_note"] == f"attributed to {name} (best guess)"
+        assert "best_guess_attribution" not in changed
+    finally:
+        await _cleanup(db, agent_id)
+
+
+def test_summarise_caps_after_removing_checkpoint_paths():
+    changes = [{"path": f"C:/Users/u/.claude/file-history/x/{i}".replace("/", BS), "change": "write"} for i in range(80)]
+    changes += [{"path": f"C:/p/f{i}".replace("/", BS), "change": "write"} for i in range(60)]
+    result = summarise(changes, scope_dirs=["C:/p"])
+    assert len(result["first_paths"]) == 50 and all(p.startswith("C:/p/") for p in result["first_paths"])
+    assert result["checkpoint_writes"] == 80 and result["total"] == 140
+
+
+def test_pdf_prints_checkpoint_and_attribution_notes_and_no_checkpoint_paths():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    session = {
+        "id": "11111111-aaaa", "started_at": "2026-03-15 08:00:00", "ended_at": "2026-03-15 09:00:00",
+        "operator_username": "a", "operator_hostname": "h", "agent_name": "claude_code",
+        "event_count_in_period": 5, "no_activity": False, "resumed": False, "checkpoint_writes": 4,
+        "files_changed": {
+            "total": 5, "by_change": {"write": 5}, "recorded_rows": 5, "note": "full list in the session report",
+            "top_directories": [{"directory": "C:/p", "count": 1}], "first_paths": ["C:/p/a.py"],
+            "checkpoint_writes": 4, "attribution_note": "attributed to claude_code (best guess)",
+            "checkpoint_note": "4 checkpoint writes in the agent's hidden cache, not listed",
+        },
+    }
+
+    async def fake_build_summary(date, tz=None):
+        return {
+            "date": "2026-03-15", "generated_at": "2026-03-15T12:00:00+00:00",
+            "period_start": "2026-03-15T00:00:00+00:00", "period_end": "2026-03-16T00:00:00+00:00",
+            "timezone": "UTC", "event_count": 5, "sessions": [session], "alerts": [],
+            "report_notes": export_module.REPORT_NOTES, "coverage_available": False, "tracking_started_at": None,
+            "active_seconds": 0, "period_seconds_measured": 0, "gaps": [], "short_gap_count": 0, "short_gap_seconds": 0,
+        }
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    app = FastAPI()
+    app.include_router(export_module.router)
+    with patch.object(export_module, "_build_summary", fake_build_summary), patch.object(canvas.Canvas, "drawString", capture):
+        assert TestClient(app).get("/export/pdf").status_code == 200
+    assert "attributed to claude_code (best guess)" in drawn
+    assert drawn.count("4 checkpoint writes in the agent's hidden cache, not listed") == 1
+    assert not any("file-history" in t for t in drawn)

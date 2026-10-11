@@ -9,7 +9,8 @@ database work.
 Never ignored, anywhere:
   - credential-looking paths (.env, .ssh, .aws, .pem, .key ... the same
     definition the aggregator uses to classify credential access), even
-    inside node_modules;
+    inside node_modules (except public CA bundles such as certifi's cacert.pem,
+    see aggregator._is_public_ca_bundle);
   - the security-relevant parts of git: .git/hooks, .git/config (and the
     same two inside .git/modules/<name>/), plus .gitmodules, which is not
     under .git at all. A write to one of those can run code or redirect
@@ -23,7 +24,7 @@ report states the total. VLAW_IGNORE_GENERATED=0 switches the rule off.
 import os
 
 from core import watch_stats
-from core.aggregator import _is_credential_path
+from core.aggregator import _is_credential_path, _is_public_ca_bundle
 
 IGNORED_DIR_NAMES = frozenset({
     "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next", ".nuxt", "target",
@@ -60,6 +61,10 @@ def ignored_folder_for(path: str | None) -> str | None:
             return segment
         if segment == ".git":
             return None if _git_internal_is_meaningful(segments[index + 1:]) else ".git"
+    # A public CA bundle (cacert.pem ...) in a certifi folder that is not itself
+    # inside a generated folder: still an ordinary generated file.
+    if _is_public_ca_bundle(path):
+        return "certifi"
     return None
 
 

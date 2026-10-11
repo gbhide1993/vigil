@@ -61,8 +61,23 @@ class ConnectionWedgedError(Exception):
     like any other failed write."""
 
 
+# Public CA certificate bundles that package managers write into dependency
+# folders. They match ".pem" but hold no secret, so inside these folders they
+# are ordinary generated files. A key.pem there, or any .pem elsewhere, is not
+# covered.
+PUBLIC_CA_BUNDLE_NAMES = frozenset({"cacert.pem", "ca-bundle.crt", "ca-certificates.crt"})
+PUBLIC_CA_BUNDLE_FOLDERS = frozenset({"site-packages", "node_modules", "certifi"})
+
+
+def _is_public_ca_bundle(path: str) -> bool:
+    parts = path.lower().replace("\\", "/").split("/")
+    return parts[-1] in PUBLIC_CA_BUNDLE_NAMES and any(p in PUBLIC_CA_BUNDLE_FOLDERS for p in parts[:-1])
+
+
 def _is_credential_path(path: str) -> bool:
     lowered = path.lower()
+    if _is_public_ca_bundle(path) and not any(p in lowered for p in (".env", ".ssh", ".aws")):
+        return False
     return any(pattern in lowered for pattern in CREDENTIAL_PATTERNS)
 
 

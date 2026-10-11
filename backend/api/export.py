@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from core import ignore_rules, watch_stats
 from core.file_changes import session_changes, summarise
 from core.monitoring_status import file_watcher_tier, mcp_monitoring, network_monitoring
-from core.scope_store import get_scope_entries
+from core.scope_store import get_scope_directories, get_scope_entries
 from db.database import get_db
 
 router = APIRouter()
@@ -584,6 +584,7 @@ async def _build_summary(date: str, tz=None) -> dict:
     checkpoint_counts = await _checkpoint_counts_by_session(db, start_sql, end_sql)
     time_alerted = await _sessions_with_time_alert(db, [s["id"] for s in sessions])
     no_folder_watched = (not await get_scope_entries(db)) and file_watcher_tier() != "etw"
+    scope_dirs = await get_scope_directories(db)
     for session in sessions:
         session["event_count_in_period"] = event_counts_by_session.get(session["id"], 0)
         session["checkpoint_writes"] = checkpoint_counts.get(session["id"], 0)
@@ -593,7 +594,10 @@ async def _build_summary(date: str, tz=None) -> dict:
         changes, rows_total = await session_changes(
             db, session["id"], session.get("agent_name"), since=start_sql, until=end_sql,
         )
-        session["files_changed"] = {**summarise(changes), "recorded_rows": rows_total}
+        files_changed = {**summarise(changes, scope_dirs=scope_dirs), "recorded_rows": rows_total}
+        if files_changed.pop("best_guess_attribution"):
+            files_changed["attribution_note"] = f"attributed to {session.get('agent_name') or 'unidentified_agent'} (best guess)"
+        session["files_changed"] = files_changed
         session["unwatched_session"] = no_folder_watched and await _ran_processes_without_file_events(db, session["id"])
         # A session whose started_at/ended_at are identical and which
         # contributed no events this period is the artifact a restart
@@ -806,6 +810,10 @@ async def export_pdf(date: str = Query(default="today")):
                 y, f"files changed: {files_changed['total']} ({by_change}); full list in the session report",
                 "Helvetica", 9, 0.2 * inch, indent=0.3 * inch,
             )
+            if files_changed.get("attribution_note"):
+                y = draw(y, files_changed["attribution_note"], "Helvetica", 8, 0.17 * inch, indent=0.5 * inch)
+            if files_changed.get("checkpoint_note"):
+                y = draw(y, files_changed["checkpoint_note"], "Helvetica", 8, 0.17 * inch, indent=0.5 * inch)
             for entry in files_changed["top_directories"]:
                 y = draw(y, f"{entry['count']:>5}  {entry['directory']}", "Helvetica", 8, 0.17 * inch, indent=0.5 * inch)
             for path in files_changed["first_paths"]:
@@ -828,7 +836,7 @@ async def export_pdf(date: str = Query(default="today")):
                 "within 30 days, not alerted again)",
                 "Helvetica", 9, 0.2 * inch, indent=0.3 * inch,
             )
-        if session.get("checkpoint_writes"):
+        if session.get("checkpoint_writes") and not (files_changed and files_changed.get("checkpoint_note")):
             n = session["checkpoint_writes"]
             y = draw(
                 y,

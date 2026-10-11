@@ -575,3 +575,45 @@ async def test_real_repository_layout_burst_is_ignored_cheaply_and_recorded_wher
         await aggregator.stop_writer()
         await db.execute("DELETE FROM events WHERE agent_id = ? AND id NOT IN (SELECT event_id FROM event_chain)", (agent_id,))
         await db.commit()
+
+
+# ------------------------------------------------ public CA bundles (certifi)
+
+CA_IGNORED = [
+    "C:/Users/u/vlaw/backend/.venv/Lib/site-packages/certifi/cacert.pem",
+    "C:/Users/u/vlaw/backend/.venv/Lib/site-packages/certifi/cacert.pem".replace("/", chr(92)),
+    "C:/proj/node_modules/some/ca-bundle.crt",
+    "C:/x/certifi/ca-certificates.crt",
+]
+STILL_CREDENTIAL = [
+    "C:/Users/u/notes/cacert.pem",                                    # outside the dependency folders
+    "C:/Users/u/vlaw/backend/.venv/Lib/site-packages/pkg/key.pem",    # other name in site-packages
+    "C:/Users/u/vlaw/backend/.venv/.env",
+    "C:/Users/u/.ssh/id_rsa",
+    "C:/Users/u/.ssh/cacert.pem",
+    "C:/Users/u/certs/server.pem",
+]
+
+
+@pytest.mark.parametrize("path", CA_IGNORED)
+def test_public_ca_bundle_in_dependency_folders_is_ignored_not_a_credential(path):
+    from core.aggregator import _is_credential_path
+
+    assert _is_credential_path(path) is False
+    assert ignored_folder_for(path) is not None
+
+
+def test_ca_bundle_is_counted_by_the_ignore_counters(monkeypatch):
+    monkeypatch.setenv("VLAW_IGNORE_GENERATED", "1")
+    before = watch_stats.snapshot() if hasattr(watch_stats, "snapshot") else None
+    assert ignore_rules.ignore_and_count(CA_IGNORED[0]) is True
+    if before is not None:
+        assert watch_stats.snapshot() != before
+
+
+@pytest.mark.parametrize("path", STILL_CREDENTIAL)
+def test_other_credential_looking_paths_still_alert_and_are_not_ignored(path):
+    from core.aggregator import _is_credential_path
+
+    assert _is_credential_path(path) is True
+    assert ignored_folder_for(path) is None

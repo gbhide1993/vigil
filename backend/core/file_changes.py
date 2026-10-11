@@ -102,22 +102,52 @@ async def session_changes(db, session_id: str, agent_name: str | None, *, since:
     return rows_to_changes(await cur.fetchall(), agent_name), total
 
 
-def summarise(changes: list[dict], *, max_directories: int = 10, max_paths: int = 50) -> dict:
-    """Bounded summary for the daily exports."""
+CHECKPOINT_MARKER = "/.claude/file-history/"
+
+
+def normalise_path(path: str) -> str:
+    """Forward slashes everywhere in the daily exports."""
+    return path.replace("\\", "/")
+
+
+def is_checkpoint_path(path: str) -> bool:
+    """Claude's hidden checkpoint cache (~/.claude/file-history)."""
+    return CHECKPOINT_MARKER in normalise_path(path).lower() + "/"
+
+
+def summarise(changes: list[dict], *, scope_dirs: list[str] | None = None,
+              max_directories: int = 10, max_paths: int = 50) -> dict:
+    """Bounded summary for the daily exports. Counts (by_change, top_directories,
+    total) cover every change. The listed paths exclude the checkpoint cache
+    (reported as one count instead) and put paths under a watched folder first,
+    then other paths. All paths use forward slashes."""
     by_change = Counter(c["change"] for c in changes)
-    directories = Counter(os.path.dirname(c["path"].replace("\\", "/")) or "." for c in changes)
+    directories = Counter(os.path.dirname(normalise_path(c["path"])) or "." for c in changes)
+    checkpoint_writes = 0
+    watched_paths: list[str] = []
+    other_paths: list[str] = []
     seen: set[str] = set()
-    first_paths: list[str] = []
     for c in changes:
-        if c["path"] not in seen:
-            seen.add(c["path"])
-            first_paths.append(c["path"])
-            if len(first_paths) >= max_paths:
-                break
+        path = normalise_path(c["path"])
+        if is_checkpoint_path(path):
+            checkpoint_writes += 1
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        if scope_dirs and scope_label(path, scope_dirs) == "in_scope":
+            watched_paths.append(path)
+        else:
+            other_paths.append(path)
     return {
         "total": len(changes),
         "by_change": dict(by_change),
         "top_directories": [{"directory": d, "count": n} for d, n in directories.most_common(max_directories)],
-        "first_paths": first_paths,
+        "first_paths": (watched_paths + other_paths)[:max_paths],
+        "checkpoint_writes": checkpoint_writes,
+        "checkpoint_note": (
+            f"{checkpoint_writes} checkpoint writes in the agent's hidden cache, not listed" if checkpoint_writes else None
+        ),
+        "best_guess_attribution": any(c.get("attribution") == "best_guess" for c in changes),
         "note": "full list in the session report",
     }
