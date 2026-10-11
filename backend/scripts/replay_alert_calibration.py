@@ -144,6 +144,75 @@ async def has_low_red_line(db, sid, aid) -> bool:
 
 # --------------------------------------------------------------------- main
 
+async def redline_command_report(db, days: int | None, list_limit: int) -> None:
+    """Dangerous-command red lines, old matching (the whole command line,
+    wrapper boilerplate included) against new matching (the command the
+    agent asked for, see core/agent_wrappers.py). Re-evaluated from the
+    stored process events, so it is independent of which alerts were deduped."""
+    import core.red_lines as rl
+
+    real_unwrap = rl.unwrap_agent_command
+
+    def old_match(cmd, exe):
+        rl.unwrap_agent_command = lambda _s: None
+        try:
+            return rl.is_dangerous_command(cmd, exe)
+        finally:
+            rl.unwrap_agent_command = real_unwrap
+
+    where = "event_type = 'proc_spawn'"
+    args: tuple = ()
+    if days:
+        where += " AND created_at >= datetime('now', ?)"
+        args = (f"-{days} days",)
+    cur = await db.execute(f"SELECT id, path, detail, created_at FROM events WHERE {where}", args)
+    events = [dict(r) for r in await cur.fetchall()]
+
+    old_c, new_c, wrappers, flips = Counter(), Counter(), 0, []
+    for e in events:
+        try:
+            exe = json.loads(e["detail"]).get("command", "")
+        except (ValueError, TypeError):
+            exe = ""
+        o, n = old_match(e["path"], exe), rl.is_dangerous_command(e["path"], exe)
+        old_c[o[0] if o else None] += 1
+        new_c[n[0] if n else None] += 1
+        if rl.unwrap_agent_command(e["path"]) is not None:
+            wrappers += 1
+        if o != n:
+            flips.append((e, o, n))
+
+    print()
+    print(f"Dangerous-command red lines, re-evaluated over {len(events)} process events "
+          f"({'last %d days' % days if days else 'all history'}); {wrappers} are Claude Code shell wrappers:")
+    print(f"  {'pattern':26} {'old':>6} {'new':>6}")
+    for pat in sorted(set(old_c) | set(new_c), key=lambda k: (k is None, str(k))):
+        if pat is None:
+            continue
+        print(f"  {pat:26} {old_c.get(pat, 0):>6} {new_c.get(pat, 0):>6}")
+    print(f"  {'no match':26} {old_c.get(None, 0):>6} {new_c.get(None, 0):>6}")
+    print(f"  events whose result changed: {len(flips)}")
+    for e, o, n in flips[:list_limit]:
+        inner = rl.unwrap_agent_command(e["path"])
+        print(f"    {e['created_at'][:16]} event {e['id']}: {o} -> {n}   inner: {(inner.inner if inner else e['path'])[:90]!r}")
+
+    cur = await db.execute(
+        "SELECT created_at, severity, description FROM alerts WHERE title LIKE '%sensitive command%' "
+        "AND created_at >= datetime('now', ?) ORDER BY created_at",
+        (f"-{days or 7} days",),
+    )
+    rows = await cur.fetchall()
+    print(f"  dangerous-command red-line alerts in the last {days or 7} days, with the new match "
+          f"of the command text ({len(rows)}):")
+    for r in rows[:list_limit]:
+        desc = r["description"]
+        cmd = desc.split("sensitive command: ", 1)[1] if "sensitive command: " in desc else desc
+        n = rl.is_dangerous_command(cmd, "")
+        inner = rl.unwrap_agent_command(cmd)
+        shown = (inner.inner if inner else cmd)[:100].replace("\n", " ")
+        print(f"    {r['created_at'][:16]} stored={r['severity']:7} now={str(n):32} {'[wrapper] ' if inner else ''}{shown!r}")
+
+
 async def main(db_path: str, days: int | None, list_limit: int) -> int:
     live = Path(os.environ.get("LOCALAPPDATA", "")) / "V-LAW" / "data" / "vlaw.db"
     if live.exists() and Path(db_path).resolve() == live.resolve():
@@ -323,6 +392,7 @@ async def main(db_path: str, days: int | None, list_limit: int) -> int:
             print(f"Remaining alerts that were not recomputed (red-line and policy), {len(rows)} in this window:")
             for r in rows[:list_limit]:
                 print(f"  {r['created_at'][:16]}  {r['severity']:8} {r['rule_type']:12} {r['title'][:110]}")
+        await redline_command_report(db, days, list_limit)
         return 0
     finally:
         await db.close()

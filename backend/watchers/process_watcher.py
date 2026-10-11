@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 
+from core.agent_wrappers import unwrap_agent_command
 from core.alerter import Alerter
 from core.attributor import KNOWN_AGENTS, Attributor
 from core.feature_flags import CORE_ONLY
@@ -121,7 +122,10 @@ def _is_suspicious(cmdline: str, exe_basename: str) -> bool:
     exe = re.sub(r"\.(exe|bin)$", "", exe_basename.lower())
     if exe in SUSPICIOUS_EXE_PATTERNS:
         return True
-    lowered = cmdline.lower()
+    # Judge the command the agent asked for, not Claude Code's shell wrapper
+    # around it (core/agent_wrappers.py).
+    unwrapped = unwrap_agent_command(cmdline)
+    lowered = (unwrapped.inner if unwrapped is not None else cmdline).lower()
     return any(pattern in lowered for pattern in SUSPICIOUS_INLINE_PATTERNS)
 
 

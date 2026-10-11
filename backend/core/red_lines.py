@@ -25,6 +25,7 @@ import re
 import time
 from pathlib import Path
 
+from core.agent_wrappers import unwrap_agent_command
 from core.alerter import Alerter
 from core.priors import get_prior
 
@@ -274,6 +275,15 @@ def is_dangerous_command(cmdline: str, exe_basename: str = "") -> tuple[str, str
     run against the full lowered cmdline so flags and context all
     participate; the bare exe-name and inline-substring tiers are
     checked the same way they always were."""
+    # Claude Code runs every Bash command inside a fixed wrapper (see
+    # core/agent_wrappers.py). The rules run on the command the agent asked
+    # for, never on the wrapper boilerplate. A wrapper is not suppressed:
+    # a dangerous inner command still matches at its normal severity.
+    unwrapped = unwrap_agent_command(cmdline)
+    if unwrapped is not None:
+        cmdline = unwrapped.inner
+        exe_basename = ""  # the wrapper's own bash.exe says nothing about the inner command
+
     exe = re.sub(r"\.(exe|bin)$", "", exe_basename.lower())
     lowered = cmdline.lower()
 
@@ -591,7 +601,10 @@ class RedLines:
             agent_id, "dangerous_command", severity,
             title=f"RED LINE: sensitive command spawned by {agent_name}",
             description=f"{agent_name} spawned a potentially sensitive command: {cmdline}",
-            extra_detail={"command": cmdline, "matched_pattern": matched_pattern},
+            extra_detail={
+                "command": cmdline, "matched_pattern": matched_pattern,
+                **({"evaluated_command": unwrapped.inner[:500]} if (unwrapped := unwrap_agent_command(cmdline)) else {}),
+            },
             target=exe_basename or cmdline,
             session_id=session_id,
         )
