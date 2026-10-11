@@ -176,15 +176,17 @@ def cap_severity(base: str, corroboration: Corroboration) -> str:
 
 async def get_corroboration(db, session_id: str, agent_id: int) -> Corroboration:
     c = Corroboration()
-    # Red-line alerts at medium or above count as a red-line signal. The
-    # low-severity red-line "unrecognised network destination" alert is a
-    # network signal (it corroborates up to HIGH, not CRITICAL): it fires
-    # for any connection to a host outside the allow-list, so on its own it
-    # says little about the rest of the session.
+    # Only red-line alerts at HIGH or CRITICAL count as a red-line signal;
+    # a MEDIUM or LOW red line (for example the python -c or curl command
+    # patterns) no longer corroborates anything. The red-line "unrecognised
+    # network destination" alert is the exception to "red line = red-line
+    # signal": it is a network signal (it corroborates up to HIGH, not
+    # CRITICAL) because it fires for any connection to a host outside the
+    # allow-list, so on its own it says little about the rest of the session.
     cur = await db.execute(
         """
         SELECT 1 FROM alerts
-        WHERE agent_id = ? AND rule_type = 'red_line' AND severity != 'low'
+        WHERE agent_id = ? AND rule_type = 'red_line' AND severity IN ('high', 'critical')
           AND (session_id = ? OR event_id IN (SELECT id FROM events WHERE session_id = ?))
         LIMIT 1
         """,
@@ -202,7 +204,9 @@ async def get_corroboration(db, session_id: str, agent_id: int) -> Corroboration
         """
         SELECT 1 FROM alerts
         WHERE agent_id = ?
-          AND (rule_type = 'unknown_destination' OR (rule_type = 'red_line' AND severity = 'low'))
+          AND (rule_type = 'unknown_destination'
+               OR (rule_type = 'red_line'
+                   AND (reason = 'red_line_unknown_destination' OR title LIKE '%network destination%')))
           AND (session_id = ? OR event_id IN (SELECT id FROM events WHERE session_id = ?))
         LIMIT 1
         """,

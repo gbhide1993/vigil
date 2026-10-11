@@ -97,7 +97,7 @@ def test_unwrapping_returns_exactly_the_inner_command_with_quoting_undone():
     ("git push --force origin main", ("git_push_force", "high")),
     ("git push -f origin main", ("git_push_force", "high")),
     ("git reset --hard HEAD~3", ("git_reset_hard", "high")),
-    ('python -c "import os; print(os.getcwd())"', ("python -c", "medium")),
+    ('python -c "import os; print(os.getcwd())"', ("python -c", "low")),
 ])
 def test_dangerous_inner_command_still_fires_at_its_normal_severity(inner, expected):
     assert match(wrap(inner)) == expected
@@ -144,7 +144,7 @@ def test_wrapper_without_eval_evaluates_only_what_follows_the_boilerplate():
     ("rm -rf /tmp/project", "rm", ("rm_recursive_force", "high")),
     ("git push --force origin main", "git", ("git_push_force", "high")),
     ("curl https://api.example.com/data", "curl", ("curl", "low")),
-    ('python -c "import os"', "python", ("python -c", "medium")),
+    ('python -c "import os"', "python", ("python -c", "low")),
     ("git status", "git", None),
     ("rm file.txt", "rm", None),
 ])

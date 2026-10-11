@@ -134,8 +134,11 @@ def old_2b(current, history):
 
 
 async def has_low_red_line(db, sid, aid) -> bool:
+    """The red-line unrecognised-destination alert (a network signal). Other
+    low or medium red lines (python -c, curl, ...) no longer corroborate."""
     cur = await db.execute(
-        "SELECT 1 FROM alerts WHERE agent_id = ? AND rule_type = 'red_line' AND severity = 'low' "
+        "SELECT 1 FROM alerts WHERE agent_id = ? AND rule_type = 'red_line' "
+        "AND (reason = 'red_line_unknown_destination' OR title LIKE '%network destination%') "
         "AND (session_id = ? OR event_id IN (SELECT id FROM events WHERE session_id = ?)) LIMIT 1",
         (aid, sid, sid),
     )

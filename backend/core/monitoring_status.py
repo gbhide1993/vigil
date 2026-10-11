@@ -41,3 +41,19 @@ def mcp_monitoring() -> str:
     else "off". (MCP *connections* are what this covers; changes to MCP
     config files are ordinary file events and do not depend on it.)"""
     return "on" if _job_running(MCP_WATCHER_JOB_ID) else "off"
+
+
+# Which file-watching tier came up: "etw" (kernel tracing, every change made
+# by a recognised agent anywhere) or "folders" (native / polling observer,
+# only the watched folders). Set by main.py from what start_file_watcher
+# actually returned; "folders" is the safe default.
+_file_tier = "folders"
+
+
+def set_file_watcher_tier(tier: str) -> None:
+    global _file_tier
+    _file_tier = "etw" if tier == "etw" else "folders"
+
+
+def file_watcher_tier() -> str:
+    return _file_tier

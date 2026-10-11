@@ -29,6 +29,7 @@ from core.evidence import (
     RawEvidence,
     VigilEvidence,
 )
+from core.scope_store import get_scope_directories
 from db.database import get_db
 
 SEVERITIES = ("low", "medium", "high", "critical")
@@ -312,7 +313,8 @@ class Alerter:
 
         host_root = os.environ.get("VLAW_HOST_ROOT", "")
         never_scope = await self._get_policy_list(db, "never_scope_directories")
-        scope_dirs = await self._get_policy_list(db, "scope_directories")
+        # One source of truth for the watched folders (core/scope_store.py).
+        scope_dirs = await get_scope_directories(db)
 
         expanded_never = [host_root + os.path.expanduser(p) for p in never_scope]
         if any(self._path_matches(path, p) for p in expanded_never):

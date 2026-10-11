@@ -17,6 +17,7 @@ export default function Status({ onNavigate }) {
   const [criticalAlerts, setCriticalAlerts] = useState([])
   const [stats, setStats] = useState(null)
   const [agents, setAgents] = useState([])
+  const [scope, setScope] = useState(null)
   const [recordingSince, setRecordingSince] = useState(null)
   const [error, setError] = useState(null)
 
@@ -30,15 +31,17 @@ export default function Status({ onNavigate }) {
         // Status page, the sidebar badge and the tray tooltip cannot
         // disagree. Only alerts detected in the last 24 hours drive it;
         // older open alerts are shown as a separate quiet line.
-        const [recentData, agentsData, sessionsData, statsData] = await Promise.all([
+        const [recentData, agentsData, sessionsData, statsData, scopeData] = await Promise.all([
           api.getAlerts({ status: 'open', severity: 'high,critical', since_hours: WINDOW_HOURS }),
           api.getAgents(),
           api.getSessions(),
           api.getStats(),
+          api.getScope(),
         ])
         if (cancelled) return
         setCriticalAlerts(recentData.alerts)
         setStats(statsData)
+        setScope(scopeData)
         setAgents(agentsData.agents)
         if (sessionsData.sessions.length > 0) {
           const earliest = sessionsData.sessions.reduce((min, s) =>
@@ -103,6 +106,12 @@ export default function Status({ onNavigate }) {
         </div>
         <div className="status-since mono">Recording since {formatStartDate(recordingSince)}</div>
         <div className="status-context">{contextLine}</div>
+        {scope && scope.folders.length === 0 && scope.file_watcher_tier !== 'etw' && (
+          <div className="status-older">
+            No project folders are watched yet.{' '}
+            <a className="status-older-link" onClick={() => onNavigate('settings')}>Add one in Settings</a>
+          </div>
+        )}
         {olderOpen > 0 && (
           <div className="status-older">
             <a className="status-older-link" onClick={() => onNavigate('alerts')}>

@@ -103,10 +103,10 @@ def test_off_note_is_present_only_while_the_watcher_is_off():
     bind_scheduler(_FakeScheduler(running=True, job_ids={NETWORK_WATCHER_JOB_ID}))
     on_notes = export_module.current_report_notes()
     assert export_module.NETWORK_OFF_NOTE not in on_notes
-    assert on_notes == export_module.REPORT_NOTES + [export_module.MCP_OFF_NOTE]   # MCP still off
+    assert on_notes == export_module.REPORT_NOTES + [export_module.MCP_OFF_NOTE, export_module.FILE_SCOPE_NOTE]   # MCP still off
 
     bind_scheduler(_FakeScheduler(running=True, job_ids={NETWORK_WATCHER_JOB_ID, "mcp_watcher"}))
-    assert export_module.current_report_notes() == export_module.REPORT_NOTES
+    assert export_module.current_report_notes() == export_module.REPORT_NOTES + [export_module.FILE_SCOPE_NOTE]
 
 
 def _client_for(summary):

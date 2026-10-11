@@ -56,6 +56,9 @@ export const api = {
     return request(`/events?${qs}`)
   },
   getStats: () => request('/stats'),
+  getScope: () => request('/scope'),
+  addScopeFolder: (path) => request('/scope', { method: 'POST', body: JSON.stringify({ path }) }),
+  removeScopeFolder: (path) => request('/scope', { method: 'DELETE', body: JSON.stringify({ path }) }),
   getHealth: () => request('/health'),
   getInsights: () => request('/insights'),
   getProofOfValue: () => request('/digest/proof-of-value'),

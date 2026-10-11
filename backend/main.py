@@ -90,7 +90,7 @@ from fastapi import FastAPI, APIRouter, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
-from api import agents, alerts, analytics_api, chain_routes, config_api, digest_api, events, evidence, export, git_routes, mcp_routes, platform_routes, sessions
+from api import agents, alerts, analytics_api, chain_routes, config_api, digest_api, events, evidence, export, git_routes, mcp_routes, platform_routes, scope, sessions
 from config.policy import load_policy
 from core.aggregator import Aggregator
 from core.attributor import Attributor
@@ -101,6 +101,7 @@ from core.feature_flags import CORE_ONLY
 from core.insights import get_insights
 from core.instance_lock import InstanceAlreadyRunning, acquire_instance_lock, release_instance_lock
 from core.log_setup import configure_logging
+from core.scope_store import get_scope_directories
 from core.monitoring_status import mcp_monitoring, network_monitoring
 from core.red_lines import SESSION_LAUNCH_DIR
 from db.database import DB_PATH, close_db, get_db, get_read_db, init_db
@@ -144,9 +145,24 @@ DEFAULT_POLICY = {
 def build_watch_paths(policy: dict) -> tuple[list[str], list[str]]:
     """Builds (watch_paths, red_line_non_recursive_dirs) for the file
     watcher. Extracted out of the lifespan startup sequence so it can be
-    unit tested without booting the full app — see
-    tests/test_watch_paths.py. Behavior is otherwise unchanged from what
-    used to be inlined in lifespan() below.
+    unit tested without booting the full app -- see
+    tests/test_watch_paths.py.
+
+    What is watched, and nothing else:
+      - every scope directory (the user's project folders, see
+        core/scope_store.py -- the database copy is authoritative; the
+        caller passes it in policy["scope_directories"]), recursively. The
+        project config folders (.claude, .cursor, .vscode) and a root-level
+        .mcp.json live under a scope directory, so they are covered by that
+        recursive watch rather than scheduled a second time (a second watch
+        on a subfolder would deliver every event twice).
+      - ~/.ssh and ~/.claude/file-history, always (Red Line rules 1 and 3
+        must fire regardless of policy).
+      - any directory-shaped credential_paths entry ("~/.aws/", ...).
+    The backend's own working directory (Path.cwd()) is NOT watched: for the
+    installed app that is Vigil's own install folder, not the user's
+    project. red_line_non_recursive_dirs is therefore always empty; it is
+    kept in the return value so callers do not change.
 
     VLAW_HOST_ROOT is set to /host in docker-compose.yml, where the
     read-only host filesystem is mounted. Policy paths are defined from
@@ -162,48 +178,12 @@ def build_watch_paths(policy: dict) -> tuple[list[str], list[str]]:
         p for p in credential_paths
         if p.endswith("/") or p.endswith("\\") or p.startswith("~")
     ]
-    # Flat credential file patterns (".env", "*.pem", "*.key", ...) have no
-    # directory component, so the filter above never turns them into a
-    # watched directory — a policy of credential_paths=[".env"] would
-    # otherwise never cause anything to be watched at all, and a .env
-    # modification in the project would silently never reach the
-    # credential-access pipeline. When credential_paths has any entries
-    # (there's something to match against), also watch the project root
-    # (SESSION_LAUNCH_DIR) and every configured scope directory, so a flat
-    # pattern still has somewhere to fire from. Appended here in their
-    # pre-host_root form (matching how scope_directories/SESSION_LAUNCH_DIR
-    # are expressed everywhere else in this function) since host_root is
-    # applied once, below, to the whole credential_dirs list — prefixing it
-    # here too would double it under Docker (VLAW_HOST_ROOT set).
-    if credential_paths:
-        credential_dirs.append(str(SESSION_LAUNCH_DIR))
-        credential_dirs.extend(scope_directories)
-
-    # Red Line rules 1 and 3 (SSH directory access, Claude hidden cache
-    # writes) must fire regardless of policy configuration, so their
-    # directories are always watched — independent of whatever the user
-    # has set in credential_paths/scope_directories. RL7b (project config
-    # execution, CVE-2025-59536 pattern) needs the active project's own
-    # .claude/.cursor/.vscode config dirs watched too — these live under
-    # the session's launch directory (core.red_lines.SESSION_LAUNCH_DIR),
-    # not under the user's home dir like the other red-line paths.
     red_line_dirs = [
         host_root + os.path.expanduser("~/.ssh/"),
         host_root + os.path.expanduser("~/.claude/file-history/"),
-        host_root + str(SESSION_LAUNCH_DIR / ".claude"),
-        host_root + str(SESSION_LAUNCH_DIR / ".cursor"),
-        host_root + str(SESSION_LAUNCH_DIR / ".vscode"),
     ]
-    # RL8 (MCP auto-approval, CVE-2026-21852 pattern) needs .mcp.json writes
-    # at the project root — watched non-recursively so this doesn't balloon
-    # into watching the entire project tree just to catch one root-level file.
-    # SESSION_LAUNCH_DIR is now also covered recursively above (via
-    # credential_dirs, when credential_paths is non-empty) so .env/*.key
-    # files in subdirectories of the project root are caught too — this
-    # non-recursive entry stays for RL8's own narrower purpose.
-    red_line_non_recursive_dirs = [host_root + str(SESSION_LAUNCH_DIR)]
     watch_paths = scope_dirs + [host_root + p for p in credential_dirs] + red_line_dirs
-    return watch_paths, red_line_non_recursive_dirs
+    return watch_paths, []
 
 
 def _ensure_default_policy() -> None:
@@ -323,12 +303,20 @@ async def lifespan(app: FastAPI):
     _state["baseline"] = baseline
 
     # 4. File watcher (PollingObserver — Docker/Windows safe)
+    # The watched project folders come from the database (core/scope_store.py);
+    # the policy file only seeds it. An existing database value, including the
+    # one a user set earlier, is always kept.
+    policy = {**policy, "scope_directories": await get_scope_directories(await get_db())}
     watch_paths, red_line_non_recursive_dirs = build_watch_paths(policy)
     observer, file_handler = start_file_watcher(
         attributor, aggregator, watch_paths, red_line_non_recursive_dirs,
         process_watcher=process_watcher, network_watcher=network_watcher,
     )
     _state["observer"] = observer
+    _state["file_handler"] = file_handler
+    from core.monitoring_status import set_file_watcher_tier
+    from watchers.etw_file_watcher import ETWFileWatcher
+    set_file_watcher_tier("etw" if isinstance(observer, ETWFileWatcher) else "folders")
     logger.info("file watcher started, watching %d paths", len(watch_paths) + len(red_line_non_recursive_dirs))
 
     # 5. APScheduler jobs
@@ -572,6 +560,7 @@ if not getattr(sys, "frozen", False):
     app.include_router(analytics_api.router)
     app.include_router(evidence.router)
     app.include_router(chain_routes.router)
+    app.include_router(scope.router)
 
 # mcp_routes/platform_routes/git_routes have no /api-prefixed twin at all
 # (see below) -- the VS Code extension calls these directly, unprefixed,
@@ -595,6 +584,7 @@ app.include_router(config_api.router, prefix="/api")
 app.include_router(analytics_api.router, prefix="/api")
 app.include_router(evidence.router, prefix="/api")
 app.include_router(chain_routes.router, prefix="/api")
+app.include_router(scope.router, prefix="/api")
 
 
 _STATS_CACHE_TTL_SECONDS = 2.0

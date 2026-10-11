@@ -123,15 +123,17 @@ APPROVED_NETWORK_DESTINATIONS = {
 DANGEROUS_EXE_PATTERNS = {"curl", "wget", "nc", "ncat", "ssh", "scp"}
 DANGEROUS_EXE_SEVERITY = "low"
 
-# python -c / python3 -c: inline code execution, common for legitimate
-# scripting too -- kept at its existing "medium" tier. The old literal
+# python -c / python3 -c: inline code execution, extremely common for
+# legitimate scripting (agents run it constantly) -- detected and recorded
+# at "low". It used to be "medium", which also made it count as red-line
+# corroboration; it no longer does (see core/activity_filter.py). The old literal
 # "powershell -enc"/"powershell -command" substrings are gone from here;
 # real invocations are "powershell.exe -Command ..." or a full path, so
 # a literal "powershell -command" (bare word, no .exe, no path) never
 # actually appears in a real cmdline -- see _POWERSHELL_BYPASS_FLAGS below,
 # which checks the exe basename and the flag separately instead.
 DANGEROUS_INLINE_PATTERNS = ["python -c", "python3 -c"]
-DANGEROUS_INLINE_SEVERITY = "medium"
+DANGEROUS_INLINE_SEVERITY = "low"
 
 # Download-and-execute: curl/wget output piped straight into a shell or
 # PowerShell's Invoke-Expression. Unlike a bare curl/wget above, this is

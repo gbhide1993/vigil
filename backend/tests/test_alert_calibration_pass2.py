@@ -98,7 +98,7 @@ async def test_uncorroborated_time_anomaly_is_not_an_alert(test_db):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("signal", ["credential", "network_alert", "red_line_low", "red_line_medium", "mcp"])
+@pytest.mark.parametrize("signal", ["credential", "network_alert", "red_line_low", "red_line_high", "mcp"])
 async def test_corroborated_time_anomaly_still_alerts(test_db, signal):
     agent_id, name = await _agent(test_db)
     sid = await _session(test_db, agent_id, "2026-02-01 23:40:00")
@@ -111,7 +111,7 @@ async def test_corroborated_time_anomaly_still_alerts(test_db, signal):
         rule_type, severity, reason = {
             "network_alert": ("unknown_destination", "medium", "unknown_destination"),
             "red_line_low": ("red_line", "low", "red_line_unknown_destination"),
-            "red_line_medium": ("red_line", "medium", "red_line_env_outside_workspace"),
+            "red_line_high": ("red_line", "high", "red_line_ssh_access"),
             "mcp": ("policy", "high", "unapproved_mcp"),
         }[signal]
         await test_db.execute(
@@ -124,9 +124,9 @@ async def test_corroborated_time_anomaly_still_alerts(test_db, signal):
     ids = await check_time_anomaly(sid, agent_id, name, "2026-02-01 23:40:00", get_prior(name), test_db)
     assert len(ids) == 1
     (alert,) = await _alert_rows(test_db, sid, "time_anomaly")
-    # Severity stays capped: only a medium-or-higher red line allows CRITICAL.
+    # Severity stays capped: only a HIGH or CRITICAL red line allows CRITICAL.
     assert alert["severity"] in ("high", "critical")
-    if signal != "red_line_medium":
+    if signal != "red_line_high":
         assert alert["severity"] != "critical"
 
 
@@ -328,7 +328,7 @@ async def test_red_line_destination_alert_is_unaffected_by_repeat_suppression(te
 
 @pytest.mark.asyncio
 async def test_red_line_alerts_are_unaffected_by_time_anomaly_rule(test_db):
-    """A medium-or-higher red line is itself a corroborating signal, never
+    """A HIGH or CRITICAL red line is itself a corroborating signal, never
     something the time rule removes or caps."""
     agent_id, name = await _agent(test_db)
     sid = await _session(test_db, agent_id, "2026-02-01 23:40:00")
@@ -340,3 +340,38 @@ async def test_red_line_alerts_are_unaffected_by_time_anomaly_rule(test_db):
     assert len(ids) == 1, "the high red line corroborates the unusual hour"
     (red_after,) = await _alert_rows(test_db, sid, "red_line")
     assert red_after["severity"] == "high"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("severity, reason", [
+    ("low", "red_line_dangerous_command"),       # e.g. python -c, curl
+    ("medium", "red_line_dangerous_command"),
+    ("medium", "red_line_env_outside_workspace"),
+    ("low", "red_line_cross_project_read"),
+])
+async def test_medium_or_low_red_line_no_longer_corroborates_a_time_anomaly(test_db, severity, reason):
+    agent_id, name = await _agent(test_db)
+    sid = await _session(test_db, agent_id, "2026-02-01 23:40:00")
+    await test_db.execute(
+        "INSERT INTO alerts (agent_id, severity, title, description, rule_type, session_id, reason) "
+        "VALUES (?, ?, 'RED LINE: x', 'd', 'red_line', ?, ?)",
+        (agent_id, severity, sid, reason),
+    )
+    await test_db.commit()
+    assert await check_time_anomaly(sid, agent_id, name, "2026-02-01 23:40:00", get_prior(name), test_db) == []
+
+
+@pytest.mark.asyncio
+async def test_critical_red_line_corroborates_and_allows_critical(test_db):
+    agent_id, name = await _agent(test_db)
+    await _session(test_db, agent_id, "2026-01-30 08:00:00")             # an earlier session: gap rule base is critical
+    sid = await _session(test_db, agent_id, "2026-02-01 23:40:00")
+    await test_db.execute(
+        "INSERT INTO alerts (agent_id, severity, title, description, rule_type, session_id, reason) "
+        "VALUES (?, 'critical', 'RED LINE: x', 'd', 'red_line', ?, 'red_line_mcp_autoapproval')",
+        (agent_id, sid),
+    )
+    await test_db.commit()
+    (aid,) = await check_time_anomaly(sid, agent_id, name, "2026-02-01 23:40:00", get_prior(name), test_db)
+    cur = await test_db.execute("SELECT severity FROM alerts WHERE id = ?", (aid,))
+    assert (await cur.fetchone())["severity"] == "critical"

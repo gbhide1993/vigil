@@ -44,6 +44,7 @@ from core.correlation_engine import CorrelationEngine
 from core.evidence import AttributionChain, AttributionConfidence, VigilEvidence
 from core.evidence_store import evidence_store
 from core.feature_flags import CORE_ONLY
+from core.own_paths import is_own_path
 from core.red_lines import RedLines, is_agent_config_path, is_mcp_config_path, register_agent_workspace
 from db.database import get_db
 from watchers.etw_file_watcher import ETWFileWatcher
@@ -459,6 +460,8 @@ class VlawFileHandler(FileSystemEventHandler):
 
         event_type = EVENT_TYPE_MAP.get(event.event_type, "file_read")
         path = event.dest_path if getattr(event, "dest_path", "") else event.src_path
+        if is_own_path(path):
+            return   # Vigil's own install / data folder: never an agent's activity
 
         future = asyncio.run_coroutine_threadsafe(
             self._handle_polled_event(path, event_type), self.loop
@@ -492,6 +495,13 @@ class VlawFileHandler(FileSystemEventHandler):
         confidence: str,
         timestamp: float | None = None,
     ) -> None:
+        # Safety filter for every tier (native, polling and ETW): changes
+        # inside Vigil's own install folder or data folder (its database,
+        # logs, updates) are never recorded, however the watch list was
+        # configured.
+        if is_own_path(path):
+            return
+
         # Recorded regardless of whether this specific event resolves to a
         # known agent below — burst+correlation (check_burst) is a second,
         # independent attribution path meant to catch activity the
@@ -655,11 +665,58 @@ class VlawFileHandler(FileSystemEventHandler):
         return row["c"] if row else 0
 
 
+def _watch_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(os.path.expanduser(path))).replace("\\", "/").rstrip("/")
+
+
+def _watch_registry(observer) -> dict:
+    """{normalised path: watchdog ObservedWatch} for every recursive watch
+    scheduled on this observer, kept on the observer itself so a watch can
+    be removed later (Observer.unschedule needs the watch object)."""
+    registry = getattr(observer, "_vlaw_watches", None)
+    if registry is None:
+        registry = {}
+        observer._vlaw_watches = registry
+    return registry
+
+
+def watch_folder(observer, handler, path: str) -> bool:
+    """Starts watching `path` (recursively) on the RUNNING observer, with no
+    restart. Returns True if it is now watched. False when there is nothing
+    to schedule on (the ETW tier has no folder list: it already sees every
+    change made by a recognised agent anywhere) or the folder is gone."""
+    if not hasattr(observer, "schedule"):
+        return False
+    expanded = os.path.expanduser(path)
+    if not os.path.isdir(expanded):
+        return False
+    registry = _watch_registry(observer)
+    key = _watch_key(expanded)
+    if key in registry:
+        return True
+    registry[key] = observer.schedule(handler, expanded, recursive=True)
+    return True
+
+
+def unwatch_folder(observer, path: str) -> bool:
+    """Stops watching `path`. True if a watch was removed."""
+    if not hasattr(observer, "unschedule"):
+        return False
+    watch = _watch_registry(observer).pop(_watch_key(path), None)
+    if watch is None:
+        return False
+    observer.unschedule(watch)
+    return True
+
+
 def _schedule_paths(observer, handler: VlawFileHandler, watch_paths: list[str], non_recursive_paths: list[str] | None) -> None:
     for path in watch_paths:
         expanded = os.path.expanduser(path)
         if os.path.isdir(expanded):
-            observer.schedule(handler, expanded, recursive=True)
+            registry = _watch_registry(observer)
+            key = _watch_key(expanded)
+            if key not in registry:    # never schedule the same folder twice (duplicate events)
+                registry[key] = observer.schedule(handler, expanded, recursive=True)
 
     for path in non_recursive_paths or []:
         expanded = os.path.expanduser(path)

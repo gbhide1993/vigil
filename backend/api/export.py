@@ -5,7 +5,8 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from core.monitoring_status import mcp_monitoring, network_monitoring
+from core.monitoring_status import file_watcher_tier, mcp_monitoring, network_monitoring
+from core.scope_store import get_scope_entries
 from db.database import get_db
 
 router = APIRouter()
@@ -183,12 +184,25 @@ MCP_OFF_NOTE = (
 )
 
 
+FILE_SCOPE_NOTE = (
+    "Vigil only records file changes in watched folders, in ~/.ssh and in the Claude checkpoint cache. "
+    "Changes elsewhere are not recorded."
+)
+FILE_SCOPE_NOTE_ETW = (
+    "Kernel file tracing is active: file changes made by recognised agents are recorded wherever they happen "
+    "on this computer, not only in watched folders."
+)
+
+NO_WATCHED_FOLDERS_TEXT = "No project folders are watched yet. Add one in Settings."
+
+
 def current_report_notes() -> list[str]:
     notes = list(REPORT_NOTES)
     if network_monitoring() == "off":
         notes.append(NETWORK_OFF_NOTE)
     if mcp_monitoring() == "off":
         notes.append(MCP_OFF_NOTE)
+    notes.append(FILE_SCOPE_NOTE_ETW if file_watcher_tier() == "etw" else FILE_SCOPE_NOTE)
     return notes
 
 # Alerts whose description ends in the spawned command line (see
@@ -553,6 +567,10 @@ async def _build_summary(date: str, tz=None) -> dict:
     # Read from live scheduler state, not a constant (core/monitoring_status.py).
     coverage["network_monitoring"] = network_monitoring()
     coverage["mcp_monitoring"] = mcp_monitoring()
+    # The project folders being watched right now (the database copy, see
+    # core/scope_store.py), plus which file-watching tier is running.
+    coverage["watched_folders"] = await get_scope_entries(db)
+    coverage["file_watcher_tier"] = file_watcher_tier()
 
     return {
         # Always the resolved real calendar date, never the literal
@@ -801,6 +819,16 @@ async def export_pdf(date: str = Query(default="today")):
         y = draw(y, f"Network monitoring: {summary['network_monitoring']}", "Helvetica", 9, 0.2 * inch)
     if summary.get("mcp_monitoring") is not None:
         y = draw(y, f"MCP monitoring: {summary['mcp_monitoring']}", "Helvetica", 9, 0.2 * inch)
+    if summary.get("watched_folders") is not None:
+        folders = summary["watched_folders"]
+        if summary.get("file_watcher_tier") == "etw":
+            y = draw(y, "File tracing: kernel (all recognised agent file changes)", "Helvetica", 9, 0.2 * inch)
+        if folders:
+            y = draw(y, f"Watched folders ({len(folders)}):", "Helvetica", 9, 0.2 * inch)
+            for folder in folders:
+                y = draw(y, folder["path"], "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
+        else:
+            y = draw(y, NO_WATCHED_FOLDERS_TEXT, "Helvetica", 9, 0.2 * inch)
     y -= 0.2 * inch
 
     c.setFont("Helvetica-Bold", 12)

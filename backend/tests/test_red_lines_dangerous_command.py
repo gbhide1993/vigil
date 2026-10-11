@@ -172,10 +172,11 @@ def test_bare_ssh_matches_low_not_high():
     assert matched[1] == "low"
 
 
-def test_python_inline_exec_matches_medium():
+def test_python_inline_exec_matches_low():
+    """Still detected and recorded, but at LOW: agents run python -c all the time."""
     matched = is_dangerous_command('python -c "import os"', "python")
     assert matched is not None
-    assert matched[1] == "medium"
+    assert matched == ("python -c", "low")
 
 
 # ---------------------------------------------------------------- near-misses
