@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+from core import ignore_rules, watch_stats
 from core.monitoring_status import file_watcher_tier, mcp_monitoring, network_monitoring
 from core.scope_store import get_scope_entries
 from db.database import get_db
@@ -194,6 +195,15 @@ FILE_SCOPE_NOTE_ETW = (
 )
 
 NO_WATCHED_FOLDERS_TEXT = "No project folders are watched yet. Add one in Settings."
+UNWATCHED_SESSION_TEXT = "(info: no project folder is watched, so file changes by this session were not recorded)"
+
+
+def ignored_changes_note(count: int) -> str:
+    return f"{count} changes in generated or dependency folders (node_modules, build outputs) were not recorded."
+
+
+def dropped_changes_note(count: int) -> str:
+    return f"{count} file changes were not recorded because too many arrived at once."
 
 
 def current_report_notes() -> list[str]:
@@ -203,6 +213,13 @@ def current_report_notes() -> list[str]:
     if mcp_monitoring() == "off":
         notes.append(MCP_OFF_NOTE)
     notes.append(FILE_SCOPE_NOTE_ETW if file_watcher_tier() == "etw" else FILE_SCOPE_NOTE)
+    # Only while the ignore rule is active, and only when it actually ignored something.
+    ignored = watch_stats.ignored_total()
+    if ignore_rules.is_enabled() and ignored > 0:
+        notes.append(ignored_changes_note(ignored))
+    dropped = watch_stats.dropped_total()
+    if dropped > 0:
+        notes.append(dropped_changes_note(dropped))
     return notes
 
 # Alerts whose description ends in the spawned command line (see
@@ -448,6 +465,24 @@ async def _checkpoint_counts_by_session(db, start_sql: str, end_sql: str) -> dic
     return counts
 
 
+async def _ran_processes_without_file_events(db, session_id: str) -> bool:
+    """True if the session's agent ran processes but not one file event was
+    recorded for it. Combined by the caller with "no project folder is
+    watched" (and kernel tracing not active) it means the missing file
+    changes are explained by Vigil's configuration, not by the agent."""
+    cur = await db.execute(
+        """
+        SELECT
+            EXISTS(SELECT 1 FROM events WHERE session_id = ? AND event_type = 'proc_spawn') AS ran,
+            EXISTS(SELECT 1 FROM events WHERE session_id = ?
+                   AND event_type IN ('file_write', 'file_delete', 'file_read', 'cred_access')) AS had_files
+        """,
+        (session_id, session_id),
+    )
+    row = await cur.fetchone()
+    return bool(row["ran"]) and not bool(row["had_files"])
+
+
 async def _sessions_with_time_alert(db, session_ids: list[str]) -> set[str]:
     if not session_ids:
         return set()
@@ -522,10 +557,12 @@ async def _build_summary(date: str, tz=None) -> dict:
     event_counts_by_session = {row["session_id"]: row["c"] for row in await cur.fetchall()}
     checkpoint_counts = await _checkpoint_counts_by_session(db, start_sql, end_sql)
     time_alerted = await _sessions_with_time_alert(db, [s["id"] for s in sessions])
+    no_folder_watched = (not await get_scope_entries(db)) and file_watcher_tier() != "etw"
     for session in sessions:
         session["event_count_in_period"] = event_counts_by_session.get(session["id"], 0)
         session["checkpoint_writes"] = checkpoint_counts.get(session["id"], 0)
         await _add_calibration_info(db, session, time_alerted)
+        session["unwatched_session"] = no_folder_watched and await _ran_processes_without_file_events(db, session["id"])
         # A session whose started_at/ended_at are identical and which
         # contributed no events this period is the artifact a restart
         # produces (see the duplicate-session investigation): opened and
@@ -571,6 +608,10 @@ async def _build_summary(date: str, tz=None) -> dict:
     # core/scope_store.py), plus which file-watching tier is running.
     coverage["watched_folders"] = await get_scope_entries(db)
     coverage["file_watcher_tier"] = file_watcher_tier()
+    coverage["ignored_generated_changes"] = watch_stats.ignored_total() if ignore_rules.is_enabled() else 0
+    coverage["ignored_by_folder"] = watch_stats.ignored_by_folder() if ignore_rules.is_enabled() else {}
+    coverage["dropped_file_changes"] = watch_stats.dropped_total()
+    coverage["ignore_counts_since"] = watch_stats.since_iso()
 
     return {
         # Always the resolved real calendar date, never the literal
@@ -725,6 +766,8 @@ async def export_pdf(date: str = Query(default="today")):
             y = draw(y, "(began before this period)", "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
         if session["resumed"]:
             y = draw(y, "(already running when Vigil started)", "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
+        if session.get("unwatched_session"):
+            y = draw(y, UNWATCHED_SESSION_TEXT, "Helvetica", 9, 0.2 * inch, indent=0.3 * inch)
         if session.get("unusual_hour"):
             y = draw(
                 y, f"(info: started at an unusual hour: {session['unusual_hour']} local)",

@@ -28,6 +28,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from core import watch_stats
 from core.alerter import Alerter
 from core.evidence_store import evidence_store
 from db.database import get_db, get_read_db, replace_db, DB_PATH
@@ -490,6 +491,7 @@ class Aggregator:
         async with self._buffer_lock:
             if len(self.file_event_buffer) >= FILE_EVENT_BUFFER_MAX:
                 dropped = self.file_event_buffer.pop(0)
+                watch_stats.add_dropped("buffer_full")
                 logger.warning(
                     "file_event_buffer full (%d events) -- dropping oldest buffered event "
                     "(path=%s) to make room",

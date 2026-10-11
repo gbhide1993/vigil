@@ -44,6 +44,8 @@ from core.correlation_engine import CorrelationEngine
 from core.evidence import AttributionChain, AttributionConfidence, VigilEvidence
 from core.evidence_store import evidence_store
 from core.feature_flags import CORE_ONLY
+from core import watch_stats
+from core.ignore_rules import ignore_and_count
 from core.own_paths import is_own_path
 from core.red_lines import RedLines, is_agent_config_path, is_mcp_config_path, register_agent_workspace
 from db.database import get_db
@@ -66,6 +68,12 @@ EVENT_TYPE_MAP = {
     "moved": "file_write",
     "deleted": "file_delete",
 }
+
+# Upper bound on raw file events handed to the event loop and not yet handled
+# (watchdog threads submit one coroutine per raw event). Beyond this, new raw
+# events are dropped and counted (core/watch_stats.py, stated in the report)
+# instead of queueing without limit. Ignored folders never reach this point.
+MAX_PENDING_FILE_DISPATCH = 2000
 
 # _refine_pid_by_open_handle's psutil.Process.open_files() calls run in a
 # disposable subprocess (watchers/_open_handle_worker.py), not in this
@@ -451,6 +459,9 @@ class VlawFileHandler(FileSystemEventHandler):
         self.network_watcher = network_watcher
         self._burst_detector = BurstDetector()
         self._correlation_engine = CorrelationEngine()
+        # Raw events submitted to the loop and not yet handled; see MAX_PENDING_FILE_DISPATCH.
+        self._pending_dispatch = 0
+        self._pending_lock = threading.Lock()
 
     def on_any_event(self, event):
         """Tiers 2/3 entry point — native Observer and PollingObserver both
@@ -462,11 +473,25 @@ class VlawFileHandler(FileSystemEventHandler):
         path = event.dest_path if getattr(event, "dest_path", "") else event.src_path
         if is_own_path(path):
             return   # Vigil's own install / data folder: never an agent's activity
+        if ignore_and_count(path):
+            return   # generated / dependency folder: dropped before any other work (core/ignore_rules.py)
+        with self._pending_lock:
+            over_limit = self._pending_dispatch >= MAX_PENDING_FILE_DISPATCH
+            if not over_limit:
+                self._pending_dispatch += 1
+        if over_limit:
+            watch_stats.add_dropped("overload")
+            return
 
         future = asyncio.run_coroutine_threadsafe(
             self._handle_polled_event(path, event_type), self.loop
         )
-        future.add_done_callback(lambda f: _log_dispatch_exception(f, path))
+        future.add_done_callback(lambda f: self._dispatch_done(f, path))
+
+    def _dispatch_done(self, future, path: str) -> None:
+        with self._pending_lock:
+            self._pending_dispatch -= 1
+        _log_dispatch_exception(future, path)
 
     async def _handle_polled_event(self, path: str, event_type: str) -> None:
         # _find_owning_agent_pid itself is now just a cache read (see
@@ -500,6 +525,10 @@ class VlawFileHandler(FileSystemEventHandler):
         # logs, updates) are never recorded, however the watch list was
         # configured.
         if is_own_path(path):
+            return
+        # Safety net for callers that did not filter earlier (the ETW tier
+        # filters before attribution; the watchdog tiers in on_any_event).
+        if ignore_and_count(path):
             return
 
         # Recorded regardless of whether this specific event resolves to a

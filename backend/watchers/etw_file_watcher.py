@@ -37,6 +37,8 @@ import threading
 import time
 
 from core.attributor import Attributor
+from core import watch_stats
+from core.ignore_rules import ignore_and_count
 
 logger = logging.getLogger("vlaw")
 
@@ -252,6 +254,11 @@ class ETWFileWatcher:
             if not path:
                 return  # can't safely report a file event with no resolved path
 
+            # Generated / dependency folders are dropped here, before the
+            # attribution lookup and any dispatch (core/ignore_rules.py).
+            if ignore_and_count(path):
+                return
+
             pid = event.process_id
             if not pid:
                 return
@@ -303,6 +310,7 @@ class ETWFileWatcher:
     def _dispatch(self, pid: int, path: str, event_type: str, timestamp: float) -> None:
         if not self._inflight.acquire(blocking=False):
             self._dropped_count += 1
+            watch_stats.add_dropped("overload")
             if self._dropped_count % 100 == 1:
                 logger.warning(
                     "ETW file watcher: dropping events, %d in-flight events already queued "
