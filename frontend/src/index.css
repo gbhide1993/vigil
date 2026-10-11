@@ -437,6 +437,39 @@ a {
   color: var(--color-navy-muted);
 }
 
+.status-older {
+  margin-top: 10px;
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.status-older-link {
+  cursor: pointer;
+  color: inherit;
+  text-decoration: underline;
+}
+
+.resolve-older-panel {
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius);
+  background: var(--card-bg);
+  padding: 14px 16px;
+  margin-bottom: 20px;
+  font-size: 13px;
+}
+
+.resolve-older-panel label {
+  display: block;
+  margin: 8px 0;
+  font-size: 12px;
+}
+
+.resolve-older-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
 .status-context-link {
   color: var(--color-teal-dark);
   font-weight: 600;

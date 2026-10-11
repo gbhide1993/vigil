@@ -95,6 +95,7 @@ from config.policy import load_policy
 from core.aggregator import Aggregator
 from core.attributor import Attributor
 from core.baseline import Baseline
+from core.alert_status import alert_status_counts, status_level
 from core.config_auditor import audit_all_configs
 from core.feature_flags import CORE_ONLY
 from core.insights import get_insights
@@ -696,13 +697,14 @@ async def get_stats():
 
         # Single definition of "needs review", used everywhere a review
         # count is shown (tray tooltip, Status page, Incidents sidebar
-        # badge): open alerts at severity high or critical. Pending-agent
-        # approval is a separate concept (see api/agents.py) and is never
-        # folded into this number.
-        cur = await db.execute(
-            "SELECT COUNT(*) c FROM alerts WHERE status = 'open' AND severity IN ('high', 'critical')"
-        )
-        needs_review = (await cur.fetchone())["c"]
+        # badge): open alerts at severity high or critical DETECTED IN THE
+        # LAST 24 HOURS (core/alert_status.py). Older open alerts are
+        # reported separately as older_open, and the all-time open
+        # high/critical total stays available as needs_review_total.
+        # Pending-agent approval is a separate concept (see api/agents.py)
+        # and is never folded into this number.
+        alert_counts = await alert_status_counts(db)
+        needs_review = alert_counts["needs_review"]
 
         # checkpoint_activity (RL3's normal-/rewind tier — see core/red_lines.py)
         # is expected, frequent, benign background noise, not a "meaningful
@@ -756,6 +758,10 @@ async def get_stats():
         "alerts_open": alerts_open,
         "alerts_open_yesterday": alerts_open_yesterday,
         "needs_review": needs_review,
+        "needs_review_total": alert_counts["needs_review_total"],
+        "open_medium_24h": alert_counts["open_medium_24h"],
+        "older_open": alert_counts["older_open"],
+        "status_level": status_level(alert_counts),
         "net_egress_mb_today": round(net_bytes_today / (1024 * 1024), 3),
         "net_egress_mb_yesterday": round(net_bytes_yesterday / (1024 * 1024), 3),
         "cred_accesses_today": cred_accesses_today,

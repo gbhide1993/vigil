@@ -2,8 +2,10 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import IncidentList from './IncidentList'
 
+const WINDOW_HOURS = 24
+
 function formatStartDate(ts) {
-  if (!ts) return '—'
+  if (!ts) return '\u2014'
   return new Date(ts.replace(' ', 'T') + 'Z').toLocaleDateString(undefined, {
     month: 'short',
     day: 'numeric',
@@ -11,18 +13,10 @@ function formatStartDate(ts) {
   })
 }
 
-function computeOrbState(hasCritical, hasMinor, proofOfValue) {
-  if (hasCritical) return 'red'
-  if (hasMinor || (proofOfValue && proofOfValue.days_clean === 0)) return 'amber'
-  return 'green'
-}
-
 export default function Status({ onNavigate }) {
   const [criticalAlerts, setCriticalAlerts] = useState([])
-  const [criticalTotal, setCriticalTotal] = useState(0)
-  const [hasMinorAlerts, setHasMinorAlerts] = useState(false)
+  const [stats, setStats] = useState(null)
   const [agents, setAgents] = useState([])
-  const [proofOfValue, setProofOfValue] = useState(null)
   const [recordingSince, setRecordingSince] = useState(null)
   const [error, setError] = useState(null)
 
@@ -31,33 +25,21 @@ export default function Status({ onNavigate }) {
 
     async function load() {
       try {
-        // Two separate calls, not one unfiltered fetch filtered client-side:
-        // the orb needs both "is there an open high/critical alert" (red)
-        // and "is there an open medium/low alert" (amber vs green), and
-        // filtering severity server-side for only one of those tiers would
-        // just move the same silent-miss bug this change is fixing onto
-        // the other tier. The medium/low call only needs `total` (an
-        // existence check), so it asks for limit: 1 rather than pulling
-        // rows nothing here renders.
-        const [criticalData, minorData, agentsData, sessionsData, proofOfValueData, statsData] = await Promise.all([
-          api.getAlerts({ status: 'open', severity: 'high,critical' }),
-          api.getAlerts({ status: 'open', severity: 'medium,low', limit: 1 }),
+        // The status itself (red / amber / green) is decided by the backend
+        // (core/alert_status.py, delivered as stats.status_level) so the
+        // Status page, the sidebar badge and the tray tooltip cannot
+        // disagree. Only alerts detected in the last 24 hours drive it;
+        // older open alerts are shown as a separate quiet line.
+        const [recentData, agentsData, sessionsData, statsData] = await Promise.all([
+          api.getAlerts({ status: 'open', severity: 'high,critical', since_hours: WINDOW_HOURS }),
           api.getAgents(),
           api.getSessions(),
-          api.getProofOfValue(),
           api.getStats(),
         ])
         if (cancelled) return
-        setCriticalAlerts(criticalData.alerts)
-        // needs_review (open, severity high or critical) is the one
-        // definition shared with the tray tooltip and the Incidents
-        // sidebar badge -- sourced from /api/stats rather than
-        // criticalData.total so all three stay in sync by construction,
-        // not by coincidence of matching filters in three places.
-        setCriticalTotal(statsData.needs_review)
-        setHasMinorAlerts(minorData.total > 0)
+        setCriticalAlerts(recentData.alerts)
+        setStats(statsData)
         setAgents(agentsData.agents)
-        setProofOfValue(proofOfValueData)
         if (sessionsData.sessions.length > 0) {
           const earliest = sessionsData.sessions.reduce((min, s) =>
             !min || (s.started_at && s.started_at < min) ? s.started_at : min, null)
@@ -77,20 +59,27 @@ export default function Status({ onNavigate }) {
     }
   }, [])
 
-  const orbState = computeOrbState(criticalAlerts.length > 0, hasMinorAlerts, proofOfValue)
+  const orbState = stats ? stats.status_level : 'green'
+  const recentHigh = stats ? stats.needs_review : 0
+  const recentMedium = stats ? stats.open_medium_24h : 0
+  const olderOpen = stats ? stats.older_open : 0
   const activeAgentNames = agents.filter((a) => a.approved !== 2).map((a) => a.name)
 
   let contextLine
   if (orbState === 'red') {
     contextLine = (
       <a href="#incident-list" className="status-context-link">
-        {criticalTotal} incident{criticalTotal !== 1 ? 's' : ''} need{criticalTotal !== 1 ? '' : 's'} attention. Investigate →
+        {recentHigh} open high-severity alert{recentHigh !== 1 ? 's' : ''} in the last 24 hours. Investigate &rarr;
       </a>
     )
   } else if (orbState === 'amber') {
-    contextLine = <span className="status-context-text">Nothing urgent — see History for recent activity.</span>
+    contextLine = (
+      <a className="status-context-link" style={{ cursor: 'pointer' }} onClick={() => onNavigate('alerts')}>
+        {recentMedium} open medium-severity alert{recentMedium !== 1 ? 's' : ''} in the last 24 hours. Review &rarr;
+      </a>
+    )
   } else {
-    contextLine = <span className="status-context-text">Nothing to investigate.</span>
+    contextLine = <span className="status-context-text">No open high-severity alerts in the last 24 hours</span>
   }
 
   return (
@@ -110,18 +99,24 @@ export default function Status({ onNavigate }) {
           {orbState === 'red' ? 'Incident Detected' : 'Vigil Running'}
         </div>
         <div className="status-agents mono">
-          {activeAgentNames.length > 0 ? activeAgentNames.join(' · ') : 'No agents detected'}
+          {activeAgentNames.length > 0 ? activeAgentNames.join(' \u00b7 ') : 'No agents detected'}
         </div>
         <div className="status-since mono">Recording since {formatStartDate(recordingSince)}</div>
         <div className="status-context">{contextLine}</div>
+        {olderOpen > 0 && (
+          <div className="status-older">
+            <a className="status-older-link" onClick={() => onNavigate('alerts')}>
+              {olderOpen} older open alert{olderOpen !== 1 ? 's' : ''}
+            </a>
+          </div>
+        )}
       </div>
 
       {orbState === 'red' && (
         <div id="incident-list">
           <IncidentList alerts={criticalAlerts} onNavigate={onNavigate} onResolved={() => {
-            api.getAlerts({ status: 'open', severity: 'high,critical' }).then((d) => {
+            api.getAlerts({ status: 'open', severity: 'high,critical', since_hours: WINDOW_HOURS }).then((d) => {
               setCriticalAlerts(d.alerts)
-              setCriticalTotal(d.total)
             }).catch(() => {})
           }} />
         </div>

@@ -152,6 +152,8 @@ export default function Alerts({ onNavigate }) {
   const [agents, setAgents] = useState([])
   const [bulkBusy, setBulkBusy] = useState(false)
   const [reloadTick, setReloadTick] = useState(0)
+  // null when closed. While open: { days, includeRedLine, preview, busy, error, done }.
+  const [olderPanel, setOlderPanel] = useState(null)
 
   // Each filter's own onChange resets page to 0 (see the <select>s below)
   // rather than this effect deriving the reset from a filter change, so a
@@ -217,6 +219,29 @@ export default function Alerts({ onNavigate }) {
     }
   }
 
+  async function previewOlder(days, includeRedLine) {
+    setOlderPanel({ days, includeRedLine, preview: null, busy: true, error: null, done: null })
+    try {
+      // dry run: counts only, nothing is changed
+      const preview = await api.resolveOlderAlerts(days, { dryRun: true, includeRedLine })
+      setOlderPanel({ days, includeRedLine, preview, busy: false, error: null, done: null })
+    } catch (err) {
+      setOlderPanel({ days, includeRedLine, preview: null, busy: false, error: err.message, done: null })
+    }
+  }
+
+  async function confirmResolveOlder() {
+    const { days, includeRedLine } = olderPanel
+    setOlderPanel((p) => ({ ...p, busy: true, error: null }))
+    try {
+      const result = await api.resolveOlderAlerts(days, { dryRun: false, includeRedLine })
+      setOlderPanel({ days, includeRedLine, preview: null, busy: false, error: null, done: result })
+      setReloadTick((t) => t + 1)
+    } catch (err) {
+      setOlderPanel((p) => ({ ...p, busy: false, error: err.message }))
+    }
+  }
+
   const grouped = SEVERITY_ORDER.map((sev) => ({
     severity: sev,
     alerts: alerts.filter((a) => a.severity === sev),
@@ -238,6 +263,7 @@ export default function Alerts({ onNavigate }) {
         <select value={statusFilter} onChange={(e) => { setStatusFilter(e.target.value); setPage(0) }}>
           <option value="open">Open</option>
           <option value="investigating">Investigating</option>
+          <option value="resolved">Resolved</option>
           <option value="dismissed">Dismissed</option>
           <option value="exception_approved">Exception Approved</option>
           <option value="risk_accepted">Risk Accepted</option>
@@ -262,7 +288,72 @@ export default function Alerts({ onNavigate }) {
         <button className="btn ghost" disabled={bulkBusy} onClick={handleBulkDismissLow}>
           Bulk: Dismiss all LOW
         </button>
+        <button className="btn ghost" disabled={olderPanel !== null} onClick={() => previewOlder(7, false)}>
+          Resolve older alerts
+        </button>
       </div>
+
+      {olderPanel && (
+        <div className="resolve-older-panel">
+          {olderPanel.done ? (
+            <div>
+              Resolved {olderPanel.done.count} open alert{olderPanel.done.count !== 1 ? 's' : ''} older than{' '}
+              {olderPanel.done.days} days. Nothing was deleted; they are still listed under Resolved.
+              <div className="resolve-older-actions">
+                <button className="btn ghost" onClick={() => setOlderPanel(null)}>Close</button>
+              </div>
+            </div>
+          ) : (
+            <div>
+              <div>
+                Resolve open alerts older than{' '}
+                <select
+                  value={olderPanel.days}
+                  disabled={olderPanel.busy}
+                  onChange={(e) => previewOlder(Number(e.target.value), olderPanel.includeRedLine)}
+                >
+                  <option value={1}>1 day</option>
+                  <option value={7}>7 days</option>
+                  <option value={14}>14 days</option>
+                  <option value={30}>30 days</option>
+                </select>
+              </div>
+              {olderPanel.preview && (
+                <div style={{ marginTop: 8 }}>
+                  <strong>{olderPanel.preview.count}</strong> alert{olderPanel.preview.count !== 1 ? 's' : ''} will be marked resolved
+                  {' '}(critical {olderPanel.preview.by_severity.critical}, high {olderPanel.preview.by_severity.high},
+                  {' '}medium {olderPanel.preview.by_severity.medium}, low {olderPanel.preview.by_severity.low}).
+                  {!olderPanel.includeRedLine && olderPanel.preview.red_line_skipped > 0 && (
+                    <> {olderPanel.preview.red_line_skipped} red-line alert{olderPanel.preview.red_line_skipped !== 1 ? 's are' : ' is'} being left open.</>
+                  )}
+                </div>
+              )}
+              <label>
+                <input
+                  type="checkbox"
+                  checked={olderPanel.includeRedLine}
+                  disabled={olderPanel.busy}
+                  onChange={(e) => previewOlder(olderPanel.days, e.target.checked)}
+                />{' '}
+                Also include red-line alerts
+              </label>
+              {olderPanel.error && <div className="empty-state">{olderPanel.error}</div>}
+              <div className="resolve-older-actions">
+                <button
+                  className="btn ghost"
+                  disabled={olderPanel.busy || !olderPanel.preview || olderPanel.preview.count === 0}
+                  onClick={confirmResolveOlder}
+                >
+                  Confirm: resolve {olderPanel.preview ? olderPanel.preview.count : ''}
+                </button>
+                <button className="btn ghost" disabled={olderPanel.busy} onClick={() => setOlderPanel(null)}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {grouped.length === 0 ? (
         <div className="empty-state">No alerts match the current filters.</div>

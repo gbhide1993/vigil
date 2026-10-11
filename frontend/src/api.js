@@ -48,6 +48,9 @@ export const api = {
     request(`/alerts/${alertId}/resolve`, { method: 'POST', body: JSON.stringify(body) }),
   bulkDismissAlerts: (severity) =>
     request(`/alerts/bulk-dismiss?severity=${severity}`, { method: 'POST' }),
+  // dryRun=true only counts; nothing is changed. Red-line alerts are skipped unless includeRedLine.
+  resolveOlderAlerts: (days, { dryRun, includeRedLine }) =>
+    request(`/alerts/resolve-older?days=${days}&dry_run=${dryRun}&include_red_line=${includeRedLine}`, { method: 'POST' }),
   getSessionEvents: (sessionId, agentId) => {
     const qs = new URLSearchParams({ session: sessionId, agent: agentId, limit: 2000 }).toString()
     return request(`/events?${qs}`)
