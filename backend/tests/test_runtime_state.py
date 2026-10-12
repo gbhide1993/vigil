@@ -145,7 +145,11 @@ def test_scope_add_and_remove_reach_the_observer_when_main_runs_as___main__(tmp_
         assert up, f"backend did not start: {(tmp_path / 'stdout.txt').read_text(errors='replace')[-1500:]}"
 
         status, before = _call(port, "GET", "/api/scope")
-        assert status == 200 and before["file_watcher_tier"] == "folders"
+        # An elevated machine (a CI runner as Administrator) starts the ETW tier instead of the folder
+        # observer. ETW sees every recognised agent's changes without a folder list, so there the live
+        # apply is reported as applied and observed_paths stays empty; the folder tier lists the path.
+        assert status == 200 and before["file_watcher_tier"] in ("folders", "etw")
+        folder_tier = before["file_watcher_tier"] == "folders"
         stored = Path(project).resolve().as_posix()
         assert stored.lower() not in [p.replace("\\", "/").lower() for p in before["observed_paths"]]
 
@@ -153,8 +157,12 @@ def test_scope_add_and_remove_reach_the_observer_when_main_runs_as___main__(tmp_
         assert status == 200, added
         assert added["applied_live"] is True and added["message"] is None
         status, during = _call(port, "GET", "/api/scope")
-        assert stored.lower() in [p.replace("\\", "/").lower() for p in during["observed_paths"]], \
-            "the added folder must be on the running observer, with no restart"
+        if folder_tier:
+            assert stored.lower() in [p.replace("\\", "/").lower() for p in during["observed_paths"]], \
+                "the added folder must be on the running observer, with no restart"
+        else:
+            assert during["observed_paths"] == []
+        assert [f["path"].lower() for f in during["folders"]] == [stored.lower()], "the folder is saved either way"
 
         status, removed = _call(port, "DELETE", "/api/scope", {"path": str(project)})
         assert status == 200, removed

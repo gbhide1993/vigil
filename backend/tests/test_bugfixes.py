@@ -565,14 +565,25 @@ def test_export_format_local_converts_utc_to_local_with_offset():
     _format_local must convert to local time and label it, for both a
     naive-UTC DB timestamp and an isoformat string with an explicit
     offset (generated_at)."""
-    from api.export import _format_local
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import patch
 
-    naive_result = _format_local("2026-01-01 22:30:00")
-    assert "2026" in naive_result and ":" in naive_result
-    assert naive_result != "2026-01-01 22:30:00"  # actually converted, not passed through
+    import api.export as export_module
 
-    offset_result = _format_local("2026-01-01T22:30:00.123456+00:00")
-    assert "2026" in offset_result
+    # The conversion uses the machine's local zone (datetime.astimezone() with no argument), which is
+    # UTC on a CI runner. Pin a fixed +05:30 local zone so the test does not depend on the OS zone.
+    class _Plus0530(datetime):
+        def astimezone(self, tz=None):
+            return super().astimezone(tz or timezone(timedelta(hours=5, minutes=30)))
+
+    with patch.object(export_module, "datetime", _Plus0530):
+        naive_result = export_module._format_local("2026-01-01 22:30:00")
+        offset_result = export_module._format_local("2026-01-01T22:30:00.123456+00:00")
+        other_offset = export_module._format_local("2026-01-01T22:30:00-04:00")
+
+    assert naive_result == "2026-01-02 04:00:00"        # 22:30 UTC is 04:00 the next day at +05:30
+    assert offset_result == "2026-01-02 04:00:00"
+    assert other_offset == "2026-01-02 08:00:00"         # 22:30 at -04:00 is 02:30 UTC on the 2nd, 08:00 at +05:30
 
 
 def test_export_pdf_header_shows_period_not_the_word_today():
