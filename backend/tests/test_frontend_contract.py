@@ -54,7 +54,7 @@ def test_sidebar_separates_recognised_from_running_and_describes_approval():
     assert "Recognised agents" in sidebar and "active now" in sidebar and "not approved yet" in sidebar
     # the dot reflects activity, never approval
     dot = sidebar[sidebar.index("function statusDotColor"):sidebar.index("function approvalLabel")]
-    assert "approved === 0" not in dot and "current_status === 'active'" in dot
+    assert "approved === 0" not in dot and "agent.activity === 'active'" in dot
 
 
 def test_dashboard_card_is_labelled_for_what_it_counts():

@@ -24,6 +24,7 @@
     },
     "files": [
       "main.js",
+      "status-text.js",
       "preload.js",
       "flyout.html",
       "flyout.css",

@@ -41,7 +41,9 @@ def _enum_processes_powershell():
         result = subprocess.run(
             [
                 'powershell', '-NoProfile', '-NonInteractive', '-Command',
-                'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name | ConvertTo-Csv -NoTypeInformation'
+                'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,'
+                '@{n="Started";e={if ($_.CreationDate) { [int64]($_.CreationDate.ToUniversalTime() - [datetime]"1970-01-01").TotalSeconds } else { 0 }}} | '
+                'ConvertTo-Csv -NoTypeInformation'
             ],
             capture_output=True, text=True, timeout=15
         )
@@ -54,12 +56,17 @@ def _enum_processes_powershell():
                 pid = int(row.get('ProcessId', '').strip().strip('"'))
                 ppid = int(row.get('ParentProcessId', '0').strip().strip('"') or '0')
                 name = (row.get('Name') or '').strip().strip('"').lower()
+                started = int((row.get('Started') or '0').strip().strip('"') or '0')
                 if pid and name:
                     processes.append({
                         'pid': pid,
                         'name': name,
                         'ppid': ppid,
                         'status': 'running',
+                        # Process creation time (epoch seconds, 0 if unknown). With the pid it
+                        # identifies one process, so a restart of Vigil can tell "already
+                        # recorded" from a new process that reused the pid.
+                        'started': started,
                     })
             except (ValueError, KeyError):
                 continue
@@ -75,7 +82,7 @@ def _enum_processes_psutil():
     place; still cheaper here (disposable subprocess, killable) than in the
     parent even at its slower, ~13s-on-this-machine pace."""
     processes = []
-    for proc in psutil.process_iter(['pid', 'name', 'ppid', 'status']):
+    for proc in psutil.process_iter(['pid', 'name', 'ppid', 'status', 'create_time']):
         try:
             info = proc.info
             pid = info.get('pid')
@@ -86,6 +93,7 @@ def _enum_processes_psutil():
                 'name': (info.get('name') or '').lower(),
                 'ppid': info.get('ppid') or 0,
                 'status': info.get('status') or '',
+                'started': int(info.get('create_time') or 0),
             })
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue

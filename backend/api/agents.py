@@ -5,6 +5,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from config.policy import POLICY_FILE
+from core import runtime_state
+from core.agent_activity import ACTIVE, ACTIVITY_WINDOW_SECONDS, OPEN_IDLE, classify, recent_activity, running_pids
 from core.cve_check import check_agent_cves, get_installed_agent_version
 from core.feature_flags import CORE_ONLY
 from db.database import get_db, get_read_db
@@ -65,18 +67,6 @@ async def _remove_from_policy_list(db, key: str, name: str) -> None:
         await _set_policy_list(db, key, values)
 
 
-def _current_status(last_seen: str | None) -> str:
-    if not last_seen:
-        return "inactive"
-    seen = datetime.fromisoformat(last_seen.replace(" ", "T")).replace(tzinfo=timezone.utc)
-    age = (datetime.now(timezone.utc) - seen).total_seconds()
-    if age < 30:
-        return "active"
-    if age < 300:
-        return "idle"
-    return "inactive"
-
-
 async def _latest_agent_audit_entries(db) -> dict[int, dict]:
     """Returns {agent_id: {actor, created_at, detail}} for each agent's most
     recent agent_approved/agent_blocked audit_log row, used to show
@@ -111,10 +101,20 @@ async def get_agents():
         cur = await db.execute("SELECT * FROM agents ORDER BY last_seen DESC")
         rows = await cur.fetchall()
         audit_by_agent = await _latest_agent_audit_entries(db)
+        activity = await recent_activity(db)
+        watcher = runtime_state.state.get("process_watcher")
         agents = []
         for r in rows:
             agent = dict(r)
-            agent["current_status"] = _current_status(agent.get("last_seen"))
+            pids = running_pids(watcher, agent["name"])
+            last_activity = activity.get(agent["id"])
+            state = classify(bool(pids), last_activity)
+            agent["running"] = bool(pids)
+            agent["running_processes"] = len(pids)
+            agent["activity"] = state
+            agent["last_activity_at"] = last_activity
+            # Kept for older clients: active / idle (open but quiet) / inactive (not running).
+            agent["current_status"] = {ACTIVE: "active", OPEN_IDLE: "idle"}.get(state, "inactive")
             audit = audit_by_agent.get(agent["id"])
             if audit and agent["approved"] == 1:
                 agent["approved_by"] = audit["actor"]
@@ -123,7 +123,7 @@ async def get_agents():
                 agent["blocked_reason"] = audit["reason"]
                 agent["blocked_at"] = audit["created_at"]
             agents.append(agent)
-        return {"agents": agents}
+        return {"agents": agents, "activity_window_seconds": ACTIVITY_WINDOW_SECONDS}
     finally:
         await db.close()
 

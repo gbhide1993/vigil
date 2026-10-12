@@ -304,6 +304,7 @@ async def lifespan(app: FastAPI):
         logger.exception("session recovery failed -- continuing startup without it")
 
     process_watcher = ProcessWatcher(attributor, aggregator)
+    _state["process_watcher"] = process_watcher
     network_watcher = NetworkWatcher(attributor, aggregator)
     mcp_watcher = McpWatcher(attributor)
 

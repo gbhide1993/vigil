@@ -3,6 +3,7 @@ const path = require('path')
 const fs = require('fs')
 const http = require('http')
 const cron = require('node-cron')
+const { trayStatusText } = require('./status-text')
 const { spawn, execFile } = require('child_process')
 
 // Only one tray instance may run at a time — otherwise a second launch
@@ -435,42 +436,20 @@ function formatMB(bytes) {
 async function updateTrayTooltip() {
   if (!backendReady || !tray) return
   try {
-    // /sessions doesn't support a server-side `limit` -- it's already
-    // ordered newest-first, so slicing client-side after the fetch gives
-    // the same "most recent" result the spec asks for. The alert count
-    // comes from /api/stats's needs_review field (open, severity high or
-    // critical) -- the same definition the Status page and the Incidents
-    // sidebar badge use. This used to fetch /api/alerts?status=open&limit=1
-    // and show that result's own length, which is capped at 1 by the
-    // request itself -- the tooltip could only ever say "1 alert", never
-    // the real count, and it counted every open severity, not just the
-    // ones that actually need review.
-    const [sessionsRes, statsRes] = await Promise.all([
-      httpRequest('GET', '/api/sessions?limit=1'),
+    // The alert count comes from /api/stats's needs_review (open, severity high or critical),
+    // the same definition the Status page and the Incidents sidebar badge use.
+    const [agentsRes, statsRes] = await Promise.all([
+      httpRequest('GET', '/api/agents'),
       httpRequest('GET', '/api/stats'),
     ])
 
-    const sessions = ((sessionsRes.body && sessionsRes.body.sessions) || []).slice(0, 1)
-    const needsReview = (statsRes.body && statsRes.body.needs_review) || 0
-
-    if (sessions.length === 0) {
-      tray.setToolTip('Vigil — Watching. No sessions recorded yet.')
-      return
-    }
-
-    if (needsReview > 0) {
-      tray.setToolTip(`Vigil — ${needsReview} alert${needsReview !== 1 ? 's' : ''} need${needsReview !== 1 ? '' : 's'} review.`)
-      return
-    }
-
-    const lastSession = sessions[0]
-    if (lastSession.ended_at == null) {
-      tray.setToolTip(`Vigil — Live: ${lastSession.agent_name || 'agent'} session in progress`)
-      return
-    }
-
-    const files = (lastSession.file_reads || 0) + (lastSession.file_writes || 0)
-    tray.setToolTip(`Vigil — Last session clean. ${files} files.`)
+    // What the words mean is decided by the backend (core/agent_activity.py): "active" is real
+    // activity in the last 5 minutes, "open (idle)" is a process that exists with nothing going
+    // on. An open session on its own no longer says "Live".
+    tray.setToolTip(trayStatusText({
+      agents: (agentsRes.body && agentsRes.body.agents) || [],
+      needsReview: (statsRes.body && statsRes.body.needs_review) || 0,
+    }))
   } catch (err) {
     // non-fatal — tooltip just keeps its last known text until this succeeds again
   }

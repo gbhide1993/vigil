@@ -16,7 +16,7 @@ from core.attributor import KNOWN_AGENTS, Attributor
 from core.feature_flags import CORE_ONLY
 from core.red_lines import RedLines
 from core.redaction import redact_cmdline
-from db.database import get_db
+from db.database import get_db, get_read_db
 from watchers._process_scan_worker import _filter_env
 
 logger = logging.getLogger("vlaw")
@@ -129,6 +129,41 @@ def _is_suspicious(cmdline: str, exe_basename: str) -> bool:
     return any(pattern in lowered for pattern in SUSPICIOUS_INLINE_PATTERNS)
 
 
+# A process is identified by (pid, creation time). Two creation times this close are the same
+# process (the Windows and psutil sources can differ by a second).
+PROC_START_TOLERANCE_SECONDS = 2
+
+
+def _epoch(created_at: str | None) -> float:
+    """Stored naive-UTC 'YYYY-MM-DD HH:MM:SS' as epoch seconds (0 if unreadable)."""
+    try:
+        from datetime import datetime, timezone
+
+        return datetime.fromisoformat(created_at.replace(" ", "T")).replace(tzinfo=timezone.utc).timestamp()
+    except (AttributeError, ValueError):
+        return 0.0
+
+
+def already_recorded(rows: list[tuple[dict, str]], started: int) -> bool:
+    """True when one of the stored proc_spawn rows for this pid is this same process.
+
+    rows: (detail dict, created_at) of the pid's earlier rows. A row written by this
+    version carries detail.process_started. An older row has none, so it is matched by
+    time instead: the process had already started when that row was written, which
+    is the case only for the same process and never for a later one that reused the pid.
+    An unknown creation time (0) never matches, so such a process is recorded as before."""
+    if not started:
+        return False
+    for detail, created_at in rows:
+        recorded = detail.get("process_started")
+        if recorded:
+            if abs(int(recorded) - started) <= PROC_START_TOLERANCE_SECONDS:
+                return True
+        elif started <= _epoch(created_at) + PROC_START_TOLERANCE_SECONDS:
+            return True
+    return False
+
+
 class ProcessWatcher:
     def __init__(self, attributor: Attributor, aggregator=None):
         self.attributor = attributor
@@ -182,6 +217,44 @@ class ProcessWatcher:
         # calls proc.environ()/proc.cmdline()/proc.exe() itself) and
         # consumed by _gather_spawn_info/_scan_all_agent_processes_for_env_redirect.
         self._cmdline_snapshot: dict[int, dict] = {}
+        # {agent_name: [pid, ...]} of agent processes (and their children) that exist in the
+        # latest scan. "Running" only means a process exists; whether the agent is doing
+        # anything is decided from recorded events (core/agent_activity.py).
+        self.running_agents: dict[str, list[int]] = {}
+        self.running_agents_at: float = 0.0
+
+    def _update_running_agents(self) -> None:
+        running: dict[str, list[int]] = {}
+        for pid in self._pid_snapshot:
+            name = Attributor._walk_parent_chain_from_snapshot(pid, self._pid_snapshot)
+            if name:
+                running.setdefault(name, []).append(pid)
+        self.running_agents = running
+        self.running_agents_at = time.time()
+
+    async def _recorded_rows(self, pids: list[int]) -> dict[int, list[tuple[dict, str]]]:
+        """Earlier proc_spawn rows (detail, created_at) per pid."""
+        rows: dict[int, list[tuple[dict, str]]] = {}
+        if not pids:
+            return rows
+        db = await get_read_db()
+        try:
+            for start in range(0, len(pids), 400):
+                chunk = pids[start:start + 400]
+                cur = await db.execute(
+                    "SELECT pid, detail, created_at FROM events WHERE event_type = 'proc_spawn' "
+                    f"AND pid IN ({','.join('?' * len(chunk))})",
+                    chunk,
+                )
+                for row in await cur.fetchall():
+                    try:
+                        detail = json.loads(row["detail"]) if row["detail"] else {}
+                    except (TypeError, ValueError):
+                        detail = {}
+                    rows.setdefault(row["pid"], []).append((detail, row["created_at"]))
+        finally:
+            await db.close()
+        return rows
 
     def stop(self) -> None:
         pass
@@ -302,6 +375,7 @@ class ProcessWatcher:
             resumed = self._is_first_poll
             self._known_pids = current_pids
             self._is_first_poll = False
+            self._update_running_agents()
 
         logger.info("ProcessWatcher new_pids this cycle: %d (resumed=%s)", len(new_pids), resumed)
 
@@ -318,6 +392,15 @@ class ProcessWatcher:
             return
 
         spawn_infos = await self._gather_spawn_info(new_pids)
+
+        # A process Vigil has already recorded (same pid and creation time) is not recorded
+        # again. Without this every restart of Vigil re-recorded every agent process that was
+        # already running (one long-lived helper was recorded once per restart).
+        try:
+            earlier = await self._recorded_rows([i["pid"] for i in spawn_infos if i["agent_name"] is not None])
+        except Exception:
+            logger.exception("ProcessWatcher: could not look up earlier proc_spawn rows; recording as before")
+            earlier = {}
 
         pending_rows: list[dict] = []
 
@@ -340,6 +423,10 @@ class ProcessWatcher:
 
             if agent_name is None:
                 continue  # not under a known agent, and not agent-like by behaviour either
+
+            started = info["started"]
+            if already_recorded(earlier.get(pid, []), started):
+                continue
 
             is_unidentified = agent_name == "unidentified_agent"
             # get_behaviour_score_for_pid reads the score Attributor already
@@ -368,7 +455,15 @@ class ProcessWatcher:
                 "command": exe_name,
                 "args": info["args"],
                 "suspicious": suspicious,
+                "process_started": started,
+                # A new tool or shell process started under an agent process: real activity.
+                # The agent's own processes (the helper itself) are not.
+                "activity_spawn": info["activity_spawn"],
             }
+            if resumed:
+                # Found on the first scan after Vigil started: it was already running, this is
+                # the one marker for it (it is not recorded again on later restarts).
+                detail["already_running"] = True
             if is_unidentified:
                 detail["behaviour_detected"] = True
                 detail["confidence"] = confidence
@@ -619,6 +714,7 @@ class ProcessWatcher:
                     "name": p.get("name", ""),
                     "ppid": p.get("ppid", 0),
                     "status": p.get("status", ""),
+                    "started": p.get("started", 0),
                 }
 
         self._pid_snapshot = snapshot
@@ -769,6 +865,12 @@ class ProcessWatcher:
                 "exe_path": exe_path,
                 "parent_pid": parent_pid,
                 "agent_name": agent_name,
+                "started": snap_info.get("started", 0),
+                "activity_spawn": (
+                    bool(parent_pid)
+                    and Attributor._walk_parent_chain_from_snapshot(parent_pid, self._pid_snapshot) is not None
+                    and _match_known_agent_name(exe_name) is None
+                ),
             })
         return infos
 

@@ -11,12 +11,15 @@ const NAV_ITEMS = [
   { key: 'settings', label: 'Settings' },
 ]
 
-// The dot says whether the agent has been active just now, not whether it is approved.
-// Approval is a separate word under the name. "active" means the backend saw activity
-// from this agent in the last 30 seconds (api/agents.py current_status).
+// The dot and the first line describe what the agent is doing, not whether it is approved
+// (approval is the word after the dot). The backend decides (core/agent_activity.py):
+//   active       real activity in the last 5 minutes (a file change, a new tool process, ...)
+//   open_idle    an agent process exists, for example a background helper, but nothing is happening
+//   not_running  no process of that agent exists
 function statusDotColor(agent) {
   if (agent.approved === 2) return 'red'
-  return agent.current_status === 'active' ? 'green' : 'idle'
+  if (agent.activity === 'active') return 'green'
+  return agent.activity === 'open_idle' ? 'idle' : 'off'
 }
 
 function approvalLabel(agent) {
@@ -26,15 +29,15 @@ function approvalLabel(agent) {
 }
 
 function activityLabel(agent) {
-  if (agent.current_status === 'active') return 'active now'
-  if (!agent.last_seen) return 'no activity seen'
+  if (agent.activity === 'active') return 'active now'
+  if (agent.activity === 'open_idle') return 'open, idle'
+  if (!agent.last_seen) return 'not running'
   const seconds = Math.max(0, (Date.now() - new Date(agent.last_seen.replace(' ', 'T') + 'Z').getTime()) / 1000)
-  if (seconds < 90) return 'last activity just now'
   const minutes = Math.round(seconds / 60)
-  if (minutes < 60) return `last activity ${minutes} min ago`
+  if (minutes < 60) return `not running, last seen ${Math.max(minutes, 1)} min ago`
   const hours = Math.round(minutes / 60)
-  if (hours < 48) return `last activity ${hours} h ago`
-  return `last activity ${Math.round(hours / 24)} d ago`
+  if (hours < 48) return `not running, last seen ${hours} h ago`
+  return `not running, last seen ${Math.round(hours / 24)} d ago`
 }
 
 export default function Sidebar({ view, onNavigate, needsReviewCount, version }) {
@@ -64,7 +67,8 @@ export default function Sidebar({ view, onNavigate, needsReviewCount, version })
   }, [])
 
   const pendingCount = agents.filter((a) => a.approved === 0).length
-  const activeNow = agents.filter((a) => a.current_status === 'active').length
+  const activeNow = agents.filter((a) => a.activity === 'active').length
+  const openIdle = agents.filter((a) => a.activity === 'open_idle').length
 
   return (
     <aside className="sidebar">
@@ -96,7 +100,7 @@ export default function Sidebar({ view, onNavigate, needsReviewCount, version })
       <div>
         <div className="sidebar-section-title">Recognised agents</div>
         <div className="sidebar-section-note">
-          {agents.length === 0 ? 'none seen yet' : `${activeNow} active now of ${agents.length} seen`}
+          {agents.length === 0 ? 'none seen yet' : `${activeNow} active now, ${openIdle} open, idle (of ${agents.length} seen)`}
         </div>
         <div className="watching-list">
           {agents.length === 0 && (

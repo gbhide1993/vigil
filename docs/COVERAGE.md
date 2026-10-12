@@ -47,6 +47,7 @@ Consequence of the disabled sweep: a session is closed (and scored by the volume
 ### Not watchers, but they affect what you see
 
 - **Attribution** works from process names (Claude Code, Cursor, Copilot, Codex and a few others), parent chains and a behaviour score. An agent that is not recognized is only seen if it scores as agent-like.
+- **Running, open (idle) and active:** an agent is *running* when one of its processes exists (a desktop app or an editor extension's background helper counts). It is *active* only after real activity in the last 5 minutes: a file change attributed to it, a network or MCP event, or a new tool or shell process started under one of its processes. A long-lived helper, a process that was already running when Vigil started, or an open session alone is not activity; such an agent is shown as "open, idle". The tray tooltip, the sidebar and `/api/agents` use the same rule. A process Vigil has already recorded (same pid and creation time) is not recorded again after a restart.
 - **Evidence chain:** hashes the stored events and checks them for consistency, run by Vigil itself on its own database. It does not cover alerts, dismissals, policy, sessions or coverage data, and nothing outside this computer holds a copy.
 
 ## 3. Red-line rules
