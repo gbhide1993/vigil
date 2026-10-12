@@ -1,4 +1,4 @@
-const { app, Tray, Menu, BrowserWindow, ipcMain, screen, shell, Notification } = require('electron')
+const { app, Tray, Menu, BrowserWindow, ipcMain, screen, shell, Notification, dialog } = require('electron')
 const path = require('path')
 const fs = require('fs')
 const http = require('http')
@@ -615,7 +615,9 @@ function setTrayIcon(iconName, fallbackTooltip) {
   if (!backendReady) tray.setToolTip(fallbackTooltip)
 }
 
-const APP_VERSION = '0.2.0-beta'
+// The version in package.json: the installer, the tray and the backend (/api/health) all carry
+// the same number, and installer/check-version.js stops the build when they differ.
+const APP_VERSION = app.getVersion()
 
 function setTrayIdle() {
   setTrayIcon('icon_green.png', `Vigil v${APP_VERSION} — All clear`)
@@ -727,6 +729,49 @@ function toggleFlyout() {
   })
 }
 
+// Asks the local backend for a support bundle (api/support.py) and saves it where the user
+// chooses. Nothing is uploaded: the zip goes from the loopback backend to a file on this PC.
+async function saveSupportLogs() {
+  const fail = (detail) => dialog.showMessageBox({
+    type: 'error', title: 'Save support logs', message: 'Vigil could not save the support logs.', detail,
+  })
+  try {
+    let contents
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/support/contents`, { signal: AbortSignal.timeout(5000) })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      contents = await res.json()
+    } catch (err) {
+      await fail(`Vigil's backend did not answer (${err.message}). Start Vigil and try again.`)
+      return
+    }
+    const detail = [
+      'Included:', ...contents.included.map((line) => `  - ${line}`),
+      '', 'Not included:', ...contents.excluded.map((line) => `  - ${line}`),
+      '', 'Nothing is uploaded. You choose where the file is saved.',
+      'The log file can still contain file paths and agent names, so look through it before you send it.',
+    ].join('\n')
+    const choice = await dialog.showMessageBox({
+      type: 'info', title: 'Save support logs', message: 'Save a support bundle (zip)?', detail,
+      buttons: ['Choose where to save...', 'Cancel'], defaultId: 0, cancelId: 1,
+    })
+    if (choice.response !== 0) return
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')
+    const target = await dialog.showSaveDialog({
+      title: 'Save support logs',
+      defaultPath: path.join(app.getPath('desktop'), `vigil-support-${APP_VERSION}-${stamp}.zip`),
+      filters: [{ name: 'Zip file', extensions: ['zip'] }],
+    })
+    if (target.canceled || !target.filePath) return
+    const res = await fetch(`${BACKEND_URL}/api/support/bundle`, { method: 'POST', signal: AbortSignal.timeout(30000) })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    fs.writeFileSync(target.filePath, Buffer.from(await res.arrayBuffer()))
+    shell.showItemInFolder(target.filePath)
+  } catch (err) {
+    await fail(err.message)
+  }
+}
+
 function createTray() {
   tray = new Tray(path.join(__dirname, 'assets', 'icon_green.png'))
   tray.setToolTip('Vigil: idle')
@@ -763,6 +808,8 @@ function createTray() {
           waitForBackend()
         },
       },
+      { type: 'separator' },
+      { label: 'Save support logs...', click: () => saveSupportLogs() },
       { type: 'separator' },
     ]
     if (!app.isPackaged) {
@@ -821,7 +868,9 @@ async function isBackendAlreadyHealthy() {
 }
 
 app.whenReady().then(async () => {
-  app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true })
+  // Starting at sign-in is the installer's "Start Vigil when I sign in" task (it writes the per-user
+  // Run entry electron.app.Vigil, the same entry setLoginItemSettings would). The tray no longer
+  // re-creates that entry on every start, so a user who declined it stays declined.
   if (app.dock) app.dock.hide()
 
   createTray()

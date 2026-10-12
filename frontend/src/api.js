@@ -7,12 +7,19 @@ const BASE = '/api'
 const REQUEST_TIMEOUT_MS = 10000
 
 async function request(path, options = {}) {
+  const { signal: callerSignal, ...fetchOptions } = options
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  // A caller-supplied signal (the History search cancels a request when the next
+  // keystroke arrives) aborts the same controller the timeout uses.
+  if (callerSignal) {
+    if (callerSignal.aborted) controller.abort()
+    else callerSignal.addEventListener('abort', () => controller.abort(), { once: true })
+  }
   try {
     const res = await fetch(`${BASE}${path}`, {
       headers: { 'Content-Type': 'application/json' },
-      ...options,
+      ...fetchOptions,
       signal: controller.signal,
     })
     if (!res.ok) {
@@ -26,9 +33,15 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  getEvents: (params = {}) => {
+  getEvents: (params = {}, signal) => {
     const qs = new URLSearchParams(params).toString()
-    return request(`/events${qs ? `?${qs}` : ''}`)
+    return request(`/events${qs ? `?${qs}` : ''}`, { signal })
+  },
+  // History search: matches a session id prefix (any case) or text in agent, type,
+  // path or detail. The reply has total, sessions and session_count besides events.
+  searchEvents: (q, { limit = 100, offset = 0 } = {}, signal) => {
+    const qs = new URLSearchParams({ q, limit, offset }).toString()
+    return request(`/events?${qs}`, { signal })
   },
   getAgents: () => request('/agents'),
   getAgentSessions: (agentId) => request(`/agents/${agentId}/sessions`),
@@ -68,6 +81,7 @@ export const api = {
   sendTestWebhook: () => request('/digest/send-webhook', { method: 'POST' }),
   exportJsonUrl: (date) => `${BASE}/export/json?date=${date}`,
   exportPdfUrl: (date) => `${BASE}/export/pdf?date=${date}`,
+  sessionReportUrl: (sessionId) => `${BASE}/sessions/${encodeURIComponent(sessionId)}/report`,
   getAnalyticsSummary: () => request('/analytics/summary'),
   getEvidence: () => request('/evidence'),
   getEvidenceIncidents: () => request('/incidents'),

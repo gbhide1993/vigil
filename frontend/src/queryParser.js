@@ -10,6 +10,26 @@ function detailText(e) {
   return (e.detail || '').toLowerCase()
 }
 
+// True for the question-style queries parseQuery understands on the client (time
+// words, "credentials", "modified x", "spawned", "connected to"). Anything else,
+// including a session id or part of one, is searched on the server so it covers
+// the whole history and not just the events already loaded.
+export function isIntentQuery(q) {
+  const lower = q.toLowerCase().trim()
+  if (!lower || /^[0-9a-f-]{1,36}$/.test(lower)) return false
+  return (
+    /after\s+\d|before\s+\d/.test(lower) ||
+    lower.includes('yesterday') ||
+    lower.includes('today') ||
+    DAY_NAMES.some((d) => lower.includes(d)) ||
+    /secret|credential|api.?key|password|token/.test(lower) ||
+    /^(?:modified?|wrote?|edit(?:ed)?|changed?)\b/.test(lower) ||
+    /^spawn|^ran\b|^executed?/.test(lower) ||
+    /^connected?\s+to\b/.test(lower) ||
+    lower === 'mcp'
+  )
+}
+
 export function parseQuery(q, events, now = new Date()) {
   if (!q.trim()) return events
   const lower = q.toLowerCase().trim()

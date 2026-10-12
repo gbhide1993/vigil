@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
+import CopyButton from './CopyButton'
 
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low']
 const SEVERITY_LABELS = { critical: 'CRITICAL', high: 'HIGH', medium: 'MEDIUM', low: 'LOW' }
@@ -33,6 +34,7 @@ function DetailLine({ text }) {
           {expanded ? 'Show less ▲' : 'Show full command ▼'}
         </button>
       )}
+      <CopyButton text={text} />
     </div>
   )
 }

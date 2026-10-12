@@ -211,7 +211,7 @@ async def test_events_api_labels_file_events_but_not_other_events(db):
     )
     await db.commit()
     try:
-        data = await events_module.get_events(agent=agent_id, type=None, since=None, session=sid, limit=50)
+        data = await events_module.get_events(agent=agent_id, type=None, since=None, session=sid, q=None, offset=0, limit=50)
         by_path = {e["path"]: e for e in data["events"]}
         assert by_path["C:/p/guess.py"]["attribution"] == "best_guess"
         assert by_path["C:/p/guess.py"]["attribution_confidence"] == "medium"

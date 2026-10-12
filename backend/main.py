@@ -90,7 +90,7 @@ from fastapi import FastAPI, APIRouter, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
-from api import agents, alerts, analytics_api, chain_routes, config_api, digest_api, events, evidence, export, git_routes, mcp_routes, platform_routes, scope, sessions
+from api import agents, alerts, analytics_api, chain_routes, config_api, digest_api, events, evidence, export, git_routes, mcp_routes, platform_routes, scope, sessions, support
 from config.policy import load_policy
 from core.aggregator import Aggregator
 from core.attributor import Attributor
@@ -121,7 +121,12 @@ PORT = int(os.environ.get("VLAW_PORT", 7422))
 
 # Shared with the API routes through core/runtime_state.py (NOT through `import main`,
 # which in the exe would load a second copy of this module). Same objects, old names.
+from core.local_day import local_day_window  # noqa: E402
 from core.runtime_state import state as _state, stats_cache as _stats_cache  # noqa: E402
+
+# What the support bundle (api/support.py) needs from this module, without importing it.
+_state["log_path"] = LOG_PATH
+_state["version"] = VERSION
 
 
 DEFAULT_POLICY = {
@@ -588,6 +593,7 @@ app.include_router(analytics_api.router, prefix="/api")
 app.include_router(evidence.router, prefix="/api")
 app.include_router(chain_routes.router, prefix="/api")
 app.include_router(scope.router, prefix="/api")
+app.include_router(support.router, prefix="/api")
 
 
 _STATS_CACHE_TTL_SECONDS = 2.0
@@ -620,8 +626,8 @@ async def get_stats():
     1. get_read_db() instead of get_db() -- a dedicated connection that
        never queues behind the shared writer thread.
     2. Every date(created_at) = date('now') replaced with a
-       created_at >= ? AND created_at < ? range against UTC day
-       boundaries computed in Python, so the planner can do an actual
+       created_at >= ? AND created_at < ? range against LOCAL-day
+       boundaries (as UTC strings) computed in Python, so the planner can do an actual
        index range SEARCH (idx_events_created, idx_alerts_created,
        idx_sessions_started -- the latter two added alongside this fix).
     3. 13 round-trips consolidated into 6 queries via conditional
@@ -642,10 +648,10 @@ async def get_stats():
 
     db = await get_read_db()
     try:
-        now = datetime.now(timezone.utc)
-        today_start = now.strftime("%Y-%m-%d 00:00:00")
-        tomorrow_start = (now + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
-        yesterday_start = (now - timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+        # "Today" is the machine's local calendar day, the same day the daily
+        # report uses (core/local_day.py), converted to the stored UTC strings.
+        today_start, tomorrow_start = local_day_window(0)
+        yesterday_start, _ = local_day_window(1)
 
         cur = await db.execute("SELECT COUNT(*) c FROM agents WHERE approved = 1")
         active_agents = (await cur.fetchone())["c"]
@@ -706,8 +712,6 @@ async def get_stats():
         cur = await db.execute(
             """
             SELECT
-                SUM(CASE WHEN status = 'open' AND created_at >= ? AND created_at < ?
-                    THEN 1 ELSE 0 END) AS alerts_open_yesterday,
                 SUM(CASE WHEN created_at >= ? AND created_at < ? THEN 1 ELSE 0 END) AS alerts_today,
                 SUM(CASE WHEN created_at >= ? AND created_at < ? AND rule_type != 'checkpoint_activity'
                     THEN 1 ELSE 0 END) AS meaningful_alerts_today
@@ -715,14 +719,21 @@ async def get_stats():
             WHERE created_at >= ?
             """,
             (
-                yesterday_start, today_start,
                 today_start, tomorrow_start,
                 today_start, tomorrow_start,
                 yesterday_start,
             ),
         )
         alerts_row = await cur.fetchone()
-        alerts_open_yesterday = alerts_row["alerts_open_yesterday"] or 0
+        # Open at the end of yesterday: created before local midnight and not
+        # resolved before it (still open now, or resolved at/after midnight).
+        # A closed alert with no resolved_at cannot be placed in time and is
+        # not counted.
+        cur = await db.execute(
+            "SELECT COUNT(*) c FROM alerts WHERE created_at < ? AND (status = 'open' OR resolved_at >= ?)",
+            (today_start, today_start),
+        )
+        alerts_open_yesterday = (await cur.fetchone())["c"]
         alerts_today = alerts_row["alerts_today"] or 0
         meaningful_alerts_today = alerts_row["meaningful_alerts_today"] or 0
 
@@ -801,6 +812,9 @@ async def health():
         "network_monitoring": network_monitoring(),
         "mcp_monitoring": mcp_monitoring(),
     }
+
+
+_state["health_fn"] = health
 
 
 @app.get("/insights")
