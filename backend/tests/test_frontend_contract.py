@@ -72,7 +72,8 @@ def test_export_uses_a_calendar_input_with_quick_choices_and_local_day_note():
 
 def test_no_new_frontend_dependencies():
     package = json.loads((ROOT / "frontend" / "package.json").read_text(encoding="utf-8"))
-    assert set(package["dependencies"]) == {"react", "react-dom"}
+    # fonts only: bundled, open licence, no runtime fetch (see test_no_external_loads.py)
+    assert set(package["dependencies"]) == {"react", "react-dom", "@fontsource/inter", "@fontsource/jetbrains-mono"}
     assert set(package["devDependencies"]) == {"@vitejs/plugin-react", "vite"}
 
 

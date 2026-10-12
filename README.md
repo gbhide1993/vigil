@@ -46,6 +46,15 @@ Not active in this version:
 
 See [docs/COVERAGE.md](docs/COVERAGE.md) for what Vigil does and does not see.
 
+## What Vigil contacts over the network
+
+Nothing, by default. The backend listens on localhost only, the interface and its fonts are served
+from your own machine, and there is no update check, telemetry upload or license server call.
+
+The one exception is the daily summary webhook (Slack, Teams or any webhook URL). It is off until you
+save a URL in Settings; then Vigil sends the daily summary text to exactly that URL. Leave the URL empty
+and nothing is sent. The full list is in `docs/COVERAGE.md` ("Network contact").
+
 ## Requirements
 
 - Windows 10 or 11

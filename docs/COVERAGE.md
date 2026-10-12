@@ -97,3 +97,17 @@ Rules that read "read" in their alert text (RL2, RL6) describe file-read events 
 | Nothing for reachable credentials | What the agent's account could reach but did not use | Permission inventory (`docs/design/reachable-set-inventory.md`) |
 
 "Planned" means a design or a documented prerequisite exists. It is not a delivery date and none of it is active.
+
+## 6. Network contact
+
+What the shipped app (backend, tray and web interface) contacts over the network:
+
+- **By default: nothing.** The web interface, its scripts, styles and fonts (Inter and JetBrains Mono, bundled and
+  licensed in `frontend/THIRD_PARTY_LICENSES.md`) are served from the local backend. The tray and the interface
+  only talk to `localhost:7422`. There is no update check, no telemetry upload and no license server call (the
+  license is verified offline). Usage events are appended to a local file (`~/.vigil/usage.jsonl`) and never sent.
+- **Only if you save a webhook URL in Settings:** the backend POSTs the daily summary text (summary sentence, clean-day
+  and agent counts) to that URL, at 9:00 each day and when you press the test button. With no URL saved, nothing is
+  sent. `VLAW_CORE_ONLY=1` disables this feature entirely.
+- A test (`backend/tests/test_no_external_loads.py`) fails if the interface source or the built interface loads
+  any script, style, font or image from outside the machine.
