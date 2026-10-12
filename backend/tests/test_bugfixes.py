@@ -879,7 +879,11 @@ async def test_export_folds_no_activity_sessions_pdf_and_json(test_db):
     agent_name = _uniq("claude_code_noactivitytest")
     agent_id = await _make_agent(test_db, agent_name)
 
-    real_session_id = _uniq("sess")
+    # The PDF prints only the first 8 characters of a session id. _uniq("sess") has just 3 random
+    # characters in those 8 ("sess_" + 3 hex), so with the 30 or more sessions other tests leave in the
+    # shared database, an unrelated session can print the same 8 characters (1 in ~4000 per session).
+    # Real session ids are uuids: use the first 8 hex digits (4 billion values) as the marker.
+    real_session_id = str(uuid.uuid4())
     await test_db.execute(
         "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         (real_session_id, agent_id),
@@ -889,7 +893,7 @@ async def test_export_folds_no_activity_sessions_pdf_and_json(test_db):
         (agent_id, real_session_id),
     )
 
-    empty_session_id = _uniq("sess")
+    empty_session_id = str(uuid.uuid4())
     await test_db.execute(
         "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         (empty_session_id, agent_id),
@@ -932,8 +936,8 @@ async def test_export_folds_no_activity_sessions_pdf_and_json(test_db):
     assert summary_match is not None and int(summary_match.group(1)) >= 1
     assert f"agent={agent_name}" in joined
     assert "events=1" in joined
-    # the empty session's own id must never appear as an individually
-    # listed line
+    # the real session is listed individually by its id prefix; the empty one's must never appear
+    assert real_session_id[:8] in joined
     assert empty_session_id[:8] not in joined
 
 
