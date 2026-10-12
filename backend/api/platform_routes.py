@@ -81,8 +81,8 @@ async def debug_runtime():
 
     # Scheduler jobs
     try:
-        import main as _main
-        scheduler = _main._state.get("scheduler")
+        from core.runtime_state import state as _runtime_state
+        scheduler = _runtime_state.get("scheduler")
         jobs = [
             {
                 "id": job.id,
@@ -96,8 +96,8 @@ async def debug_runtime():
 
     # Aggregator queue depth
     try:
-        import main as _main
-        aggregator = _main._state.get("aggregator")
+        from core.runtime_state import state as _runtime_state
+        aggregator = _runtime_state.get("aggregator")
         queue_depth = aggregator._write_queue.qsize() if aggregator else -1
     except Exception:
         queue_depth = -1

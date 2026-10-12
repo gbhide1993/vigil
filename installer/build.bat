@@ -1,13 +1,21 @@
 @echo off
+setlocal
+cd /d "%~dp0"
 echo Building Vigil installer...
 
-echo Step 0: Cleaning build folders...
-rmdir /S /Q build\tray 2>nul
-rmdir /S /Q build\backend 2>nul
-rmdir /S /Q build\frontend 2>nul
+echo Step 0: Checking that the installer, tray and backend versions agree...
+node check-version.js
+if errorlevel 1 goto error
+for /f "delims=" %%V in ('node check-version.js --print') do set APP_VERSION=%%V
+
+echo Step 0b: Cleaning build folders...
+for %%D in (tray backend frontend assets policy) do (
+    if exist build\%%D rmdir /S /Q build\%%D
+)
 mkdir build\tray
 mkdir build\backend
 mkdir build\frontend
+mkdir build\assets
 
 echo Step 1: Building backend exe...
 cd ..\backend
@@ -30,40 +38,24 @@ echo Removed legacy V-LAW.exe
 echo Step 3: Copying artifacts to installer/build...
 cd ..\installer
 xcopy /E /Y /I ..\tray\dist\win-unpacked\* build\tray\
+if errorlevel 1 goto error
 copy /Y ..\backend\dist\vlaw-backend.exe build\backend\vigil-backend.exe
+if errorlevel 1 goto error
 xcopy /E /Y /I ..\tray\assets\* build\assets\
+if errorlevel 1 goto error
 xcopy /E /Y /I ..\frontend\dist\* build\frontend\
+if errorlevel 1 goto error
 
 echo Step 4: Compiling installer...
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" vigil-setup.iss
 if errorlevel 1 goto error
 
-echo Step 5: Generating manifest.json...
-for /f "delims=" %%V in ('node -e "console.log(require('../tray/package.json').version)"') do set APP_VERSION=%%V
+echo Step 5: Writing SHA256 of the installer...
+powershell -NoProfile -Command "$f='output\Vigil-Setup-%APP_VERSION%.exe'; $h=(Get-FileHash $f -Algorithm SHA256).Hash; Set-Content -Path ($f + '.sha256') -Value ($h + '  ' + (Split-Path $f -Leaf)) -Encoding ASCII; Write-Host $h"
+if errorlevel 1 goto error
 
-for /f "tokens=1-3 delims=/ " %%a in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd"') do set RELEASE_DATE=%%a
-
-for /f "skip=1 tokens=1" %%H in ('certutil -hashfile output\Vigil-Setup.exe SHA256 ^| findstr /v "hash"') do (
-    if not defined FILE_SHA256 set FILE_SHA256=%%H
-)
-
-for %%F in (output\Vigil-Setup.exe) do set FILE_BYTES=%%~zF
-set /a FILE_MB=%FILE_BYTES% / 1048576
-
-(
-echo {
-echo   "version": "%APP_VERSION%",
-echo   "released": "%RELEASE_DATE%",
-echo   "win_x64": {
-echo     "url": "https://download.getvvault.com/Vigil-Setup.exe",
-echo     "sha256": "%FILE_SHA256%",
-echo     "size_mb": %FILE_MB%
-echo   }
-echo }
-) > output\manifest.json
-
-echo Done. Installer at installer\output\Vigil-Setup.exe
-echo Manifest at installer\output\manifest.json
+echo Done. Installer at installer\output\Vigil-Setup-%APP_VERSION%.exe
+echo SHA256 at installer\output\Vigil-Setup-%APP_VERSION%.exe.sha256
 goto end
 
 :error

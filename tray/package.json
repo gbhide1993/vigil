@@ -1,6 +1,6 @@
 {
   "name": "vigil-tray",
-  "version": "0.2.10",
+  "version": "0.9.0",
   "description": "Vigil system tray app",
   "private": true,
   "main": "main.js",
@@ -24,6 +24,7 @@
     },
     "files": [
       "main.js",
+      "status-text.js",
       "preload.js",
       "flyout.html",
       "flyout.css",

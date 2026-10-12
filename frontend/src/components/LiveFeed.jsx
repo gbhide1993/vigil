@@ -47,7 +47,9 @@ function FeedRow({ event }) {
   return (
     <div className={`feed-row ${severityClass}`}>
       <span className="feed-time">{formatTime(event.created_at)}</span>
-      <span className="agent-pill">{event.agent_name || '—'}</span>
+      <span className="agent-pill" title={event.attribution_label || undefined}>
+        {event.agent_name || '—'}{event.attribution === 'best_guess' ? ' (best guess)' : ''}
+      </span>
       <TypeBadge type={event.event_type} />
       <span className="feed-path" title={path}>
         {showGlobe && <GlobeIcon />}
@@ -66,7 +68,7 @@ function WelcomeState() {
       <div className="panel-body" style={{ padding: '56px 24px', textAlign: 'center' }}>
         <div style={{ fontSize: 32, fontWeight: 700, color: 'var(--color-teal)', marginBottom: 12 }}>V</div>
         <div style={{ fontSize: 18, fontWeight: 600, color: 'var(--color-navy)', marginBottom: 16 }}>
-          V-LAW is active and watching.
+          Vigil is active and watching.
         </div>
         <div style={{ fontSize: 13, color: 'var(--color-navy-muted)', marginBottom: 24 }}>
           Start your AI agent (Claude Code, Cursor, or Copilot)
@@ -74,13 +76,11 @@ function WelcomeState() {
           and return here. Your first session will appear automatically.
         </div>
         <div style={{ fontSize: 12.5, color: 'var(--color-navy-muted)', lineHeight: 2 }}>
-          <div>● File activity</div>
-          <div>● Network connections</div>
+          <div>● File changes</div>
           <div>● Process spawns</div>
-          <div>● MCP tool calls</div>
         </div>
         <div style={{ fontSize: 12, color: 'var(--color-navy-muted)', marginTop: 24 }}>
-          All monitored. Zero data leaves this machine.
+          Zero data leaves this machine.
         </div>
       </div>
     </div>
@@ -95,7 +95,7 @@ function FirstSessionCard({ session, topFinding, onDismiss }) {
   let text
   if (kind === 'red_line') {
     borderColor = 'var(--color-red)'
-    text = `First session complete. ${session.agent_name} accessed ${session.file_reads + session.file_writes} files and made ${session.net_connect_count} network connections. 1 RED LINE alert caught.`
+    text = `First session complete. ${session.agent_name} accessed ${session.file_reads + session.file_writes} files${session.net_connect_count > 0 ? ` and made ${session.net_connect_count} network connections` : ''}. 1 RED LINE alert caught.`
   } else if (kind === 'anomaly') {
     borderColor = 'var(--color-amber)'
     text = `First session complete. ${session.agent_name} accessed ${session.file_reads + session.file_writes} files. ${alert.title}`
@@ -103,7 +103,7 @@ function FirstSessionCard({ session, topFinding, onDismiss }) {
     borderColor = 'var(--color-amber)'
     text = `First session complete. ${session.agent_name} accessed ${session.file_reads + session.file_writes} files. ${session.alert_count} alert${session.alert_count !== 1 ? 's' : ''} raised.`
   } else {
-    text = `First session complete. ${session.agent_name} ran clean — no alerts, ${session.file_reads + session.file_writes} files accessed. V-LAW is working.`
+    text = `First session complete. ${session.agent_name} ran clean — no alerts, ${session.file_reads + session.file_writes} files accessed. Vigil is working.`
   }
 
   return (
@@ -145,7 +145,7 @@ function ProofOfValueCard({ proofOfValue, configAudit, showConfigDetail, onToggl
       <div className="pov-stats">
         {proofOfValue.agents_watched} agent{proofOfValue.agents_watched !== 1 ? 's' : ''} watched
         {' '}· {proofOfValue.files_monitored_7d} files monitored
-        {' '}· {proofOfValue.network_destinations_verified_7d} destinations verified
+        {networkMonitoring === 'on' && ` · ${proofOfValue.network_destinations_verified_7d} destinations verified`}
       </div>
       <div className="pov-config" onClick={onToggleConfigDetail}>
         Config: {proofOfValue.config_audit_summary}
@@ -196,6 +196,8 @@ export default function LiveFeed() {
   const [events, setEvents] = useState([])
   const [error, setError] = useState(null)
   const [baselineActive, setBaselineActive] = useState(true)
+  // 'on' | 'off' | null (not loaded yet); read from /health, which reports the watcher's real state.
+  const [networkMonitoring, setNetworkMonitoring] = useState(null)
   const [insights, setInsights] = useState([])
   const [sessions, setSessions] = useState(null)
   const [firstSessionCard, setFirstSessionCard] = useState(null)
@@ -220,6 +222,7 @@ export default function LiveFeed() {
         setStats(statsData)
         setEvents(eventsData.events)
         setBaselineActive(healthData.baseline_active)
+        setNetworkMonitoring(healthData.network_monitoring ?? null)
         setSessions(sessionsData.sessions)
         setProofOfValue(proofOfValueData)
         setError(null)
@@ -310,11 +313,11 @@ export default function LiveFeed() {
       <div className="page-header">
         <div>
           <div className="page-title">Live Feed</div>
-          <div className="page-subtitle">Real-time agent activity on this machine</div>
+          <div className="page-subtitle">Agent activity on this machine</div>
         </div>
       </div>
 
-      {error && <div className="empty-state">Could not reach V-LAW backend: {error}</div>}
+      {error && <div className="empty-state">Could not reach Vigil backend: {error}</div>}
 
       {firstSessionCard && (
         <FirstSessionCard
@@ -370,8 +373,8 @@ export default function LiveFeed() {
         />
         <StatCard
           label="Net Egress (MB)"
-          value={stats?.net_egress_mb_today ?? '—'}
-          valueClassName={stats ? (stats.net_egress_mb_today > 0 ? 'bad-high' : 'good') : ''}
+          value={networkMonitoring === 'off' ? 'off' : (stats?.net_egress_mb_today ?? '—')}
+          valueClassName={stats && networkMonitoring === 'on' ? (stats.net_egress_mb_today > 0 ? 'bad-high' : 'good') : ''}
           today={stats?.net_egress_mb_today}
           yesterday={stats?.net_egress_mb_yesterday}
           formatDelta={(d) => `${Math.abs(d).toFixed(2)} MB`}
@@ -408,7 +411,11 @@ export default function LiveFeed() {
           <div className="panel-header">Network Egress</div>
           <div className="panel-body">
             {netEvents.length === 0 ? (
-              <div className="empty-state">No network activity yet.</div>
+              <div className="empty-state">
+                {networkMonitoring === 'off'
+                  ? 'Network monitoring is off in this version.'
+                  : 'No network connections recorded.'}
+              </div>
             ) : (
               <table>
                 <thead>
@@ -422,7 +429,7 @@ export default function LiveFeed() {
                   {netEvents.map((e) => (
                     <tr key={e.id}>
                       <td>{formatTime(e.created_at)}</td>
-                      <td>{e.agent_name}</td>
+                      <td title={e.attribution_label || undefined}>{e.agent_name}{e.attribution === 'best_guess' ? ' (best guess)' : ''}</td>
                       <td className="mono-truncate" title={e.path}>
                         {isRawIp(e.path) && <GlobeIcon />} {e.path}
                       </td>
@@ -452,7 +459,7 @@ export default function LiveFeed() {
                   {credEvents.map((e) => (
                     <tr key={e.id}>
                       <td>{formatTime(e.created_at)}</td>
-                      <td>{e.agent_name}</td>
+                      <td title={e.attribution_label || undefined}>{e.agent_name}{e.attribution === 'best_guess' ? ' (best guess)' : ''}</td>
                       <td className="mono-truncate" title={e.path}>{e.path}</td>
                     </tr>
                   ))}

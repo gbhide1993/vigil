@@ -1,37 +1,61 @@
+import os
+
 from core.red_lines import SESSION_LAUNCH_DIR
 from main import build_watch_paths
 
 
-def test_flat_credential_pattern_still_watches_session_launch_dir():
-    """credential_paths=['.env'] has no directory component and would
-    otherwise be silently dropped by the endswith('/'|'\\\\')/startswith('~')
-    filter, leaving nothing watching the project root for a .env edit."""
-    policy = {"scope_directories": [], "credential_paths": [".env"]}
+def _norm(p: str) -> str:
+    return os.path.normcase(os.path.abspath(os.path.expanduser(p))).replace("\\", "/")
+
+
+def test_backend_launch_directory_is_never_watched():
+    """The installed backend's working directory is Vigil's own install
+    folder, not the user's project, so it must not be watched in any
+    configuration (including flat credential patterns like '.env')."""
+    for policy in (
+        {"scope_directories": [], "credential_paths": [".env"]},
+        {"scope_directories": [], "credential_paths": [".ssh", ".aws"]},
+        {"scope_directories": [], "credential_paths": []},
+        {},
+    ):
+        watch_paths, non_recursive = build_watch_paths(policy)
+        launch = _norm(str(SESSION_LAUNCH_DIR))
+        assert launch not in [_norm(p) for p in watch_paths]
+        assert launch not in [_norm(p) for p in non_recursive]
+        assert non_recursive == []
+
+
+def test_hard_coded_ssh_and_claude_cache_watches_remain():
+    watch_paths, _ = build_watch_paths({"scope_directories": [], "credential_paths": []})
+    normalised = [_norm(p) for p in watch_paths]
+    assert _norm("~/.ssh/") in normalised
+    assert _norm("~/.claude/file-history/") in normalised
+    assert len(watch_paths) == 2
+
+
+def test_scope_directories_are_watched_once_each():
+    policy = {"scope_directories": ["/some/project", "/other/project"], "credential_paths": [".env"]}
     watch_paths, _ = build_watch_paths(policy)
-    assert str(SESSION_LAUNCH_DIR) in watch_paths
+    assert watch_paths.count("/some/project") == 1
+    assert watch_paths.count("/other/project") == 1
 
 
-def test_scope_directories_included_when_credential_paths_flat():
-    policy = {"scope_directories": ["/some/project"], "credential_paths": [".env"]}
-    watch_paths, _ = build_watch_paths(policy)
-    assert "/some/project" in watch_paths
-
-
-def test_no_credential_paths_does_not_add_session_launch_dir_twice():
-    """When credential_paths is empty, the flat-pattern fallback must not
-    fire — SESSION_LAUNCH_DIR should only appear via the existing
-    red_line_non_recursive_dirs path, not injected into watch_paths."""
-    policy = {"scope_directories": [], "credential_paths": []}
-    watch_paths, red_line_non_recursive_dirs = build_watch_paths(policy)
-    assert str(SESSION_LAUNCH_DIR) not in watch_paths
-    assert str(SESSION_LAUNCH_DIR) in red_line_non_recursive_dirs
+def test_project_config_folders_are_covered_by_each_scope_directory():
+    """.claude / .cursor / .vscode (and a root .mcp.json) live under a scope
+    directory, so the recursive watch of that directory covers them. They
+    are not scheduled again (a second watch would double every event), and
+    nothing outside the scope directories is added for them."""
+    scope = os.path.abspath("some_project_dir")
+    watch_paths, _ = build_watch_paths({"scope_directories": [scope], "credential_paths": []})
+    roots = [_norm(p) for p in watch_paths]
+    for config_dir in (".claude", ".cursor", ".vscode"):
+        target = _norm(os.path.join(scope, config_dir))
+        assert any(target == root or target.startswith(root + "/") for root in roots)
+    assert not any(_norm(os.path.join(scope, c)) in roots for c in (".claude", ".cursor", ".vscode"))
 
 
 def test_directory_style_credential_paths_still_watched_directly():
-    """Existing behavior for a directory-shaped credential_paths entry
-    (e.g. '~/.ssh/') must be unaffected by the flat-pattern fix. Expansion
-    of '~' happens later in file_watcher._schedule_paths, not here, so the
-    raw policy string is what should appear in watch_paths."""
-    policy = {"scope_directories": [], "credential_paths": ["~/.ssh/"]}
-    watch_paths, _ = build_watch_paths(policy)
-    assert "~/.ssh/" in watch_paths
+    """A directory-shaped credential_paths entry (e.g. '~/.aws/') is still
+    watched; '~' is expanded later in file_watcher._schedule_paths."""
+    watch_paths, _ = build_watch_paths({"scope_directories": [], "credential_paths": ["~/.aws/"]})
+    assert "~/.aws/" in watch_paths

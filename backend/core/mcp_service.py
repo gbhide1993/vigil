@@ -295,6 +295,14 @@ async def _derive_friction_findings(db, session_id: str | None = None) -> list[d
     # a 10-minute window. Capped to the most recent 100 events per session
     # (unbounded scan of the whole events table was the dominant cost in
     # get_friction_findings/get_evidence_summary timing out under load).
+    #
+    # Vigil's own footprint is excluded here so installing, debugging, or
+    # rebuilding Vigil itself doesn't get flagged as agent friction: our
+    # own backend repeatedly spawning (vigil-backend.exe) and our own tray
+    # repeatedly touching its own Electron install tree are not an agent
+    # retry loop. This is a path/process match only, not a blanket
+    # cmd.exe/conhost.exe exclusion -- a real agent legitimately spawning
+    # those is still exactly the kind of thing this finding should catch.
     row_limit = "100" if session_id else "2000"
     cur = await db.execute(
         f"""
@@ -302,6 +310,13 @@ async def _derive_friction_findings(db, session_id: str | None = None) -> list[d
             SELECT session_id, event_type, created_at, path
             FROM events
             WHERE session_id IS NOT NULL {session_clause}
+              AND (path IS NULL OR (
+                    path NOT LIKE '%vigil-backend.exe%'
+                    AND path NOT LIKE '%\\Vigil\\tray\\Vigil.exe%'
+                    AND path NOT LIKE '%\\Vigil\\backend\\%'
+                    AND path NOT LIKE '%\\Vigil\\tray\\%'
+                    AND path NOT LIKE '%\\V-LAW\\%'
+              ))
             ORDER BY created_at DESC
             LIMIT {row_limit}
         )

@@ -1,20 +1,29 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
+import DateField, { dayProblem, localIsoDate } from './DateField'
 
 function formatReportDate(dateStr, generatedAt) {
-  const d = dateStr === 'today' && generatedAt ? new Date(generatedAt) : new Date(dateStr)
+  // A bare YYYY-MM-DD is a local calendar day: parse it as local midnight, not UTC midnight.
+  const d = dateStr === 'today' && generatedAt ? new Date(generatedAt) : new Date(`${dateStr}T00:00:00`)
   if (Number.isNaN(d.getTime())) return dateStr
   return d.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })
 }
 
 export default function Export() {
-  const [date, setDate] = useState('today')
+  const [date, setDate] = useState(() => localIsoDate())
   const [preview, setPreview] = useState(null)
   const [error, setError] = useState(null)
   const [showRawJson, setShowRawJson] = useState(false)
 
+  const problem = dayProblem(date)
+
   useEffect(() => {
     let cancelled = false
+    if (problem) {
+      setPreview(null)
+      setError(null)
+      return undefined
+    }
     async function load() {
       try {
         const res = await fetch(api.exportJsonUrl(date))
@@ -32,7 +41,7 @@ export default function Export() {
     return () => {
       cancelled = true
     }
-  }, [date])
+  }, [date, problem])
 
   const agentCount = preview ? new Set(preview.sessions.map((s) => s.agent_id)).size : null
   const alertCount = preview ? preview.alerts.length : null
@@ -47,22 +56,14 @@ export default function Export() {
         </div>
       </div>
 
-      <div className="field" style={{ maxWidth: 240, marginBottom: 20 }}>
-        <label>Date</label>
-        <input
-          type="text"
-          value={date}
-          onChange={(e) => setDate(e.target.value)}
-          placeholder="today or YYYY-MM-DD"
-        />
-      </div>
+      <DateField value={date} onChange={setDate} />
 
       {error && <div className="empty-state">Could not load report: {error}</div>}
 
-      {!error && (
+      {!error && !problem && (
         <div className="report-summary-card">
           <div className="report-summary-title">
-            {date === 'today' ? "Today's Report" : 'Report'} — {preview ? formatReportDate(date, preview.generated_at) : '…'}
+            {date === localIsoDate() ? "Today's Report" : 'Report'} — {preview ? formatReportDate(date, preview.generated_at) : '…'}
           </div>
           {preview ? (
             <div className="report-summary-stats">
@@ -79,14 +80,28 @@ export default function Export() {
         <div className="export-card">
           <h3>Audit PDF</h3>
           <p>Formatted report of sessions and alerts for the selected date — suitable for compliance review.</p>
-          <a className="btn primary" href={api.exportPdfUrl(date)} download>
+          <a
+            className={`btn primary ${problem ? 'disabled' : ''}`}
+            href={problem ? undefined : api.exportPdfUrl(date)}
+            aria-disabled={Boolean(problem)}
+            download
+          >
             Download PDF
           </a>
         </div>
         <div className="export-card">
           <h3>SIEM JSON</h3>
           <p>Structured session and alert data for ingestion into your SIEM or log pipeline.</p>
-          <a className="btn primary" href={api.exportJsonUrl(date)} download={`vlaw-export-${date}.json`}>
+          {/* preview.date is the backend-resolved real calendar date (never the
+              literal string "today"), once the fetch for the current date input
+              has completed. Falls back to the raw date input only for the brief
+              window before that first fetch resolves. */}
+          <a
+            className={`btn primary ${problem ? 'disabled' : ''}`}
+            href={problem ? undefined : api.exportJsonUrl(date)}
+            aria-disabled={Boolean(problem)}
+            download={`vigil-export-${preview ? preview.date : date}.json`}
+          >
             Download JSON
           </a>
         </div>

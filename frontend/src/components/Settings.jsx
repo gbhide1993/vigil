@@ -234,6 +234,109 @@ function AnalyticsSection() {
   )
 }
 
+function WatchedFoldersSection() {
+  const [folders, setFolders] = useState([])
+  const [tier, setTier] = useState(null)
+  const [path, setPath] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+  const [message, setMessage] = useState(null)
+
+  async function load() {
+    try {
+      const data = await api.getScope()
+      setFolders(data.folders)
+      setTier(data.file_watcher_tier)
+    } catch {
+      // non-fatal; section just stays as it was
+    }
+  }
+
+  useEffect(() => {
+    load()
+  }, [])
+
+  async function handleAdd() {
+    setBusy(true)
+    setError(null)
+    setMessage(null)
+    try {
+      const result = await api.addScopeFolder(path.trim())
+      setFolders(result.folders)
+      setPath('')
+      setMessage(
+        result.applied_live
+          ? 'Folder added and now being watched.'
+          : (result.message || 'Saved. Restart Vigil to start watching this folder.')
+      )
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function handleRemove(folderPath) {
+    setBusy(true)
+    setError(null)
+    setMessage(null)
+    try {
+      const result = await api.removeScopeFolder(folderPath)
+      setFolders(result.folders)
+      setMessage(
+        result.applied_live
+          ? 'Folder removed. It is no longer watched.'
+          : (result.message || 'Saved. Restart Vigil to stop watching this folder.')
+      )
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="settings-section">
+      <h3>Watched folders</h3>
+      <p className="settings-desc">
+        Vigil records file changes only in the folders listed here, in your .ssh folder, and in Claude's checkpoint
+        cache. For each change it records the file name and folder path, the kind of change (created, changed, moved
+        or deleted), the time, and which agent made it. It does not read, copy or store file contents, and it does not
+        record files being read. Changes in other folders are not recorded.
+      </p>
+      {tier === 'etw' && (
+        <p className="settings-desc">Kernel file tracing is active, so changes made by recognised agents are recorded anywhere on this computer.</p>
+      )}
+      {folders.length === 0 && (
+        <div className="empty-state">No project folders are watched yet. Add one below.</div>
+      )}
+      {folders.map((folder) => (
+        <div className="settings-agent-row" key={folder.path}>
+          <span className="agent-name mono">{folder.path}</span>
+          <button className="btn ghost" disabled={busy} onClick={() => handleRemove(folder.path)}>
+            Remove
+          </button>
+        </div>
+      ))}
+      <div className="settings-input-row">
+        <input
+          className="settings-input"
+          type="text"
+          placeholder="Full path of a project folder, for example C:\Users\you\projects\app"
+          value={path}
+          onChange={(e) => setPath(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && path.trim() && !busy) handleAdd() }}
+        />
+        <button className="btn-settings-save" disabled={busy || !path.trim()} onClick={handleAdd}>
+          Add folder
+        </button>
+      </div>
+      {error && <div className="empty-state">{error}</div>}
+      {message && <p className="settings-desc">{message}</p>}
+    </div>
+  )
+}
+
 export default function Settings() {
   return (
     <div className="settings-page">
@@ -245,6 +348,7 @@ export default function Settings() {
       </div>
 
       <AgentsSection />
+      <WatchedFoldersSection />
       <WebhookSection />
       <ConfigAuditSection />
       <AnalyticsSection />

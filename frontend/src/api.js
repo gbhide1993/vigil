@@ -1,21 +1,47 @@
 const BASE = '/api'
+// App.jsx's stats poll runs every 3s and uses failures here to decide
+// whether to show the "Backend not responding" banner -- without a
+// timeout, a hung request (backend wedged but the TCP connection still
+// open) never rejects, so inFlight never clears and polling stalls
+// forever instead of ever reporting a failure.
+const REQUEST_TIMEOUT_MS = 10000
 
 async function request(path, options = {}) {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  })
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error(body.detail || `Request failed: ${res.status}`)
+  const { signal: callerSignal, ...fetchOptions } = options
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  // A caller-supplied signal (the History search cancels a request when the next
+  // keystroke arrives) aborts the same controller the timeout uses.
+  if (callerSignal) {
+    if (callerSignal.aborted) controller.abort()
+    else callerSignal.addEventListener('abort', () => controller.abort(), { once: true })
   }
-  return res.json()
+  try {
+    const res = await fetch(`${BASE}${path}`, {
+      headers: { 'Content-Type': 'application/json' },
+      ...fetchOptions,
+      signal: controller.signal,
+    })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.detail || `Request failed: ${res.status}`)
+    }
+    return await res.json()
+  } finally {
+    clearTimeout(timeoutId)
+  }
 }
 
 export const api = {
-  getEvents: (params = {}) => {
+  getEvents: (params = {}, signal) => {
     const qs = new URLSearchParams(params).toString()
-    return request(`/events${qs ? `?${qs}` : ''}`)
+    return request(`/events${qs ? `?${qs}` : ''}`, { signal })
+  },
+  // History search: matches a session id prefix (any case) or text in agent, type,
+  // path or detail. The reply has total, sessions and session_count besides events.
+  searchEvents: (q, { limit = 100, offset = 0 } = {}, signal) => {
+    const qs = new URLSearchParams({ q, limit, offset }).toString()
+    return request(`/events?${qs}`, { signal })
   },
   getAgents: () => request('/agents'),
   getAgentSessions: (agentId) => request(`/agents/${agentId}/sessions`),
@@ -35,11 +61,17 @@ export const api = {
     request(`/alerts/${alertId}/resolve`, { method: 'POST', body: JSON.stringify(body) }),
   bulkDismissAlerts: (severity) =>
     request(`/alerts/bulk-dismiss?severity=${severity}`, { method: 'POST' }),
+  // dryRun=true only counts; nothing is changed. Red-line alerts are skipped unless includeRedLine.
+  resolveOlderAlerts: (days, { dryRun, includeRedLine }) =>
+    request(`/alerts/resolve-older?days=${days}&dry_run=${dryRun}&include_red_line=${includeRedLine}`, { method: 'POST' }),
   getSessionEvents: (sessionId, agentId) => {
     const qs = new URLSearchParams({ session: sessionId, agent: agentId, limit: 2000 }).toString()
     return request(`/events?${qs}`)
   },
   getStats: () => request('/stats'),
+  getScope: () => request('/scope'),
+  addScopeFolder: (path) => request('/scope', { method: 'POST', body: JSON.stringify({ path }) }),
+  removeScopeFolder: (path) => request('/scope', { method: 'DELETE', body: JSON.stringify({ path }) }),
   getHealth: () => request('/health'),
   getInsights: () => request('/insights'),
   getProofOfValue: () => request('/digest/proof-of-value'),
@@ -49,6 +81,7 @@ export const api = {
   sendTestWebhook: () => request('/digest/send-webhook', { method: 'POST' }),
   exportJsonUrl: (date) => `${BASE}/export/json?date=${date}`,
   exportPdfUrl: (date) => `${BASE}/export/pdf?date=${date}`,
+  sessionReportUrl: (sessionId) => `${BASE}/sessions/${encodeURIComponent(sessionId)}/report`,
   getAnalyticsSummary: () => request('/analytics/summary'),
   getEvidence: () => request('/evidence'),
   getEvidenceIncidents: () => request('/incidents'),

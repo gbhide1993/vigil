@@ -44,6 +44,9 @@ from core.correlation_engine import CorrelationEngine
 from core.evidence import AttributionChain, AttributionConfidence, VigilEvidence
 from core.evidence_store import evidence_store
 from core.feature_flags import CORE_ONLY
+from core import watch_stats
+from core.ignore_rules import ignore_and_count
+from core.own_paths import is_own_path
 from core.red_lines import RedLines, is_agent_config_path, is_mcp_config_path, register_agent_workspace
 from db.database import get_db
 from watchers.etw_file_watcher import ETWFileWatcher
@@ -65,6 +68,17 @@ EVENT_TYPE_MAP = {
     "moved": "file_write",
     "deleted": "file_delete",
 }
+
+# Upper bound on raw file events handed to the event loop and not yet handled
+# (watchdog threads submit one coroutine per raw event). Beyond this, new raw
+# events are dropped and counted (core/watch_stats.py, stated in the report)
+# instead of queueing without limit. Ignored folders never reach this point.
+MAX_PENDING_FILE_DISPATCH = 2000
+
+# watchdog's raw event names -> the change type stored with the event
+# (EVENT_TYPE_MAP above folds created / modified / moved into "file_write",
+# so without this the create / write / move distinction would be lost).
+CHANGE_MAP = {"created": "create", "modified": "write", "moved": "move", "deleted": "delete"}
 
 # _refine_pid_by_open_handle's psutil.Process.open_files() calls run in a
 # disposable subprocess (watchers/_open_handle_worker.py), not in this
@@ -161,21 +175,34 @@ class _AgentPidCache:
     shutdown (there's nowhere clean to hang that off the watchdog Observer/
     PollingObserver/ETWFileWatcher objects start_file_watcher returns,
     and letting it run for up to one more refresh cycle during shutdown is
-    harmless)."""
+    harmless).
 
-    # This class's own docstring above already documents the cost: a full
-    # refresh (psutil.process_iter() + get_named_agent_for_pid per process)
-    # measured 50-100ms per process, "15-20+ seconds for a full scan" on a
-    # real desktop (~375 processes). At the old 3s interval this thread was
-    # therefore doing another multi-second scan almost as soon as the
-    # previous one finished -- effectively always busy, not periodically
-    # refreshing -- which py-spy confirmed as a sustained-CPU contributor
-    # (thread caught mid-scan on every sample taken). 30s gives the scan
-    # comfortable headroom to actually finish with idle time in between,
-    # cutting this thread's busy fraction roughly in half to two-thirds,
-    # at the cost of the real-time-tier cache being up to 30s (not 3s)
-    # stale in the worst case -- the same order of staleness already
-    # accepted elsewhere (ProcessWatcher's own poll interval is 30s).
+    UPDATE: the 50-100ms/process, 15-20+ second figures below described
+    _refresh() calling get_named_agent_for_pid with no pid_snapshot, which
+    falls back to opening a fresh psutil.Process(pid) handle per
+    parent-chain level for every process on the machine -- confirmed via
+    py-spy as the sustained ~0.96-core/GIL-starvation source, stalling
+    /api/health for 3s and /api/sessions for 16s on first call. _refresh()
+    now builds one pid_snapshot per call and resolves every PID from it
+    (_walk_parent_chain_from_snapshot, zero further psutil calls) -- see
+    its own docstring for current numbers. REFRESH_INTERVAL_SECONDS left
+    at 30 for now; the busy-fraction reasoning below no longer applies at
+    the new per-refresh cost, but changing the interval is a separate
+    decision, not made here."""
+
+    # Historical cost model this interval was originally chosen against
+    # (no longer accurate for _refresh() specifically -- see UPDATE above):
+    # a full refresh (psutil.process_iter() + get_named_agent_for_pid per
+    # process) measured 50-100ms per process, "15-20+ seconds for a full
+    # scan" on a real desktop (~375 processes). At the old 3s interval this
+    # thread was therefore doing another multi-second scan almost as soon
+    # as the previous one finished -- effectively always busy, not
+    # periodically refreshing -- which py-spy confirmed as a sustained-CPU
+    # contributor (thread caught mid-scan on every sample taken). 30s gave
+    # the scan comfortable headroom to actually finish with idle time in
+    # between, at the cost of the real-time-tier cache being up to 30s
+    # (not 3s) stale in the worst case -- the same order of staleness
+    # already accepted elsewhere (ProcessWatcher's own poll interval is 30s).
     REFRESH_INTERVAL_SECONDS = 30
 
     def __init__(self, attributor: Attributor):
@@ -197,17 +224,38 @@ class _AgentPidCache:
             self._refresh()
 
     def _refresh(self) -> None:
+        """Builds one {pid: {"name", "ppid"}} snapshot from a single
+        psutil.process_iter() pass, then resolves every PID's attribution
+        from that in-memory dict via Attributor._walk_parent_chain_from_snapshot
+        (zero further psutil calls) -- same pattern ProcessWatcher already
+        uses for _gather_spawn_info's get_agent_for_pid calls. Previously
+        this called get_named_agent_for_pid with no pid_snapshot, which falls
+        back to _walk_parent_chain's per-level psutil.Process(pid).parent()
+        path: one fresh OS process handle open per parent-chain level, for
+        every process on the machine, every refresh. py-spy confirmed this
+        thread as the sustained-CPU/GIL-starvation source (see
+        get_agent_for_pid's docstring for why the snapshot path exists)."""
         try:
+            pid_snapshot: dict[int, dict] = {}
+            for proc in psutil.process_iter(["pid", "name", "ppid"]):
+                pid = proc.info.get("pid")
+                if pid is None:
+                    continue
+                pid_snapshot[pid] = {
+                    "name": proc.info.get("name") or "",
+                    "ppid": proc.info.get("ppid") or 0,
+                }
+
             fresh = {}
-            for proc in psutil.process_iter(["pid", "name"]):
+            for pid in pid_snapshot:
                 # get_named_agent_for_pid, not get_agent_for_pid: this loop
                 # runs against every process on the machine, and
                 # get_agent_for_pid's behavioural fallback (a synchronous DB
                 # round trip) would run for every one of them that isn't a
                 # name-matched known agent -- see its docstring.
-                agent = self.attributor.get_named_agent_for_pid(proc.info["pid"])
+                agent = self.attributor.get_named_agent_for_pid(pid, pid_snapshot=pid_snapshot)
                 if agent:
-                    fresh[proc.info["pid"]] = agent
+                    fresh[pid] = agent
             self._map = fresh
         except Exception:
             logger.exception("agent pid cache refresh failed, keeping previous snapshot")
@@ -231,10 +279,13 @@ async def _find_owning_agent_pid(pid_cache: _AgentPidCache, path: str | None = N
     down to exactly one (including on a subprocess timeout/failure -- see
     _refine_pid_by_open_handle), we still pick the first match but flag
     confidence as "low" so it's auditable rather than silently presented
-    as certain."""
+    as certain.
+
+    Confidence is never "high" for this (native / polling observer) tier; see
+    the comment where it is chosen below."""
     agent_map = pid_cache.snapshot()
     if not agent_map:
-        return None, "high"
+        return None, "low"      # no agent running: the caller drops the event
 
     matches = list(agent_map.keys())
     seen_agents = set(agent_map.values())
@@ -242,9 +293,13 @@ async def _find_owning_agent_pid(pid_cache: _AgentPidCache, path: str | None = N
     if path is not None and len(matches) > 1:
         refined = await _refine_pid_by_open_handle(matches, path)
         if refined is not None:
-            return refined, "high"
+            return refined, "medium"
 
-    confidence = "low" if len(seen_agents) > 1 else "high"
+    # Never "high" here: this tier does not know which process wrote the
+    # file, only which agents were running. "low" = more than one agent was
+    # running; "medium" = one agent was running, but the writer was not
+    # verified (a change you made yourself looks the same).
+    confidence = "low" if len(seen_agents) > 1 else "medium"
     return matches[0], confidence
 
 
@@ -416,6 +471,9 @@ class VlawFileHandler(FileSystemEventHandler):
         self.network_watcher = network_watcher
         self._burst_detector = BurstDetector()
         self._correlation_engine = CorrelationEngine()
+        # Raw events submitted to the loop and not yet handled; see MAX_PENDING_FILE_DISPATCH.
+        self._pending_dispatch = 0
+        self._pending_lock = threading.Lock()
 
     def on_any_event(self, event):
         """Tiers 2/3 entry point — native Observer and PollingObserver both
@@ -425,13 +483,29 @@ class VlawFileHandler(FileSystemEventHandler):
 
         event_type = EVENT_TYPE_MAP.get(event.event_type, "file_read")
         path = event.dest_path if getattr(event, "dest_path", "") else event.src_path
+        if is_own_path(path):
+            return   # Vigil's own install / data folder: never an agent's activity
+        if ignore_and_count(path):
+            return   # generated / dependency folder: dropped before any other work (core/ignore_rules.py)
+        with self._pending_lock:
+            over_limit = self._pending_dispatch >= MAX_PENDING_FILE_DISPATCH
+            if not over_limit:
+                self._pending_dispatch += 1
+        if over_limit:
+            watch_stats.add_dropped("overload")
+            return
 
         future = asyncio.run_coroutine_threadsafe(
-            self._handle_polled_event(path, event_type), self.loop
+            self._handle_polled_event(path, event_type, CHANGE_MAP.get(event.event_type)), self.loop
         )
-        future.add_done_callback(lambda f: _log_dispatch_exception(f, path))
+        future.add_done_callback(lambda f: self._dispatch_done(f, path))
 
-    async def _handle_polled_event(self, path: str, event_type: str) -> None:
+    def _dispatch_done(self, future, path: str) -> None:
+        with self._pending_lock:
+            self._pending_dispatch -= 1
+        _log_dispatch_exception(future, path)
+
+    async def _handle_polled_event(self, path: str, event_type: str, change: str | None = None) -> None:
         # _find_owning_agent_pid itself is now just a cache read (see
         # _AgentPidCache) plus, for tier 2, a possible subprocess call for
         # open-handle refinement -- see _refine_pid_by_open_handle and
@@ -440,14 +514,14 @@ class VlawFileHandler(FileSystemEventHandler):
         guess_path = path if self.use_pid_heuristic else None
         pid, confidence = await _find_owning_agent_pid(self.pid_cache, guess_path)
         event_source = "realtime_heuristic" if self.use_pid_heuristic else "poll"
-        await self.handle_file_event(path, event_type, event_source, pid, confidence, time.time())
+        await self.handle_file_event(path, event_type, event_source, pid, confidence, time.time(), change=change)
 
-    async def handle_etw_event(self, pid: int, path: str, event_type: str, timestamp: float) -> None:
+    async def handle_etw_event(self, pid: int, path: str, event_type: str, timestamp: float, change: str | None = None) -> None:
         """Tier 1 entry point — registered as ETWFileWatcher's callback.
         pid is already exact and already filtered to a known/suspected
         agent (see etw_file_watcher.ETWFileWatcher._process_event), so this
         skips the _find_owning_agent_pid guess entirely."""
-        await self.handle_file_event(path, event_type, "etw", pid, "high", timestamp)
+        await self.handle_file_event(path, event_type, "etw", pid, "high", timestamp, change=change)
 
     async def handle_file_event(
         self,
@@ -457,7 +531,19 @@ class VlawFileHandler(FileSystemEventHandler):
         pid: int | None,
         confidence: str,
         timestamp: float | None = None,
+        change: str | None = None,
     ) -> None:
+        # Safety filter for every tier (native, polling and ETW): changes
+        # inside Vigil's own install folder or data folder (its database,
+        # logs, updates) are never recorded, however the watch list was
+        # configured.
+        if is_own_path(path):
+            return
+        # Safety net for callers that did not filter earlier (the ETW tier
+        # filters before attribution; the watchdog tiers in on_any_event).
+        if ignore_and_count(path):
+            return
+
         # Recorded regardless of whether this specific event resolves to a
         # known agent below — burst+correlation (check_burst) is a second,
         # independent attribution path meant to catch activity the
@@ -487,6 +573,7 @@ class VlawFileHandler(FileSystemEventHandler):
             "path": path,
             "event_type": event_type,
             "attribution_confidence": confidence,
+            "change": change,
             "pid": pid,
             "event_source": event_source,
             "timestamp": timestamp if timestamp is not None else time.time(),
@@ -621,11 +708,66 @@ class VlawFileHandler(FileSystemEventHandler):
         return row["c"] if row else 0
 
 
+def _watch_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(os.path.expanduser(path))).replace("\\", "/").rstrip("/")
+
+
+def _watch_registry(observer) -> dict:
+    """{normalised path: watchdog ObservedWatch} for every recursive watch
+    scheduled on this observer, kept on the observer itself so a watch can
+    be removed later (Observer.unschedule needs the watch object)."""
+    registry = getattr(observer, "_vlaw_watches", None)
+    if registry is None:
+        registry = {}
+        observer._vlaw_watches = registry
+    return registry
+
+
+def watched_paths(observer) -> list[str]:
+    """The folders this observer is recursively watching right now (what the
+    live scope API reports as `observed_paths`). Empty for an observer
+    without a folder list (the ETW tier)."""
+    registry = getattr(observer, "_vlaw_watches", None) or {}
+    return sorted(getattr(w, "path", key) for key, w in registry.items())
+
+
+def watch_folder(observer, handler, path: str) -> bool:
+    """Starts watching `path` (recursively) on the RUNNING observer, with no
+    restart. Returns True if it is now watched. False when there is nothing
+    to schedule on (the ETW tier has no folder list: it already sees every
+    change made by a recognised agent anywhere) or the folder is gone."""
+    if not hasattr(observer, "schedule"):
+        return False
+    expanded = os.path.expanduser(path)
+    if not os.path.isdir(expanded):
+        return False
+    registry = _watch_registry(observer)
+    key = _watch_key(expanded)
+    if key in registry:
+        return True
+    registry[key] = observer.schedule(handler, expanded, recursive=True)
+    return True
+
+
+def unwatch_folder(observer, path: str) -> bool:
+    """Stops watching `path`. True if a watch was removed."""
+    if not hasattr(observer, "unschedule"):
+        return False
+    watch = _watch_registry(observer).pop(_watch_key(path), None)
+    if watch is None:
+        return False
+    observer.unschedule(watch)
+    return True
+
+
 def _schedule_paths(observer, handler: VlawFileHandler, watch_paths: list[str], non_recursive_paths: list[str] | None) -> None:
     for path in watch_paths:
         expanded = os.path.expanduser(path)
         if os.path.isdir(expanded):
-            observer.schedule(handler, expanded, recursive=True)
+            registry = _watch_registry(observer)
+            key = _watch_key(expanded)
+            if key not in registry:    # never schedule the same folder twice (duplicate events)
+                registry[key] = observer.schedule(handler, expanded, recursive=True)
 
     for path in non_recursive_paths or []:
         expanded = os.path.expanduser(path)

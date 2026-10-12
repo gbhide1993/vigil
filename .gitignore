@@ -80,3 +80,8 @@ test_vigil.py
 test_buffer.txt
 test_file_watch.txt
 backend/test_write.txt
+backend/.vlaw-trial-started
+installer/build/
+vigil-plugin.zip
+
+.claude/

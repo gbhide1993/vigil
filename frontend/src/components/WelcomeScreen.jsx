@@ -1,14 +1,13 @@
 const WATCH_ITEMS = [
-  { icon: '📁', label: 'Files your agents read and write' },
-  { icon: '🌐', label: 'Network connections they open' },
+  { icon: '📁', label: 'Files your agents create, change and delete' },
   { icon: '⚙️', label: 'Processes they spawn' },
-  { icon: '🔑', label: 'Credential files they access' },
+  { icon: '🔑', label: 'Changes to credential files' },
 ]
 
 export default function WelcomeScreen() {
   return (
     <div className="welcome-screen">
-      <div className="welcome-brand">V-LAW</div>
+      <div className="welcome-brand">Vigil</div>
       <div className="welcome-headline">
         Vigil is now watching your AI agents. Start a Claude Code or Cursor session to see activity here.
       </div>

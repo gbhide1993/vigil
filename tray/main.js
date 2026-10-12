@@ -1,8 +1,9 @@
-const { app, Tray, Menu, BrowserWindow, ipcMain, screen, shell, Notification } = require('electron')
+const { app, Tray, Menu, BrowserWindow, ipcMain, screen, shell, Notification, dialog } = require('electron')
 const path = require('path')
 const fs = require('fs')
 const http = require('http')
 const cron = require('node-cron')
+const { trayStatusText } = require('./status-text')
 const { spawn, execFile } = require('child_process')
 
 // Only one tray instance may run at a time — otherwise a second launch
@@ -31,6 +32,8 @@ app.on('second-instance', () => {
 
 const BACKEND_URL = 'http://localhost:7422'
 const WEB_UI_URL = 'http://localhost:7422'
+const BACKEND_PORT = 7422
+const BACKEND_PROCESS_NAME = 'vigil-backend'
 const POLL_INTERVAL_MS = 4000
 const TOOLTIP_POLL_INTERVAL_MS = 60000
 
@@ -53,6 +56,18 @@ let waitingForBackend = false
 const MAX_BACKEND_FAILURES = 3
 const BACKEND_STABLE_MS = 10000
 
+// Both set true only around a kill WE initiated (quit, or killBackendAndWait()
+// itself). Without these, the backendProcess 'exit' handler sees the nonzero
+// exit code from our own taskkill and treats it as a crash: handleBackendCrash()
+// schedules a 3s-delayed respawn. If the quit sequence (which spawns
+// powershell several times for the port checks) takes longer than that 3s,
+// the timer fires, a new backend starts, and then before-quit's app.exit(0)
+// runs anyway -- leaving that new backend orphaned with its parent already
+// gone. Confirmed live: a new vigil-backend appeared at the moment the tray
+// was quit.
+let quitInProgress = false
+let intentionalBackendKill = false
+
 function getBackendPath() {
   if (app.isPackaged) {
     // Installer layout: app\tray\Vigil.exe and app\backend\vigil-backend.exe
@@ -65,6 +80,11 @@ function getBackendPath() {
 }
 
 function spawnBackend() {
+  if (quitInProgress) {
+    console.log('Quit in progress, not spawning a new backend')
+    return
+  }
+
   if (backendProcess && !backendProcess.killed) {
     console.log(`Backend already running (PID ${backendProcess.pid}), skipping duplicate spawn`)
     return
@@ -101,27 +121,110 @@ function spawnBackend() {
   backendProcess.on('exit', (code) => {
     console.log(`Backend exited with code ${code}`)
     backendProcess = null
+    if (intentionalBackendKill || quitInProgress) {
+      // A kill we initiated ourselves (taskkill /F during quit or a
+      // manual restart) always exits with a nonzero code -- that is not
+      // a crash, and must not trigger a respawn here.
+      return
+    }
     if (code !== 0 && code !== null) {
       handleBackendCrash()
     }
   })
 }
 
-function killBackendProcess() {
-  if (!backendProcess) return
-  const pid = backendProcess.pid
-  // Plain ChildProcess.kill() is unreliable against the packaged
-  // console-mode PyInstaller exe on Windows — it can leave the process
-  // running. taskkill /F /T forcibly kills it and its child tree.
-  if (process.platform === 'win32' && pid) {
-    execFile('taskkill', ['/pid', String(pid), '/T', '/F'], () => {})
-  } else {
-    backendProcess.kill()
+function execFileAsync(file, args) {
+  return new Promise((resolve) => {
+    execFile(file, args, { windowsHide: true }, (err, stdout) => {
+      resolve({ err, stdout: stdout || '' })
+    })
+  })
+}
+
+async function isPortListening(port) {
+  const { err, stdout } = await execFileAsync('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-Command',
+    `[bool](Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue)`,
+  ])
+  return !err && stdout.trim().toLowerCase() === 'true'
+}
+
+// Resolves whoever currently owns the port and kills it ONLY if its
+// process name matches ours. This is the fallback path, used when the PID
+// the tray itself tracked is gone or was never set -- it must never kill
+// by name alone (an unrelated process could share that name), so it always
+// checks the actual port owner first and matches the name on that specific
+// PID before touching it.
+async function killPortOwnerIfOurs(port, expectedProcessName) {
+  const script =
+    `$c = Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; ` +
+    `if (-not $c) { Write-Output 'NOPORT'; exit }; ` +
+    `$p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; ` +
+    `if (-not $p) { Write-Output 'NOPROC'; exit }; ` +
+    `if ($p.ProcessName -eq '${expectedProcessName}') { Stop-Process -Id $p.Id -Force; Write-Output "KILLED:$($p.Id)" } ` +
+    `else { Write-Output "SKIP:$($p.Id):$($p.ProcessName)" }`
+  const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script])
+  return stdout.trim()
+}
+
+async function waitUntilPortFree(port, timeoutMs) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (!(await isPortListening(port))) return true
+    await new Promise((r) => setTimeout(r, 300))
   }
-  backendProcess = null
+  return !(await isPortListening(port))
+}
+
+const QUIT_KILL_TIMEOUT_MS = 5000
+
+// Kills the backend and WAITS for it to actually be gone before resolving.
+// Plain ChildProcess.kill() is unreliable against the packaged console-mode
+// PyInstaller exe on Windows -- it can leave the process running, which is
+// why this already used taskkill /T /F. The bug was that the previous
+// version fired taskkill with an empty callback and returned immediately,
+// so nothing here, or in the before-quit handler that called it, ever
+// waited for the kill to finish -- Electron's own quit sequence could (and
+// did) tear down the whole app process before taskkill had actually killed
+// the tree, or before it had even been spawned.
+//
+// taskkill /T matches a child by its process's recorded parent PID, which
+// breaks if the PyInstaller bootloader we spawned has already exited and
+// the inner process that owns the actual listener got orphaned before
+// taskkill ran, or if backendProcess was never set (e.g. we adopted an
+// already-running backend at startup rather than spawning it ourselves).
+// The port-owner fallback below covers that case independently of whether
+// the primary tree-kill found anything.
+async function killBackendAndWait() {
+  intentionalBackendKill = true
+
+  if (backendProcess && backendProcess.pid) {
+    const pid = backendProcess.pid
+    console.log(`Killing backend process tree (PID ${pid})...`)
+    await execFileAsync('taskkill', ['/pid', String(pid), '/T', '/F'])
+    backendProcess = null
+  }
+
+  if (await isPortListening(BACKEND_PORT)) {
+    const result = await killPortOwnerIfOurs(BACKEND_PORT, BACKEND_PROCESS_NAME)
+    console.log(`Port-owner fallback kill on port ${BACKEND_PORT}: ${result}`)
+  }
+
+  const exited = await waitUntilPortFree(BACKEND_PORT, QUIT_KILL_TIMEOUT_MS)
+  if (!exited) {
+    console.error(`Backend still listening on port ${BACKEND_PORT} after ${QUIT_KILL_TIMEOUT_MS}ms, proceeding anyway`)
+  }
+  return exited
 }
 
 function handleBackendCrash() {
+  if (quitInProgress || intentionalBackendKill) {
+    // Belt and suspenders alongside the 'exit' handler's own check above --
+    // handleBackendCrash() is also called directly from the spawn 'error'
+    // handler, not only from 'exit', so it needs this guard independently.
+    return
+  }
+
   backendReady = false
   if (backendStableTimer) {
     clearTimeout(backendStableTimer)
@@ -136,6 +239,13 @@ function handleBackendCrash() {
   }
 
   setTimeout(() => {
+    // Re-check: a quit (or a manual restart's kill) can start after this
+    // timer was scheduled but before it fires -- the 3s delay is exactly
+    // the gap the live orphan bug fell into.
+    if (quitInProgress || intentionalBackendKill) {
+      console.log('Quit or intentional kill in progress, skipping scheduled respawn')
+      return
+    }
     console.log('Retrying backend spawn...')
     spawnBackend()
     waitForBackend()
@@ -326,36 +436,20 @@ function formatMB(bytes) {
 async function updateTrayTooltip() {
   if (!backendReady || !tray) return
   try {
-    // Neither endpoint supports a server-side `limit` — /sessions is already
-    // ordered newest-first, so slicing client-side after the fetch gives the
-    // same "most recent" result the spec asks for.
-    const [sessionsRes, openAlertsRes] = await Promise.all([
-      httpRequest('GET', '/sessions?limit=1'),
-      httpRequest('GET', '/alerts?status=open&limit=1'),
+    // The alert count comes from /api/stats's needs_review (open, severity high or critical),
+    // the same definition the Status page and the Incidents sidebar badge use.
+    const [agentsRes, statsRes] = await Promise.all([
+      httpRequest('GET', '/api/agents'),
+      httpRequest('GET', '/api/stats'),
     ])
 
-    const sessions = ((sessionsRes.body && sessionsRes.body.sessions) || []).slice(0, 1)
-    const openAlerts = (openAlertsRes.body && openAlertsRes.body.alerts) || []
-
-    if (sessions.length === 0) {
-      tray.setToolTip('Vigil — Watching. No sessions recorded yet.')
-      return
-    }
-
-    if (openAlerts.length > 0) {
-      tray.setToolTip(`Vigil — ${openAlerts.length} alert${openAlerts.length !== 1 ? 's' : ''} need review.`)
-      return
-    }
-
-    const lastSession = sessions[0]
-    if (lastSession.ended_at == null) {
-      tray.setToolTip(`Vigil — Live: ${lastSession.agent_name || 'agent'} session in progress`)
-      return
-    }
-
-    const files = (lastSession.file_reads || 0) + (lastSession.file_writes || 0)
-    const mb = formatMB(lastSession.net_egress_bytes || 0)
-    tray.setToolTip(`Vigil — Last session clean. ${files} files, ${mb} MB egress.`)
+    // What the words mean is decided by the backend (core/agent_activity.py): "active" is real
+    // activity in the last 5 minutes, "open (idle)" is a process that exists with nothing going
+    // on. An open session on its own no longer says "Live".
+    tray.setToolTip(trayStatusText({
+      agents: (agentsRes.body && agentsRes.body.agents) || [],
+      needsReview: (statsRes.body && statsRes.body.needs_review) || 0,
+    }))
   } catch (err) {
     // non-fatal — tooltip just keeps its last known text until this succeeds again
   }
@@ -364,7 +458,7 @@ async function updateTrayTooltip() {
 async function pollAlerts() {
   if (!backendReady) return
   try {
-    const { status, body } = await httpRequest('GET', '/alerts?status=open')
+    const { status, body } = await httpRequest('GET', '/api/alerts?status=open')
     if (status !== 200 || !body) {
       throw new Error(`unexpected response status ${status}`)
     }
@@ -458,7 +552,7 @@ function formatDigestBody(body) {
 
 async function triggerDigestNow() {
   try {
-    const { status, body } = await httpRequest('GET', '/digest/daily')
+    const { status, body } = await httpRequest('GET', '/api/digest/daily')
     if (status !== 200 || !body) {
       console.error('digest fetch failed:', status)
       return
@@ -479,7 +573,7 @@ async function triggerDigestNow() {
   // Fire-and-forget: a webhook failure (unconfigured, unreachable, bad
   // URL) must never affect the toast above, which has already shown by
   // the time this runs.
-  httpRequest('POST', '/digest/send-webhook')
+  httpRequest('POST', '/api/digest/send-webhook')
     .then(({ body }) => {
       if (body && body.sent) {
         console.log('Morning digest sent to webhook')
@@ -500,7 +594,9 @@ function setTrayIcon(iconName, fallbackTooltip) {
   if (!backendReady) tray.setToolTip(fallbackTooltip)
 }
 
-const APP_VERSION = '0.2.0-beta'
+// The version in package.json: the installer, the tray and the backend (/api/health) all carry
+// the same number, and installer/check-version.js stops the build when they differ.
+const APP_VERSION = app.getVersion()
 
 function setTrayIdle() {
   setTrayIcon('icon_green.png', `Vigil v${APP_VERSION} — All clear`)
@@ -612,6 +708,49 @@ function toggleFlyout() {
   })
 }
 
+// Asks the local backend for a support bundle (api/support.py) and saves it where the user
+// chooses. Nothing is uploaded: the zip goes from the loopback backend to a file on this PC.
+async function saveSupportLogs() {
+  const fail = (detail) => dialog.showMessageBox({
+    type: 'error', title: 'Save support logs', message: 'Vigil could not save the support logs.', detail,
+  })
+  try {
+    let contents
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/support/contents`, { signal: AbortSignal.timeout(5000) })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      contents = await res.json()
+    } catch (err) {
+      await fail(`Vigil's backend did not answer (${err.message}). Start Vigil and try again.`)
+      return
+    }
+    const detail = [
+      'Included:', ...contents.included.map((line) => `  - ${line}`),
+      '', 'Not included:', ...contents.excluded.map((line) => `  - ${line}`),
+      '', 'Nothing is uploaded. You choose where the file is saved.',
+      'The log file can still contain file paths and agent names, so look through it before you send it.',
+    ].join('\n')
+    const choice = await dialog.showMessageBox({
+      type: 'info', title: 'Save support logs', message: 'Save a support bundle (zip)?', detail,
+      buttons: ['Choose where to save...', 'Cancel'], defaultId: 0, cancelId: 1,
+    })
+    if (choice.response !== 0) return
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')
+    const target = await dialog.showSaveDialog({
+      title: 'Save support logs',
+      defaultPath: path.join(app.getPath('desktop'), `vigil-support-${APP_VERSION}-${stamp}.zip`),
+      filters: [{ name: 'Zip file', extensions: ['zip'] }],
+    })
+    if (target.canceled || !target.filePath) return
+    const res = await fetch(`${BACKEND_URL}/api/support/bundle`, { method: 'POST', signal: AbortSignal.timeout(30000) })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    fs.writeFileSync(target.filePath, Buffer.from(await res.arrayBuffer()))
+    shell.showItemInFolder(target.filePath)
+  } catch (err) {
+    await fail(err.message)
+  }
+}
+
 function createTray() {
   tray = new Tray(path.join(__dirname, 'assets', 'icon_green.png'))
   tray.setToolTip('Vigil: idle')
@@ -628,8 +767,7 @@ function createTray() {
       { type: 'separator' },
       {
         label: 'Restart Backend',
-        click: () => {
-          killBackendProcess()
+        click: async () => {
           if (pollTimer) clearInterval(pollTimer)
           if (tooltipPollTimer) clearInterval(tooltipPollTimer)
           if (backendStableTimer) {
@@ -640,12 +778,17 @@ function createTray() {
           backendFailCount = 0
           setTrayWarning()
           tray.setToolTip('Vigil — Restarting backend...')
-          setTimeout(() => {
-            spawnBackend()
-            waitForBackend()
-          }, 1000)
+          await killBackendAndWait()
+          // Clear the flag before spawning again so a real crash of this
+          // freshly restarted backend is still treated as a crash, not
+          // silently ignored because of the kill that just preceded it.
+          intentionalBackendKill = false
+          spawnBackend()
+          waitForBackend()
         },
       },
+      { type: 'separator' },
+      { label: 'Save support logs...', click: () => saveSupportLogs() },
       { type: 'separator' },
     ]
     if (!app.isPackaged) {
@@ -661,7 +804,7 @@ function createTray() {
 ipcMain.handle('send-action', async (_event, { type, alertId, agentId }) => {
   try {
     if (type === 'resolve') {
-      const { status, body } = await httpRequest('POST', `/alerts/${alertId}/resolve`, {
+      const { status, body } = await httpRequest('POST', `/api/alerts/${alertId}/resolve`, {
         action: 'dismiss',
       })
       const ok = status >= 200 && status < 300
@@ -672,7 +815,7 @@ ipcMain.handle('send-action', async (_event, { type, alertId, agentId }) => {
       return { ok, status, body }
     }
     if (type === 'block') {
-      const { status, body } = await httpRequest('POST', `/agents/${agentId}/block`)
+      const { status, body } = await httpRequest('POST', `/api/agents/${agentId}/block`)
       const ok = status >= 200 && status < 300
       if (ok) {
         currentAlert = null
@@ -694,8 +837,19 @@ ipcMain.on('hide-flyout', () => {
   if (flyout && !flyout.isDestroyed()) flyout.hide()
 })
 
-app.whenReady().then(() => {
-  app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true })
+async function isBackendAlreadyHealthy() {
+  try {
+    const res = await fetch(`${BACKEND_URL}/health`, { signal: AbortSignal.timeout(1000) })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+app.whenReady().then(async () => {
+  // Starting at sign-in is the installer's "Start Vigil when I sign in" task (it writes the per-user
+  // Run entry electron.app.Vigil, the same entry setLoginItemSettings would). The tray no longer
+  // re-creates that entry on every start, so a user who declined it stays declined.
   if (app.dock) app.dock.hide()
 
   createTray()
@@ -705,8 +859,17 @@ app.whenReady().then(() => {
   setTrayWarning()
   tray.setToolTip('Vigil — Starting...')
 
-  // Spawn backend, then wait for health, then start polling
-  spawnBackend()
+  // A previous tray crash (or a Stop-Process on the tray exe) can leave a
+  // perfectly healthy backend running with no tray left to own it. Without
+  // this check, startup would spawn a second backend that fails to bind
+  // the already-taken port and shows "Backend offline" next to a working
+  // one. backendProcess stays null here (same as dev mode) since this
+  // tray instance didn't start it -- quit will not try to kill it.
+  if (await isBackendAlreadyHealthy()) {
+    console.log('Healthy backend already on port 7422, not spawned by this tray -- adopting it')
+  } else {
+    spawnBackend()
+  }
   waitForBackend() // starts pollAlerts() internally once healthy
 
   cron.schedule('0 9 * * *', () => {
@@ -719,11 +882,28 @@ app.on('window-all-closed', (e) => {
   e.preventDefault()
 })
 
-app.on('before-quit', () => {
+// before-quit only REQUESTS a shutdown -- if the handler returns without
+// calling event.preventDefault(), Electron carries on with its own quit
+// sequence and tears down the process regardless of whether any async
+// work started in this handler (like killBackendAndWait()'s taskkill and
+// port-owner checks) has actually finished. That race was the root cause
+// of the orphaned vigil-backend processes: the handler fired taskkill and
+// returned immediately, so the app could (and did) exit before the kill
+// completed, or in the worst case before it had even been spawned.
+//
+// The fix is the standard Electron pattern for this: block the quit with
+// preventDefault(), do the async cleanup, then call app.exit() -- a hard,
+// immediate exit that does not re-emit before-quit -- once cleanup is
+// done or the timeout in killBackendAndWait() gives up.
+app.on('before-quit', (e) => {
+  if (quitInProgress) return
+  quitInProgress = true
+  e.preventDefault()
+
   if (pollTimer) clearInterval(pollTimer)
   if (tooltipPollTimer) clearInterval(tooltipPollTimer)
-  if (backendProcess) {
-    console.log('Killing backend process before quit...')
-    killBackendProcess()
-  }
+
+  killBackendAndWait().finally(() => {
+    app.exit(0)
+  })
 })

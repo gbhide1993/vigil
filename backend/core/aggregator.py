@@ -28,6 +28,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from core import watch_stats
 from core.alerter import Alerter
 from core.evidence_store import evidence_store
 from db.database import get_db, get_read_db, replace_db, DB_PATH
@@ -60,8 +61,23 @@ class ConnectionWedgedError(Exception):
     like any other failed write."""
 
 
+# Public CA certificate bundles that package managers write into dependency
+# folders. They match ".pem" but hold no secret, so inside these folders they
+# are ordinary generated files. A key.pem there, or any .pem elsewhere, is not
+# covered.
+PUBLIC_CA_BUNDLE_NAMES = frozenset({"cacert.pem", "ca-bundle.crt", "ca-certificates.crt"})
+PUBLIC_CA_BUNDLE_FOLDERS = frozenset({"site-packages", "node_modules", "certifi"})
+
+
+def _is_public_ca_bundle(path: str) -> bool:
+    parts = path.lower().replace("\\", "/").split("/")
+    return parts[-1] in PUBLIC_CA_BUNDLE_NAMES and any(p in PUBLIC_CA_BUNDLE_FOLDERS for p in parts[:-1])
+
+
 def _is_credential_path(path: str) -> bool:
     lowered = path.lower()
+    if _is_public_ca_bundle(path) and not any(p in lowered for p in (".env", ".ssh", ".aws")):
+        return False
     return any(pattern in lowered for pattern in CREDENTIAL_PATTERNS)
 
 
@@ -423,7 +439,7 @@ class Aggregator:
                 "session_id": event["session_id"],
                 "event_type": event["event_type"],
                 "path": path,
-                "detail": {"attribution_confidence": confidence},
+                "detail": {"attribution_confidence": confidence, "change": event.get("change")},
                 "severity": "low",
                 "pid": event.get("pid"),
                 "event_source": event_source,
@@ -490,6 +506,7 @@ class Aggregator:
         async with self._buffer_lock:
             if len(self.file_event_buffer) >= FILE_EVENT_BUFFER_MAX:
                 dropped = self.file_event_buffer.pop(0)
+                watch_stats.add_dropped("buffer_full")
                 logger.warning(
                     "file_event_buffer full (%d events) -- dropping oldest buffered event "
                     "(path=%s) to make room",
@@ -727,14 +744,42 @@ class Aggregator:
         single writer queue instead of through it, and a slow checkpoint
         can never block Aggregator/ProcessWatcher/VlawFileHandler writes
         that share that queue. Best-effort: any failure here is logged and
-        swallowed, never raised into flush_buffers."""
+        swallowed, never raised into flush_buffers.
+
+        PRAGMA wal_checkpoint(PASSIVE) returns a single row of
+        (busy, log, checkpointed): `busy` is 1 if something else held the
+        WAL and blocked a full checkpoint, `log` is the WAL's total frame
+        count, `checkpointed` is how many of those frames this call
+        actually checkpointed. Until now that row was never fetched --
+        `await conn.execute(...)` alone discards it -- so there was no way
+        to tell a checkpoint that ran but did nothing (busy=1,
+        checkpointed < log, under write contention -- the original WAL-
+        growth theory) apart from one that genuinely had nothing to do
+        (log==0). Logging that row, plus the actual .db-wal file size on
+        disk, turns "checkpoint took 0.46s" from a duration with no
+        meaning into a verifiable catch-up/falling-behind signal."""
         start = time.monotonic()
         try:
             conn = await aiosqlite.connect(DB_PATH)
             try:
-                await conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                cur = await conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                row = await cur.fetchone()
+                busy, log_frames, checkpointed_frames = row if row else (None, None, None)
             finally:
                 await conn.close()
+
+            wal_path = Path(f"{DB_PATH}-wal")
+            try:
+                wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+            except OSError:
+                wal_bytes = None
+
+            logger.info(
+                "[TIMING] checkpoint result: busy=%s log_frames=%s checkpointed_frames=%s "
+                "wal_bytes=%s wal_mb=%s",
+                busy, log_frames, checkpointed_frames, wal_bytes,
+                round(wal_bytes / (1024 * 1024), 2) if wal_bytes is not None else None,
+            )
         except Exception:
             logger.exception("aggregator: dedicated-connection WAL checkpoint failed")
         finally:
@@ -848,6 +893,7 @@ class Aggregator:
                     json.dumps({
                         "event_type": event["event_type"],
                         "attribution_confidence": event.get("attribution_confidence", "high"),
+                        "change": event.get("change"),
                     }),
                     pid,
                     event_source,
@@ -894,6 +940,7 @@ class Aggregator:
                     path,
                     json.dumps({
                         "attribution_confidence": event.get("attribution_confidence", "high"),
+                        "change": event.get("change"),
                     }),
                     event["pid"],
                     event["event_source"],

@@ -10,11 +10,14 @@ import sys
 import time
 from pathlib import Path
 
+from core.agent_wrappers import unwrap_agent_command
 from core.alerter import Alerter
 from core.attributor import KNOWN_AGENTS, Attributor
 from core.feature_flags import CORE_ONLY
 from core.red_lines import RedLines
-from db.database import get_db
+from core.redaction import redact_cmdline
+from db.database import get_db, get_read_db
+from watchers._process_scan_worker import _filter_env
 
 logger = logging.getLogger("vlaw")
 
@@ -43,6 +46,16 @@ _SCAN_TIMEOUT_SECONDS = 18
 # cadence. This is a last-resort backstop for a genuinely wedged write,
 # not a normal-case bound.
 _POLL_WRITE_TIMEOUT_SECONDS = 90
+
+# Bounds how many newly-observed (this cycle) PIDs get their cmdline
+# fetched in one cycle -- see _snapshot_pids. Normally a handful of new
+# PIDs appear per 30s poll; the one case that can be large is the first
+# poll after a restart (self._known_pids starts empty, so every already-
+# running PID on the box looks "new" at once). Capped so that cold-start
+# case can't turn into fetching cmdline for every process on the machine
+# in one subprocess call; the scan itself still has its own
+# _SCAN_TIMEOUT_SECONDS regardless of how many PIDs are requested.
+_NEW_PID_CMDLINE_FETCH_CAP = 50
 
 # Pre-filter gate applied before any expensive per-process psutil call
 # (environ()/cmdline() — on Windows these hold the GIL for the duration of
@@ -109,8 +122,46 @@ def _is_suspicious(cmdline: str, exe_basename: str) -> bool:
     exe = re.sub(r"\.(exe|bin)$", "", exe_basename.lower())
     if exe in SUSPICIOUS_EXE_PATTERNS:
         return True
-    lowered = cmdline.lower()
+    # Judge the command the agent asked for, not Claude Code's shell wrapper
+    # around it (core/agent_wrappers.py).
+    unwrapped = unwrap_agent_command(cmdline)
+    lowered = (unwrapped.inner if unwrapped is not None else cmdline).lower()
     return any(pattern in lowered for pattern in SUSPICIOUS_INLINE_PATTERNS)
+
+
+# A process is identified by (pid, creation time). Two creation times this close are the same
+# process (the Windows and psutil sources can differ by a second).
+PROC_START_TOLERANCE_SECONDS = 2
+
+
+def _epoch(created_at: str | None) -> float:
+    """Stored naive-UTC 'YYYY-MM-DD HH:MM:SS' as epoch seconds (0 if unreadable)."""
+    try:
+        from datetime import datetime, timezone
+
+        return datetime.fromisoformat(created_at.replace(" ", "T")).replace(tzinfo=timezone.utc).timestamp()
+    except (AttributeError, ValueError):
+        return 0.0
+
+
+def already_recorded(rows: list[tuple[dict, str]], started: int) -> bool:
+    """True when one of the stored proc_spawn rows for this pid is this same process.
+
+    rows: (detail dict, created_at) of the pid's earlier rows. A row written by this
+    version carries detail.process_started. An older row has none, so it is matched by
+    time instead: the process had already started when that row was written, which
+    is the case only for the same process and never for a later one that reused the pid.
+    An unknown creation time (0) never matches, so such a process is recorded as before."""
+    if not started:
+        return False
+    for detail, created_at in rows:
+        recorded = detail.get("process_started")
+        if recorded:
+            if abs(int(recorded) - started) <= PROC_START_TOLERANCE_SECONDS:
+                return True
+        elif started <= _epoch(created_at) + PROC_START_TOLERANCE_SECONDS:
+            return True
+    return False
 
 
 class ProcessWatcher:
@@ -126,6 +177,16 @@ class ProcessWatcher:
         self.alerter = Alerter()
         self.red_lines = RedLines()
         self._known_pids: set[int] = set()
+        # True until the first successful (non-failed) scan completes --
+        # that scan's new_pids is every agent-matching process already
+        # running when this ProcessWatcher started, not anything that
+        # just spawned. Sessions opened from it are marked resumed=True
+        # (see _poll_write_body) so baselines don't treat Vigil's own
+        # restart as the agent's real start time. Stays True across a
+        # failed first scan (see _poll_write_body) so a transient scan
+        # failure doesn't let a later, still-first, successful scan be
+        # mistaken for a genuine new spawn.
+        self._is_first_poll = True
         # PIDs _gather_spawn_info has already resolved to a non-None agent
         # name (includes "unidentified_agent") — lets
         # _scan_all_agent_processes_for_env_redirect re-check only PIDs
@@ -143,6 +204,10 @@ class ProcessWatcher:
         # NAMED pids only (see _snapshot_pids), never cached across cycles:
         # RL7 (env-var-redirect detection) needs each such process's
         # *current* environment every time, not a stale first-seen copy.
+        # Holds only RL7's variables: *_BASE_URL values (credentials and
+        # query stripped) and True for *_API_KEY (see
+        # _process_scan_worker._filter_env). No other env value, and no
+        # API key value, is ever in this process's memory.
         self._env_snapshot: dict[int, dict] = {}
         # {pid: {"args", "exe_path"}} — cached permanently per pid once
         # fetched (see _snapshot_pids): unlike env, a process's cmdline/exe
@@ -152,6 +217,44 @@ class ProcessWatcher:
         # calls proc.environ()/proc.cmdline()/proc.exe() itself) and
         # consumed by _gather_spawn_info/_scan_all_agent_processes_for_env_redirect.
         self._cmdline_snapshot: dict[int, dict] = {}
+        # {agent_name: [pid, ...]} of agent processes (and their children) that exist in the
+        # latest scan. "Running" only means a process exists; whether the agent is doing
+        # anything is decided from recorded events (core/agent_activity.py).
+        self.running_agents: dict[str, list[int]] = {}
+        self.running_agents_at: float = 0.0
+
+    def _update_running_agents(self) -> None:
+        running: dict[str, list[int]] = {}
+        for pid in self._pid_snapshot:
+            name = Attributor._walk_parent_chain_from_snapshot(pid, self._pid_snapshot)
+            if name:
+                running.setdefault(name, []).append(pid)
+        self.running_agents = running
+        self.running_agents_at = time.time()
+
+    async def _recorded_rows(self, pids: list[int]) -> dict[int, list[tuple[dict, str]]]:
+        """Earlier proc_spawn rows (detail, created_at) per pid."""
+        rows: dict[int, list[tuple[dict, str]]] = {}
+        if not pids:
+            return rows
+        db = await get_read_db()
+        try:
+            for start in range(0, len(pids), 400):
+                chunk = pids[start:start + 400]
+                cur = await db.execute(
+                    "SELECT pid, detail, created_at FROM events WHERE event_type = 'proc_spawn' "
+                    f"AND pid IN ({','.join('?' * len(chunk))})",
+                    chunk,
+                )
+                for row in await cur.fetchall():
+                    try:
+                        detail = json.loads(row["detail"]) if row["detail"] else {}
+                    except (TypeError, ValueError):
+                        detail = {}
+                    rows.setdefault(row["pid"], []).append((detail, row["created_at"]))
+        finally:
+            await db.close()
+        return rows
 
     def stop(self) -> None:
         pass
@@ -200,6 +303,14 @@ class ProcessWatcher:
         now pure Python dict access over that subprocess's results; only DB
         writes and alert firing (already async) stay on the loop.
 
+        Also the heartbeat for core/monitoring_coverage.py's Monitoring
+        coverage tracking (see record_coverage_tick() there, and the
+        comment at this job's scheduler.add_job() call in main.py) --
+        called first, before any of this method's own fallible scan
+        logic, and fully self-contained (it never raises), so a coverage
+        write failure can never affect this poll and a scan failure here
+        can never suppress the heartbeat.
+
         The 45s timeout below covers ONLY the subprocess scan
         (_snapshot_pids) -- it deliberately does not wrap the DB-write phase
         that follows (_poll_write_phase). A cancellation landing mid
@@ -211,6 +322,9 @@ class ProcessWatcher:
         _POLL_WRITE_TIMEOUT_SECONDS -- so a truly-stuck write is still
         eventually reported, just not torn down mid-transaction on the
         scan's tighter cadence."""
+        from core.monitoring_coverage import record_coverage_tick
+        await record_coverage_tick()
+
         try:
             async with asyncio.timeout(45):
                 current_pids = await self._snapshot_pids()
@@ -250,18 +364,25 @@ class ProcessWatcher:
             # of flagging every still-running PID as newly spawned. RL7
             # (env-redirect scan, below) is unaffected and still runs —
             # it re-checks self._known_agent_pids, which this cycle's
-            # failure doesn't touch.
+            # failure doesn't touch. self._is_first_poll is also left
+            # untouched -- a failed scan never actually saw "everything
+            # already running", so the next successful scan is still the
+            # real first poll.
             new_pids = set()
+            resumed = False
         else:
             new_pids = current_pids - self._known_pids
+            resumed = self._is_first_poll
             self._known_pids = current_pids
+            self._is_first_poll = False
+            self._update_running_agents()
 
-        logger.info("ProcessWatcher new_pids this cycle: %d", len(new_pids))
+        logger.info("ProcessWatcher new_pids this cycle: %d (resumed=%s)", len(new_pids), resumed)
 
         env_redirect_hits = self._scan_all_agent_processes_for_env_redirect()
         for hit in env_redirect_hits:
             agent_id = await self.attributor.get_or_create_agent(hit["agent_name"], hit["pid"])
-            session_id = await self.attributor.sessions.touch(agent_id)
+            session_id = await self.attributor.sessions.touch(agent_id, resumed=resumed)
             if not CORE_ONLY:
                 await self.red_lines.check_env_var_redirect(
                     agent_id, hit["agent_name"], session_id, hit["agent_env"], pid=hit["pid"]
@@ -271,6 +392,15 @@ class ProcessWatcher:
             return
 
         spawn_infos = await self._gather_spawn_info(new_pids)
+
+        # A process Vigil has already recorded (same pid and creation time) is not recorded
+        # again. Without this every restart of Vigil re-recorded every agent process that was
+        # already running (one long-lived helper was recorded once per restart).
+        try:
+            earlier = await self._recorded_rows([i["pid"] for i in spawn_infos if i["agent_name"] is not None])
+        except Exception:
+            logger.exception("ProcessWatcher: could not look up earlier proc_spawn rows; recording as before")
+            earlier = {}
 
         pending_rows: list[dict] = []
 
@@ -294,6 +424,10 @@ class ProcessWatcher:
             if agent_name is None:
                 continue  # not under a known agent, and not agent-like by behaviour either
 
+            started = info["started"]
+            if already_recorded(earlier.get(pid, []), started):
+                continue
+
             is_unidentified = agent_name == "unidentified_agent"
             # get_behaviour_score_for_pid reads the score Attributor already
             # computed (and cached) while resolving agent_name for this pid
@@ -301,10 +435,11 @@ class ProcessWatcher:
             confidence = self.attributor.get_behaviour_score_for_pid(pid) if is_unidentified else None
 
             agent_id = await self.attributor.get_or_create_agent(agent_name, pid, confidence=confidence)
-            session_id = await self.attributor.sessions.touch(agent_id)
+            session_id = await self.attributor.sessions.touch(agent_id, resumed=resumed)
 
+            red_line_fired = False
             if not CORE_ONLY:
-                await self.red_lines.check_dangerous_command(agent_id, agent_name, cmdline, exe_name, session_id=session_id)
+                red_line_fired = await self.red_lines.check_dangerous_command(agent_id, agent_name, cmdline, exe_name, session_id=session_id)
 
                 await self._check_config_exec(agent_id, agent_name, exe_path or cmdline, session_id)
 
@@ -320,7 +455,15 @@ class ProcessWatcher:
                 "command": exe_name,
                 "args": info["args"],
                 "suspicious": suspicious,
+                "process_started": started,
+                # A new tool or shell process started under an agent process: real activity.
+                # The agent's own processes (the helper itself) are not.
+                "activity_spawn": info["activity_spawn"],
             }
+            if resumed:
+                # Found on the first scan after Vigil started: it was already running, this is
+                # the one marker for it (it is not recorded again on later restarts).
+                detail["already_running"] = True
             if is_unidentified:
                 detail["behaviour_detected"] = True
                 detail["confidence"] = confidence
@@ -335,6 +478,8 @@ class ProcessWatcher:
                 "detail": detail,
                 "severity": severity,
                 "suspicious": suspicious,
+                # One alert per process: the red-line alert already covers it.
+                "suspicious_alert": suspicious and not red_line_fired,
                 "is_unidentified": is_unidentified,
                 "confidence": confidence,
             })
@@ -400,7 +545,7 @@ class ProcessWatcher:
         for row in pending_rows:
             event_id = event_id_by_pid.get(row["pid"])
 
-            if row["suspicious"]:
+            if row["suspicious_alert"]:
                 await self.alerter.fire_alert(
                     row["agent_id"],
                     "medium",
@@ -497,7 +642,14 @@ class ProcessWatcher:
 
             return {
                 "processes": result.get("processes", []),
-                "envs": {int(pid): env for pid, env in result.get("envs", {}).items()},
+                # The worker already reduces each environment to RL7's
+                # variables; filtering again here (idempotent) means a
+                # worker that ever returned more can't put other values in
+                # this process's memory.
+                "envs": {
+                    int(pid): _filter_env(env) if isinstance(env, dict) else {}
+                    for pid, env in result.get("envs", {}).items()
+                },
                 "cmdlines": {int(pid): cl for pid, cl in result.get("cmdlines", {}).items()},
             }
 
@@ -562,6 +714,7 @@ class ProcessWatcher:
                     "name": p.get("name", ""),
                     "ppid": p.get("ppid", 0),
                     "status": p.get("status", ""),
+                    "started": p.get("started", 0),
                 }
 
         self._pid_snapshot = snapshot
@@ -574,6 +727,30 @@ class ProcessWatcher:
         agent_candidate_pids |= self._known_agent_pids
 
         cmdline_new_pids = agent_candidate_pids - set(self._cmdline_snapshot.keys())
+
+        # Also fetch cmdline for every PID newly observed this cycle, not
+        # only name-matched/already-known-agent ones. Without this, a
+        # process attributed only via parent-chain (cmd.exe, bash.exe,
+        # curl.exe, ... spawned under a known agent) never gets a
+        # cmdline: self._known_agent_pids only grows inside
+        # _gather_spawn_info, which runs after this method has already
+        # decided what to fetch this cycle, and the proc_spawn event for
+        # that PID is written exactly once, on this same cycle -- there
+        # is no later cycle that goes back and fills it in. Folded in
+        # here (not into agent_candidate_pids itself) so it only widens
+        # the cmdline fetch, not env_refresh_pids below -- RL7 has no
+        # reason to read the environment of an arbitrary new non-agent-
+        # named process.
+        new_pids_this_cycle = set(snapshot.keys()) - self._known_pids
+        if len(new_pids_this_cycle) > _NEW_PID_CMDLINE_FETCH_CAP:
+            logger.warning(
+                "ProcessWatcher: %d new PID(s) this cycle exceeds the cmdline fetch cap "
+                "(%d) -- only %d will get cmdline fetched this cycle",
+                len(new_pids_this_cycle), _NEW_PID_CMDLINE_FETCH_CAP, _NEW_PID_CMDLINE_FETCH_CAP,
+            )
+            new_pids_this_cycle = set(sorted(new_pids_this_cycle)[:_NEW_PID_CMDLINE_FETCH_CAP])
+        cmdline_new_pids |= new_pids_this_cycle - set(self._cmdline_snapshot.keys())
+
         env_refresh_pids = {
             pid for pid in agent_candidate_pids
             if _is_agent_process_name(snapshot.get(pid, {}).get("name", ""))
@@ -660,12 +837,25 @@ class ProcessWatcher:
 
             cmdline_info = self._cmdline_snapshot.get(pid)
             if cmdline_info is not None:
-                args = cmdline_info.get("args") or []
+                raw_args = cmdline_info.get("args") or []
                 exe_path = cmdline_info.get("exe_path") or exe_name
             else:
-                args = []
+                raw_args = []
                 exe_path = exe_name
-            cmdline = " ".join(args)
+            # Redacted here, the single place a cmdline is read out of
+            # the snapshot cache, so every consumer below (the stored
+            # event's detail.args, check_dangerous_command, _is_suspicious,
+            # and anything built from `cmdline`/`args` downstream) only
+            # ever sees the redacted text -- a real secret never enters
+            # the DB in the first place. args is re-derived from the
+            # redacted joined string (rather than redacting each raw
+            # argv element independently) so a flag and its value stay
+            # redacted together even when they were two separate argv
+            # elements (e.g. ["--password", "secret123"]) -- redacting
+            # them independently would never see the flag and value in
+            # the same string to match against.
+            cmdline = redact_cmdline(" ".join(raw_args))
+            args = cmdline.split()
 
             infos.append({
                 "pid": pid,
@@ -675,6 +865,12 @@ class ProcessWatcher:
                 "exe_path": exe_path,
                 "parent_pid": parent_pid,
                 "agent_name": agent_name,
+                "started": snap_info.get("started", 0),
+                "activity_spawn": (
+                    bool(parent_pid)
+                    and Attributor._walk_parent_chain_from_snapshot(parent_pid, self._pid_snapshot) is not None
+                    and _match_known_agent_name(exe_name) is None
+                ),
             })
         return infos
 

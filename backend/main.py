@@ -3,8 +3,10 @@
 2. Load policy from vlaw-policy.json
 3. Validate RSA license (14-day trial grace period if no license file)
 4. Start PollingObserver for file watching
-5. Start APScheduler jobs: process_watcher (3s), network_watcher (5s),
-   aggregator flush (5s), baseline update (hourly)
+5. Start APScheduler jobs: process_watcher (30s), aggregator flush,
+   baseline update (hourly), evidence chain seal. The network and MCP
+   watchers are currently disabled (see the comments at their disabled
+   job registrations below).
 6. Serve on port 7422
 """
 
@@ -79,43 +81,52 @@ os.environ.setdefault("VLAW_LICENSE_FILE", os.path.join(BASE_DIR, ".vlaw-license
 import asyncio
 import concurrent.futures
 import logging
+import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
-from api import agents, alerts, analytics_api, chain_routes, config_api, digest_api, events, evidence, export, git_routes, mcp_routes, platform_routes, sessions
+from api import agents, alerts, analytics_api, chain_routes, config_api, digest_api, events, evidence, export, git_routes, mcp_routes, platform_routes, scope, sessions, support
 from config.policy import load_policy
 from core.aggregator import Aggregator
 from core.attributor import Attributor
 from core.baseline import Baseline
+from core.alert_status import alert_status_counts, status_level
 from core.config_auditor import audit_all_configs
 from core.feature_flags import CORE_ONLY
 from core.insights import get_insights
+from core.instance_lock import InstanceAlreadyRunning, acquire_instance_lock, release_instance_lock
+from core.log_setup import configure_logging
+from core.scope_store import get_scope_directories
+from core.monitoring_status import mcp_monitoring, network_monitoring
 from core.red_lines import SESSION_LAUNCH_DIR
-from db.database import DB_PATH, close_db, get_db, init_db
+from db.database import DB_PATH, close_db, get_db, get_read_db, init_db
 from license.license_service import LicenseService
 from watchers.file_watcher import start_file_watcher
 from watchers.mcp_watcher import McpWatcher
 from watchers.network_watcher import NetworkWatcher
 from watchers.process_watcher import ProcessWatcher
 
-LOG_PATH = os.path.join(BASE_DIR, "vlaw-backend.log")
-logging.basicConfig(
-    level=os.environ.get("VLAW_LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger("vlaw")
+# VLAW_LOG_FILE lets a test (or an operator) put the log somewhere else.
+LOG_PATH = os.environ.get("VLAW_LOG_FILE") or os.path.join(BASE_DIR, "vlaw-backend.log")
+logger = configure_logging(LOG_PATH)
 logger.info("V-LAW backend starting. BASE_DIR=%s", BASE_DIR)
 
-VERSION = "0.2.0-beta"
+VERSION = "0.9.0"
 PORT = int(os.environ.get("VLAW_PORT", 7422))
 
-_state: dict = {}
+# Shared with the API routes through core/runtime_state.py (NOT through `import main`,
+# which in the exe would load a second copy of this module). Same objects, old names.
+from core.local_day import local_day_window  # noqa: E402
+from core.runtime_state import state as _state, stats_cache as _stats_cache  # noqa: E402
+
+# What the support bundle (api/support.py) needs from this module, without importing it.
+_state["log_path"] = LOG_PATH
+_state["version"] = VERSION
 
 
 DEFAULT_POLICY = {
@@ -142,9 +153,24 @@ DEFAULT_POLICY = {
 def build_watch_paths(policy: dict) -> tuple[list[str], list[str]]:
     """Builds (watch_paths, red_line_non_recursive_dirs) for the file
     watcher. Extracted out of the lifespan startup sequence so it can be
-    unit tested without booting the full app — see
-    tests/test_watch_paths.py. Behavior is otherwise unchanged from what
-    used to be inlined in lifespan() below.
+    unit tested without booting the full app -- see
+    tests/test_watch_paths.py.
+
+    What is watched, and nothing else:
+      - every scope directory (the user's project folders, see
+        core/scope_store.py -- the database copy is authoritative; the
+        caller passes it in policy["scope_directories"]), recursively. The
+        project config folders (.claude, .cursor, .vscode) and a root-level
+        .mcp.json live under a scope directory, so they are covered by that
+        recursive watch rather than scheduled a second time (a second watch
+        on a subfolder would deliver every event twice).
+      - ~/.ssh and ~/.claude/file-history, always (Red Line rules 1 and 3
+        must fire regardless of policy).
+      - any directory-shaped credential_paths entry ("~/.aws/", ...).
+    The backend's own working directory (Path.cwd()) is NOT watched: for the
+    installed app that is Vigil's own install folder, not the user's
+    project. red_line_non_recursive_dirs is therefore always empty; it is
+    kept in the return value so callers do not change.
 
     VLAW_HOST_ROOT is set to /host in docker-compose.yml, where the
     read-only host filesystem is mounted. Policy paths are defined from
@@ -160,48 +186,12 @@ def build_watch_paths(policy: dict) -> tuple[list[str], list[str]]:
         p for p in credential_paths
         if p.endswith("/") or p.endswith("\\") or p.startswith("~")
     ]
-    # Flat credential file patterns (".env", "*.pem", "*.key", ...) have no
-    # directory component, so the filter above never turns them into a
-    # watched directory — a policy of credential_paths=[".env"] would
-    # otherwise never cause anything to be watched at all, and a .env
-    # modification in the project would silently never reach the
-    # credential-access pipeline. When credential_paths has any entries
-    # (there's something to match against), also watch the project root
-    # (SESSION_LAUNCH_DIR) and every configured scope directory, so a flat
-    # pattern still has somewhere to fire from. Appended here in their
-    # pre-host_root form (matching how scope_directories/SESSION_LAUNCH_DIR
-    # are expressed everywhere else in this function) since host_root is
-    # applied once, below, to the whole credential_dirs list — prefixing it
-    # here too would double it under Docker (VLAW_HOST_ROOT set).
-    if credential_paths:
-        credential_dirs.append(str(SESSION_LAUNCH_DIR))
-        credential_dirs.extend(scope_directories)
-
-    # Red Line rules 1 and 3 (SSH directory access, Claude hidden cache
-    # writes) must fire regardless of policy configuration, so their
-    # directories are always watched — independent of whatever the user
-    # has set in credential_paths/scope_directories. RL7b (project config
-    # execution, CVE-2025-59536 pattern) needs the active project's own
-    # .claude/.cursor/.vscode config dirs watched too — these live under
-    # the session's launch directory (core.red_lines.SESSION_LAUNCH_DIR),
-    # not under the user's home dir like the other red-line paths.
     red_line_dirs = [
         host_root + os.path.expanduser("~/.ssh/"),
         host_root + os.path.expanduser("~/.claude/file-history/"),
-        host_root + str(SESSION_LAUNCH_DIR / ".claude"),
-        host_root + str(SESSION_LAUNCH_DIR / ".cursor"),
-        host_root + str(SESSION_LAUNCH_DIR / ".vscode"),
     ]
-    # RL8 (MCP auto-approval, CVE-2026-21852 pattern) needs .mcp.json writes
-    # at the project root — watched non-recursively so this doesn't balloon
-    # into watching the entire project tree just to catch one root-level file.
-    # SESSION_LAUNCH_DIR is now also covered recursively above (via
-    # credential_dirs, when credential_paths is non-empty) so .env/*.key
-    # files in subdirectories of the project root are caught too — this
-    # non-recursive entry stays for RL8's own narrower purpose.
-    red_line_non_recursive_dirs = [host_root + str(SESSION_LAUNCH_DIR)]
     watch_paths = scope_dirs + [host_root + p for p in credential_dirs] + red_line_dirs
-    return watch_paths, red_line_non_recursive_dirs
+    return watch_paths, []
 
 
 def _ensure_default_policy() -> None:
@@ -216,28 +206,14 @@ def _ensure_default_policy() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import os as _vigil_os
-    import sys as _vigil_sys
-
-    _lock_path = _vigil_os.path.join(_vigil_os.path.dirname(__file__),
-                                '..', 'data', 'vigil.lock')
-    _lock_path = _vigil_os.path.abspath(_lock_path)
-    _vigil_os.makedirs(_vigil_os.path.dirname(_lock_path), exist_ok=True)
-
+    # Lock lives next to vlaw.db (see core/instance_lock.py), not in the
+    # PyInstaller _MEI temp dir.
     try:
-        _lock_file = open(_lock_path, 'w')
-        if _vigil_os.name == 'nt':  # Windows
-            import msvcrt
-            msvcrt.locking(_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-        else:  # Unix
-            import fcntl
-            fcntl.flock(_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _lock_file.write(str(_vigil_os.getpid()))
-        _lock_file.flush()
-        logger.info("instance lock acquired (pid=%d)", _vigil_os.getpid())
-    except (IOError, OSError):
-        logger.error("Vigil is already running. Only one instance allowed.")
-        _vigil_sys.exit(1)
+        _lock_file = acquire_instance_lock(str(DB_PATH.parent))
+        logger.info("instance lock acquired (pid=%d)", os.getpid())
+    except InstanceAlreadyRunning as e:
+        logger.error("Vigil is already running (pid=%s). Only one instance allowed.", e.pid)
+        sys.exit(1)
 
     # 0. Recover from leftover WAL locks left by a previous unclean shutdown,
     # before aiosqlite opens its own connection in init_db().
@@ -263,6 +239,13 @@ async def lifespan(app: FastAPI):
     # 1. DB + schema
     await init_db()
     logger.info("database initialized")
+
+    # As early as possible after the schema exists, so the recorded
+    # started_at isn't delayed by license checks, crash recovery replay,
+    # etc. below -- that delay would otherwise show up as a few extra
+    # seconds of "Vigil was not running" in the next export.
+    from core.monitoring_coverage import start_run as _start_coverage_run
+    await _start_coverage_run()
 
     # 2. Policy
     _ensure_default_policy()
@@ -321,6 +304,7 @@ async def lifespan(app: FastAPI):
         logger.exception("session recovery failed -- continuing startup without it")
 
     process_watcher = ProcessWatcher(attributor, aggregator)
+    _state["process_watcher"] = process_watcher
     network_watcher = NetworkWatcher(attributor, aggregator)
     mcp_watcher = McpWatcher(attributor)
 
@@ -328,12 +312,20 @@ async def lifespan(app: FastAPI):
     _state["baseline"] = baseline
 
     # 4. File watcher (PollingObserver — Docker/Windows safe)
+    # The watched project folders come from the database (core/scope_store.py);
+    # the policy file only seeds it. An existing database value, including the
+    # one a user set earlier, is always kept.
+    policy = {**policy, "scope_directories": await get_scope_directories(await get_db())}
     watch_paths, red_line_non_recursive_dirs = build_watch_paths(policy)
     observer, file_handler = start_file_watcher(
         attributor, aggregator, watch_paths, red_line_non_recursive_dirs,
         process_watcher=process_watcher, network_watcher=network_watcher,
     )
     _state["observer"] = observer
+    _state["file_handler"] = file_handler
+    from core.monitoring_status import set_file_watcher_tier
+    from watchers.etw_file_watcher import ETWFileWatcher
+    set_file_watcher_tier("etw" if isinstance(observer, ETWFileWatcher) else "folders")
     logger.info("file watcher started, watching %d paths", len(watch_paths) + len(red_line_non_recursive_dirs))
 
     # 5. APScheduler jobs
@@ -377,19 +369,62 @@ async def lifespan(app: FastAPI):
     # landing on the event loop together and visibly delaying unrelated
     # requests (e.g. /health) for several seconds. A 10s gap spreads that
     # load across the cycle instead of bursting it.
+    # core/monitoring_coverage.py's heartbeat rides on this specific job's
+    # 30s interval (see record_coverage_tick(), called from
+    # ProcessWatcher.poll() itself) rather than a scheduler job of its
+    # own. If this job is ever disabled the way network_watcher/
+    # mcp_watcher below already have been, Monitoring coverage in the
+    # export silently stops advancing along with it.
     _now = datetime.now(scheduler.timezone)
     scheduler.add_job(
         process_watcher.poll, "interval", seconds=30, id="process_watcher",
         max_instances=1, coalesce=True, replace_existing=True,
         next_run_time=_now + timedelta(seconds=5),
     )
-    # NetworkWatcher disabled pending event-loop audit — resolution phase contains blocking I/O.
+    # NetworkWatcher is deliberately DISABLED (not forgotten). It was turned
+    # off in e821731 together with the watcher-starvation deadlock fix: its
+    # resolution phase does blocking I/O (reverse lookups, per-connection
+    # process lookups) on or next to the event loop, and with the other
+    # watchers sharing the loop and the single DB writer that was one of the
+    # sources of multi-second stalls (/health included). Consequences, shown
+    # to the user rather than hidden: no net_connect events are recorded, so
+    # no unrecognised-destination alerts are produced, and the report and
+    # /health say "network monitoring: off" (core/monitoring_status.py reads
+    # this job's presence, so re-adding it flips them to "on" by itself).
+    #
+    # A safe re-enable needs ALL of:
+    #   1. Bounded work per tick: a hard cap on connections handled and
+    #      names resolved per poll (the rest carried to the next tick), the
+    #      resolution moved off the loop into a killable subprocess with a
+    #      timeout, as ProcessWatcher does (see _process_scan_worker.py),
+    #      and an asyncio.timeout around the whole poll.
+    #   2. An off-switch: a setting/env var (for example
+    #      VLAW_NETWORK_WATCHER=0) that skips registering the job, plus an
+    #      automatic back-off that disables it for the rest of the run if
+    #      a tick overruns its budget repeatedly.
+    #   3. Loop-delay measurement before turning it on by default: /health
+    #      latency and event-loop lag with the watcher running under load
+    #      (tests/test_perf_gate.py is the place for the gate), compared
+    #      with it off.
     # scheduler.add_job(
     #     network_watcher.poll, "interval", seconds=30, id="network_watcher",
     #     max_instances=1, coalesce=True, replace_existing=True,
     #     next_run_time=_now + timedelta(seconds=15),
     # )
-    # McpWatcher disabled pending async subprocess refactor — WMI contention with ProcessWatcher.
+    # McpWatcher is deliberately DISABLED (e821731, with the watcher-starvation
+    # deadlock fix): it scans processes and connections through the same
+    # PowerShell/WMI queries ProcessWatcher uses, and the two contended for
+    # them. Consequences, shown to the user rather than hidden: no
+    # mcp_connect events are recorded, no unapproved-MCP-server alerts are
+    # produced, and the RL8 red line (MCP auto-approval) cannot fire, because
+    # it needs an MCP *connection* to pair with a .mcp.json write (it is only
+    # ever evaluated from mcp_watcher.py). The report and /health say
+    # "mcp monitoring: off" (core/monitoring_status.py reads this job's
+    # presence, so re-adding it flips them to "on" by itself).
+    # A safe re-enable needs the same three things as the network watcher
+    # above: bounded work per tick, an off-switch, and a loop-delay
+    # measurement, plus the async subprocess refactor named in the original
+    # note so it no longer shares ProcessWatcher's scan.
     # scheduler.add_job(
     #     mcp_watcher.poll, "interval", seconds=30, id="mcp_watcher",
     #     max_instances=1, coalesce=True, replace_existing=True,
@@ -416,6 +451,8 @@ async def lifespan(app: FastAPI):
     # )
     scheduler.start()
     _state["scheduler"] = scheduler
+    from core.monitoring_status import bind_scheduler
+    bind_scheduler(scheduler)
     logger.info("scheduler started")
 
     yield
@@ -425,12 +462,10 @@ async def lifespan(app: FastAPI):
     observer.stop()
     observer.join(timeout=5)
     await aggregator.stop_writer()
+    from core.monitoring_coverage import mark_clean_shutdown as _mark_coverage_clean_shutdown
+    await _mark_coverage_clean_shutdown()
     await close_db()
-    try:
-        _lock_file.close()
-        _vigil_os.unlink(_lock_path)
-    except Exception:
-        pass
+    release_instance_lock(_lock_file)
     logger.info("vlaw shutdown complete")
 
 
@@ -447,12 +482,69 @@ async def _baseline_tick(baseline: Baseline) -> None:
 
 
 async def _seal_evidence_chain() -> None:
+    # seal_new_events() now opens its own dedicated connection internally
+    # (see core/evidence_chain.py) rather than taking the shared get_db()
+    # singleton -- no db handle needed here anymore.
     from core.evidence_chain import seal_new_events
-    db = await get_db()
-    await seal_new_events(db)
+    await seal_new_events()
 
 
-app = FastAPI(title="V-LAW", version=VERSION, lifespan=lifespan)
+app = FastAPI(title="Vigil", version=VERSION, lifespan=lifespan)
+
+# Allowed browser Origins for state-changing requests. http://localhost:7422
+# and http://127.0.0.1:7422 are the web UI served by this backend itself;
+# http://localhost:5173 is the Vite dev server. No vscode-webview:// entry
+# is needed: vigil-vscode has no webview, every backend call it makes runs
+# in the extension host (a Node process), which sends no Origin header at
+# all, same as the tray and the Claude Code MCP plugin.
+_ALLOWED_ORIGINS = {
+    "http://localhost:7422",
+    "http://127.0.0.1:7422",
+    "http://localhost:5173",
+}
+_STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _host_header_hostname(host_header: str) -> str:
+    """Strips the port (and, for an IPv6 literal, the brackets) off a Host
+    header value, so "127.0.0.1:7422", "[::1]:7422", and "localhost" all
+    compare correctly against the allowed hostnames below."""
+    host = host_header.strip()
+    if host.startswith("["):
+        return host[1:host.index("]")] if "]" in host else host
+    return host.split(":")[0]
+
+
+@app.middleware("http")
+async def _localhost_origin_guard(request: Request, call_next):
+    """Defense in depth even though the server only binds 127.0.0.1 (see
+    VLAW_HOST above): any web page open in the developer's browser can
+    still send a body-less POST to http://localhost:7422/api/... with no
+    CORS preflight, since a simple POST is never preflighted -- that would
+    let a hostile page dismiss alerts or block/approve an agent on an
+    evidence product with zero interaction from the user. Two checks:
+
+    1. Host header must resolve to localhost/127.0.0.1/::1 -- blocks DNS
+       rebinding (a page on attacker.example pointing attacker.example's
+       own DNS record at 127.0.0.1, which a bind-address check alone can't
+       catch, since the request still arrives on the loopback interface).
+    2. For state-changing methods, an Origin header, if present, must be
+       in the allowlist. Real clients (the tray, the VS Code extension
+       host, the Claude Code MCP plugin) are Node/Python processes and
+       send no Origin at all, so an absent Origin is allowed; a browser
+       always sends one on a cross-origin request, so a present-but-
+       disallowed Origin is rejected."""
+    hostname = _host_header_hostname(request.headers.get("host", ""))
+    if hostname not in ("localhost", "127.0.0.1", "::1"):
+        return JSONResponse(status_code=403, content={"detail": "forbidden host"})
+
+    if request.method in _STATE_CHANGING_METHODS:
+        origin = request.headers.get("origin")
+        if origin is not None and origin not in _ALLOWED_ORIGINS:
+            return JSONResponse(status_code=403, content={"detail": "forbidden origin"})
+
+    return await call_next(request)
+
 
 # Unprefixed registration exists only for dev mode: the frontend always
 # calls /api/* (see frontend/src/api.js's BASE), but when it's run via
@@ -477,6 +569,7 @@ if not getattr(sys, "frozen", False):
     app.include_router(analytics_api.router)
     app.include_router(evidence.router)
     app.include_router(chain_routes.router)
+    app.include_router(scope.router)
 
 # mcp_routes/platform_routes/git_routes have no /api-prefixed twin at all
 # (see below) -- the VS Code extension calls these directly, unprefixed,
@@ -500,84 +593,179 @@ app.include_router(config_api.router, prefix="/api")
 app.include_router(analytics_api.router, prefix="/api")
 app.include_router(evidence.router, prefix="/api")
 app.include_router(chain_routes.router, prefix="/api")
+app.include_router(scope.router, prefix="/api")
+app.include_router(support.router, prefix="/api")
+
+
+_STATS_CACHE_TTL_SECONDS = 2.0
 
 
 @app.get("/stats")
 @app.get("/api/stats")
 async def get_stats():
-    db = await get_db()
+    """Polled every 3s by App.jsx on every page -- it's part of the app
+    shell, never unmounted. Measured directly on the live machine: 4.3s,
+    9.1s, 5.9s per call, which at ~0.82-0.94 CPU cores with the dashboard
+    open (vs 0.01 idle) was clearly the dominant cost.
 
-    cur = await db.execute("SELECT COUNT(*) c FROM agents WHERE approved = 1")
-    active_agents = (await cur.fetchone())["c"]
+    This used to run 13 sequential queries on the shared get_db()
+    singleton, most wrapping created_at in date(...) in the WHERE clause
+    -- date(created_at) = date('now') -- which defeats any index on that
+    column (EXPLAIN QUERY PLAN confirmed SCAN, not SEARCH, even where an
+    index existed). Measured on a copy of the live DB (~15k events, ~3k
+    alerts): all 13 queries combined cost only ~7.5ms there, ruling out
+    raw query cost as the cause of the multi-second latency at today's
+    scale. The real cause is connection contention: get_db() is the one
+    shared, single-writer-thread connection that ProcessWatcher, the
+    file watcher, Aggregator.flush_buffers, and _seal_evidence_chain all
+    write through -- the same class of hazard already fixed for
+    seal_new_events()/verify_chain() in core/evidence_chain.py, just
+    never applied here even though this is the highest-frequency reader
+    in the app.
 
-    cur = await db.execute("SELECT COUNT(*) c FROM events WHERE date(created_at) = date('now')")
-    events_today = (await cur.fetchone())["c"]
+    Fixed four ways:
+    1. get_read_db() instead of get_db() -- a dedicated connection that
+       never queues behind the shared writer thread.
+    2. Every date(created_at) = date('now') replaced with a
+       created_at >= ? AND created_at < ? range against LOCAL-day
+       boundaries (as UTC strings) computed in Python, so the planner can do an actual
+       index range SEARCH (idx_events_created, idx_alerts_created,
+       idx_sessions_started -- the latter two added alongside this fix).
+    3. 13 round-trips consolidated into 6 queries via conditional
+       SUM(CASE WHEN ...), each still restricted to created_at >=
+       yesterday's start so the index prunes everything older than that
+       regardless of how large events/alerts grow.
+    4. A short in-process cache (TTL above) so concurrent pollers
+       (multiple tabs, or Sidebar/App.jsx polling close together) don't
+       each pay even the now-cheap query cost.
 
-    cur = await db.execute("SELECT COUNT(*) c FROM events WHERE date(created_at) = date('now', '-1 day')")
-    events_yesterday = (await cur.fetchone())["c"]
+    Still protects against the table growing: cost here scales with
+    "rows from yesterday onward", not total table size, since every
+    multi-row query is now WHERE-bounded on the indexed created_at
+    column rather than scanning everything."""
+    now_ts = time.monotonic()
+    if _stats_cache["data"] is not None and now_ts - _stats_cache["computed_at"] < _STATS_CACHE_TTL_SECONDS:
+        return _stats_cache["data"]
 
-    cur = await db.execute("SELECT COUNT(*) c FROM alerts WHERE status = 'open'")
-    alerts_open = (await cur.fetchone())["c"]
+    db = await get_read_db()
+    try:
+        # "Today" is the machine's local calendar day, the same day the daily
+        # report uses (core/local_day.py), converted to the stored UTC strings.
+        today_start, tomorrow_start = local_day_window(0)
+        yesterday_start, _ = local_day_window(1)
 
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM alerts WHERE status = 'open' AND date(created_at) = date('now', '-1 day')"
-    )
-    alerts_open_yesterday = (await cur.fetchone())["c"]
+        cur = await db.execute("SELECT COUNT(*) c FROM agents WHERE approved = 1")
+        active_agents = (await cur.fetchone())["c"]
 
-    cur = await db.execute(
-        "SELECT COALESCE(SUM(data_volume_bytes), 0) v FROM events WHERE event_type = 'net_connect' AND date(created_at) = date('now')"
-    )
-    net_bytes_today = (await cur.fetchone())["v"]
+        cur = await db.execute(
+            """
+            SELECT
+                SUM(CASE WHEN created_at >= ? AND created_at < ? THEN 1 ELSE 0 END) AS events_today,
+                SUM(CASE WHEN created_at >= ? AND created_at < ? THEN 1 ELSE 0 END) AS events_yesterday,
+                SUM(CASE WHEN created_at >= ? AND created_at < ? AND event_type = 'net_connect'
+                    THEN COALESCE(data_volume_bytes, 0) ELSE 0 END) AS net_bytes_today,
+                SUM(CASE WHEN created_at >= ? AND created_at < ? AND event_type = 'net_connect'
+                    THEN COALESCE(data_volume_bytes, 0) ELSE 0 END) AS net_bytes_yesterday,
+                SUM(CASE WHEN created_at >= ? AND created_at < ? AND event_type = 'cred_access'
+                    THEN 1 ELSE 0 END) AS cred_accesses_today,
+                SUM(CASE WHEN created_at >= ? AND created_at < ? AND event_type = 'cred_access'
+                    THEN 1 ELSE 0 END) AS cred_accesses_yesterday
+            FROM events
+            WHERE created_at >= ?
+            """,
+            (
+                today_start, tomorrow_start,
+                yesterday_start, today_start,
+                today_start, tomorrow_start,
+                yesterday_start, today_start,
+                today_start, tomorrow_start,
+                yesterday_start, today_start,
+                yesterday_start,
+            ),
+        )
+        events_row = await cur.fetchone()
+        events_today = events_row["events_today"] or 0
+        events_yesterday = events_row["events_yesterday"] or 0
+        net_bytes_today = events_row["net_bytes_today"] or 0
+        net_bytes_yesterday = events_row["net_bytes_yesterday"] or 0
+        cred_accesses_today = events_row["cred_accesses_today"] or 0
+        cred_accesses_yesterday = events_row["cred_accesses_yesterday"] or 0
 
-    cur = await db.execute(
-        "SELECT COALESCE(SUM(data_volume_bytes), 0) v FROM events WHERE event_type = 'net_connect' AND date(created_at) = date('now', '-1 day')"
-    )
-    net_bytes_yesterday = (await cur.fetchone())["v"]
+        cur = await db.execute("SELECT COUNT(*) c FROM alerts WHERE status = 'open'")
+        alerts_open = (await cur.fetchone())["c"]
 
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM events WHERE event_type = 'cred_access' AND date(created_at) = date('now')"
-    )
-    cred_accesses_today = (await cur.fetchone())["c"]
+        # Single definition of "needs review", used everywhere a review
+        # count is shown (tray tooltip, Status page, Incidents sidebar
+        # badge): open alerts at severity high or critical DETECTED IN THE
+        # LAST 24 HOURS (core/alert_status.py). Older open alerts are
+        # reported separately as older_open, and the all-time open
+        # high/critical total stays available as needs_review_total.
+        # Pending-agent approval is a separate concept (see api/agents.py)
+        # and is never folded into this number.
+        alert_counts = await alert_status_counts(db)
+        needs_review = alert_counts["needs_review"]
 
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM events WHERE event_type = 'cred_access' AND date(created_at) = date('now', '-1 day')"
-    )
-    cred_accesses_yesterday = (await cur.fetchone())["c"]
+        # checkpoint_activity (RL3's normal-/rewind tier — see core/red_lines.py)
+        # is expected, frequent, benign background noise, not a "meaningful
+        # alert" in Sprint A's sense — excluded from the noise-reduction
+        # numerator below so it doesn't inflate the count of alerts that
+        # actually warrant a human's attention.
+        cur = await db.execute(
+            """
+            SELECT
+                SUM(CASE WHEN created_at >= ? AND created_at < ? THEN 1 ELSE 0 END) AS alerts_today,
+                SUM(CASE WHEN created_at >= ? AND created_at < ? AND rule_type != 'checkpoint_activity'
+                    THEN 1 ELSE 0 END) AS meaningful_alerts_today
+            FROM alerts
+            WHERE created_at >= ?
+            """,
+            (
+                today_start, tomorrow_start,
+                today_start, tomorrow_start,
+                yesterday_start,
+            ),
+        )
+        alerts_row = await cur.fetchone()
+        # Open at the end of yesterday: created before local midnight and not
+        # resolved before it (still open now, or resolved at/after midnight).
+        # A closed alert with no resolved_at cannot be placed in time and is
+        # not counted.
+        cur = await db.execute(
+            "SELECT COUNT(*) c FROM alerts WHERE created_at < ? AND (status = 'open' OR resolved_at >= ?)",
+            (today_start, today_start),
+        )
+        alerts_open_yesterday = (await cur.fetchone())["c"]
+        alerts_today = alerts_row["alerts_today"] or 0
+        meaningful_alerts_today = alerts_row["meaningful_alerts_today"] or 0
 
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM sessions WHERE date(started_at) = date('now')"
-    )
-    sessions_today = (await cur.fetchone())["c"]
+        cur = await db.execute(
+            "SELECT COUNT(*) c FROM sessions WHERE started_at >= ? AND started_at < ?",
+            (today_start, tomorrow_start),
+        )
+        sessions_today = (await cur.fetchone())["c"]
 
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM alerts WHERE date(created_at) = date('now')"
-    )
-    alerts_today = (await cur.fetchone())["c"]
-
-    # checkpoint_activity (RL3's normal-/rewind tier — see core/red_lines.py)
-    # is expected, frequent, benign background noise, not a "meaningful
-    # alert" in Sprint A's sense — excluded from the noise-reduction
-    # numerator below so it doesn't inflate the count of alerts that
-    # actually warrant a human's attention.
-    cur = await db.execute(
-        "SELECT COUNT(*) c FROM alerts WHERE date(created_at) = date('now') AND rule_type != 'checkpoint_activity'"
-    )
-    meaningful_alerts_today = (await cur.fetchone())["c"]
-
-    cur = await db.execute("SELECT value FROM stats_kv WHERE key = 'suppressed_alerts'")
-    row = await cur.fetchone()
-    suppressed_alerts = row["value"] if row else 0
+        cur = await db.execute("SELECT value FROM stats_kv WHERE key = 'suppressed_alerts'")
+        row = await cur.fetchone()
+        suppressed_alerts = row["value"] if row else 0
+    finally:
+        await db.close()
 
     # Signal-over-noise: how much raw activity got compressed down to
     # alerts actually worth a human's attention today.
     noise_reduction_ratio = round(meaningful_alerts_today / events_today, 4) if events_today else 0.0
 
-    return {
+    result = {
+        "version": VERSION,
         "active_agents": active_agents,
         "events_today": events_today,
         "events_yesterday": events_yesterday,
         "alerts_open": alerts_open,
         "alerts_open_yesterday": alerts_open_yesterday,
+        "needs_review": needs_review,
+        "needs_review_total": alert_counts["needs_review_total"],
+        "open_medium_24h": alert_counts["open_medium_24h"],
+        "older_open": alert_counts["older_open"],
+        "status_level": status_level(alert_counts),
         "net_egress_mb_today": round(net_bytes_today / (1024 * 1024), 3),
         "net_egress_mb_yesterday": round(net_bytes_yesterday / (1024 * 1024), 3),
         "cred_accesses_today": cred_accesses_today,
@@ -588,6 +776,9 @@ async def get_stats():
         "noise_reduction_ratio": noise_reduction_ratio,
         "suppressed_alerts": suppressed_alerts,
     }
+    _stats_cache["data"] = result
+    _stats_cache["computed_at"] = now_ts
+    return result
 
 
 @app.get("/health")
@@ -617,7 +808,14 @@ async def health():
         "baseline_active": baseline_active,
         "agents_watching": agents_watching,
         "file_watcher_alive": observer.is_alive() if observer else False,
+        # Read from the scheduler's real state ("off" while the watcher's
+        # job is not registered), never a constant.
+        "network_monitoring": network_monitoring(),
+        "mcp_monitoring": mcp_monitoring(),
     }
+
+
+_state["health_fn"] = health
 
 
 @app.get("/insights")
@@ -690,7 +888,16 @@ else:
 if __name__ == "__main__":
     import uvicorn
 
+    # The API has no auth and includes mutating routes (approve/block an
+    # agent, resolve/dismiss an alert), so it must not be reachable from
+    # the LAN. 127.0.0.1 is the correct default for every real client:
+    # the tray, the VS Code extension, and the Claude Code MCP plugin all
+    # already target 127.0.0.1/localhost explicitly (checked before this
+    # change). VLAW_HOST is an escape hatch for a deployment that needs a
+    # different interface, not something to be set by default.
+    HOST = os.environ.get("VLAW_HOST", "127.0.0.1")
+
     # Pass the app object directly rather than the "main:app" string form:
     # the string form makes uvicorn re-import "main" by module name, which
     # doesn't resolve inside a frozen PyInstaller executable.
-    uvicorn.run(app, host="0.0.0.0", port=PORT, reload=False)
+    uvicorn.run(app, host=HOST, port=PORT, reload=False)

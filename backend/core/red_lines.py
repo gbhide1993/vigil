@@ -25,6 +25,7 @@ import re
 import time
 from pathlib import Path
 
+from core.agent_wrappers import unwrap_agent_command
 from core.alerter import Alerter
 from core.priors import get_prior
 
@@ -113,9 +114,76 @@ APPROVED_NETWORK_DESTINATIONS = {
 # Matched against the executable's basename, never the full argv blob — a
 # bare substring check against the whole cmdline false-positives constantly
 # (e.g. "nc" inside "sync", "function", "--renderer-client-id", which every
-# Electron subprocess spawn includes as ordinary flag text).
+# Electron subprocess spawn includes as ordinary flag text). Severity is
+# "low" for all of these alone: curl/wget/ssh/scp/nc are extremely common
+# for entirely legitimate reasons (downloading a file, a remote login,
+# port forwarding). curl/wget actually piped into a shell (_PIPE_TO_SHELL
+# below) is the pattern that's genuinely dangerous, and fires at "high"
+# regardless of this bare-exe tier.
 DANGEROUS_EXE_PATTERNS = {"curl", "wget", "nc", "ncat", "ssh", "scp"}
-DANGEROUS_INLINE_PATTERNS = ["python -c", "python3 -c", "powershell -enc", "powershell -command"]
+DANGEROUS_EXE_SEVERITY = "low"
+
+# python -c / python3 -c: inline code execution, extremely common for
+# legitimate scripting (agents run it constantly) -- detected and recorded
+# at "low". It used to be "medium", which also made it count as red-line
+# corroboration; it no longer does (see core/activity_filter.py). The old literal
+# "powershell -enc"/"powershell -command" substrings are gone from here;
+# real invocations are "powershell.exe -Command ..." or a full path, so
+# a literal "powershell -command" (bare word, no .exe, no path) never
+# actually appears in a real cmdline -- see _POWERSHELL_BYPASS_FLAGS below,
+# which checks the exe basename and the flag separately instead.
+DANGEROUS_INLINE_PATTERNS = ["python -c", "python3 -c"]
+DANGEROUS_INLINE_SEVERITY = "low"
+
+# Download-and-execute: curl/wget output piped straight into a shell or
+# PowerShell's Invoke-Expression. Unlike a bare curl/wget above, this is
+# the actual remote-code-execution shape, so it's "high" unconditionally.
+_PIPE_TO_SHELL = re.compile(r"\b(curl|wget)\b.*\|\s*(sh|bash|iex)\b", re.IGNORECASE)
+
+# PowerShell obfuscation/bypass flags, matched against the exe basename
+# (powershell/pwsh) plus the flag appearing anywhere in the cmdline.
+_POWERSHELL_EXES = {"powershell", "pwsh"}
+_POWERSHELL_BYPASS_FLAGS = re.compile(r"-enc\b|-encodedcommand\b", re.IGNORECASE)
+
+# iex / Invoke-Expression only counts together with a download or network
+# indicator in the same cmdline. Claude Code's own shell wrapper
+# ("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+# -Command ... Invoke-Expression -Command $__claudeCodeScript") contains
+# -ExecutionPolicy Bypass, -Command and Invoke-Expression, so none of those
+# alone can be treated as dangerous.
+_IEX_WORD = re.compile(r"\b(iex|invoke-expression)\b", re.IGNORECASE)
+_NETWORK_INDICATOR = re.compile(
+    r"\b(iwr|invoke-webrequest|invoke-restmethod|downloadstring|downloadfile|curl|wget)\b|https?://",
+    re.IGNORECASE,
+)
+
+# Destructive delete: requires evidence of BOTH "recursive" and "force"
+# (either order, short or long flag form) -- a bare "rm file.txt" or
+# "Remove-Item x" must never match; only the combination does. The
+# negative lookbehind on the short-flag checks keeps them from firing
+# inside an unrelated long flag (e.g. "--dry-run" must never satisfy the
+# check for the letter 'r').
+_RM_WORD = re.compile(r"\brm\b", re.IGNORECASE)
+_SHORT_FLAG_R = re.compile(r"(?<!-)-[a-zA-Z]*r[a-zA-Z]*\b")
+_SHORT_FLAG_F = re.compile(r"(?<!-)-[a-zA-Z]*f[a-zA-Z]*\b")
+_LONG_RECURSIVE = re.compile(r"--recursive\b", re.IGNORECASE)
+_LONG_FORCE = re.compile(r"--force\b", re.IGNORECASE)
+
+_REMOVE_ITEM_WORD = re.compile(r"\bremove-item\b", re.IGNORECASE)
+_PS_RECURSE_FLAG = re.compile(r"-recurse\b", re.IGNORECASE)
+_PS_FORCE_FLAG = re.compile(r"-force\b", re.IGNORECASE)
+
+_RD_RECURSIVE = re.compile(r"\b(rd|rmdir)\b.*\s/s\b", re.IGNORECASE)
+_DEL_WORD = re.compile(r"\bdel\b", re.IGNORECASE)
+_DEL_FORCE_FLAG = re.compile(r"\s/f\b", re.IGNORECASE)
+_DEL_RECURSE_FLAG = re.compile(r"\s/s\b", re.IGNORECASE)
+
+_GIT_PUSH_FORCE = re.compile(r"\bgit\b.*\bpush\b.*(?:--force\b|\s-f\b)", re.IGNORECASE)
+_GIT_RESET_HARD = re.compile(r"\bgit\b.*\breset\b.*--hard\b", re.IGNORECASE)
+
+_REG_ADD_DELETE = re.compile(r"\breg\b\s+(add|delete)\b", re.IGNORECASE)
+_NET_USER = re.compile(r"\bnet\b\s+user\b", re.IGNORECASE)
+_SCHTASKS_CREATE = re.compile(r"\bschtasks\b.*\s/create\b", re.IGNORECASE)
 
 # Session launch directory: the working directory V-LAW itself was
 # started from. Used as the reference point for "outside the active
@@ -203,15 +271,75 @@ def is_unknown_destination(dest: str) -> bool:
     return dest not in APPROVED_NETWORK_DESTINATIONS
 
 
-def is_dangerous_command(cmdline: str, exe_basename: str = "") -> str | None:
-    """Returns the matched pattern, or None if the command is clean."""
+def is_dangerous_command(cmdline: str, exe_basename: str = "") -> tuple[str, str] | None:
+    """Returns (matched_pattern_name, severity), or None if the command
+    is clean. The compound checks (rm, Remove-Item, del, git, reg, ...)
+    run against the full lowered cmdline so flags and context all
+    participate; the bare exe-name and inline-substring tiers are
+    checked the same way they always were."""
+    # Claude Code runs every Bash command inside a fixed wrapper (see
+    # core/agent_wrappers.py). The rules run on the command the agent asked
+    # for, never on the wrapper boilerplate. A wrapper is not suppressed:
+    # a dangerous inner command still matches at its normal severity.
+    unwrapped = unwrap_agent_command(cmdline)
+    if unwrapped is not None:
+        cmdline = unwrapped.inner
+        exe_basename = ""  # the wrapper's own bash.exe says nothing about the inner command
+
     exe = re.sub(r"\.(exe|bin)$", "", exe_basename.lower())
-    if exe in DANGEROUS_EXE_PATTERNS:
-        return exe
     lowered = cmdline.lower()
+
+    if _PIPE_TO_SHELL.search(lowered):
+        return "download_pipe_to_shell", "high"
+
+    if exe in _POWERSHELL_EXES and _POWERSHELL_BYPASS_FLAGS.search(lowered):
+        return "powershell_bypass_flag", "high"
+
+    if exe in _POWERSHELL_EXES and _IEX_WORD.search(lowered) and _NETWORK_INDICATOR.search(lowered):
+        return "powershell_iex_download", "high"
+
+    if (
+        _RM_WORD.search(lowered)
+        and (_SHORT_FLAG_R.search(lowered) or _LONG_RECURSIVE.search(lowered))
+        and (_SHORT_FLAG_F.search(lowered) or _LONG_FORCE.search(lowered))
+    ):
+        return "rm_recursive_force", "high"
+
+    if (
+        _REMOVE_ITEM_WORD.search(lowered)
+        and _PS_RECURSE_FLAG.search(lowered)
+        and _PS_FORCE_FLAG.search(lowered)
+    ):
+        return "remove_item_recurse_force", "high"
+
+    if _RD_RECURSIVE.search(lowered):
+        return "rd_recursive", "high"
+
+    if _DEL_WORD.search(lowered) and _DEL_FORCE_FLAG.search(lowered) and _DEL_RECURSE_FLAG.search(lowered):
+        return "del_force_recursive", "high"
+
+    if _GIT_PUSH_FORCE.search(lowered):
+        return "git_push_force", "high"
+
+    if _GIT_RESET_HARD.search(lowered):
+        return "git_reset_hard", "high"
+
+    if _REG_ADD_DELETE.search(lowered):
+        return "reg_add_delete", "high"
+
+    if _NET_USER.search(lowered):
+        return "net_user", "high"
+
+    if _SCHTASKS_CREATE.search(lowered):
+        return "schtasks_create", "high"
+
+    if exe in DANGEROUS_EXE_PATTERNS:
+        return exe, DANGEROUS_EXE_SEVERITY
+
     for pattern in DANGEROUS_INLINE_PATTERNS:
         if pattern in lowered:
-            return pattern
+            return pattern, DANGEROUS_INLINE_SEVERITY
+
     return None
 
 
@@ -415,11 +543,8 @@ class RedLines:
 
           - Write correlates with an active/recently-active session for
             this agent (see has_active_or_recent_session): normal
-            checkpoint activity. Fires severity="low",
-            rule_type="checkpoint_activity" — informational, logged for
-            audit, but dismissible like any regular alert (NOT gated by
-            the red_line non-disableable check in api/alerts.py, since
-            that gate keys on rule_type == "red_line" specifically).
+            checkpoint activity. No alert is created; the report shows
+            one info line per session instead.
           - No active/recent session at all: genuinely anomalous — a cache
             write with no corresponding Claude Code session in progress.
             Fires severity="high", rule_type="red_line" exactly as RL3
@@ -434,16 +559,11 @@ class RedLines:
         directory = str(Path(path.replace("\\", "/")).parent)
 
         if await has_active_or_recent_session(agent_id, db):
-            await self._fire(
-                agent_id, "checkpoint_activity", "low",
-                title=f"{agent_name} checkpoint write (normal /rewind activity)",
-                description=f"{agent_name} wrote to its hidden cache directory during an active session — "
-                             "consistent with normal /rewind checkpoint behavior.",
-                extra_detail={"path": path},
-                target=directory,
-                rule_type="checkpoint_activity",
-                session_id=session_id,
-            )
+            # Normal /rewind checkpoint activity: no alert is created (one
+            # per burst of snapshot files was pure noise). The write is
+            # still recorded as an ordinary file event, and the report
+            # shows one info line per session counting them (see
+            # api/export.py::_checkpoint_counts_by_session).
             return
 
         # No active/recent session exists — leaving session_id unset here
@@ -472,18 +592,25 @@ class RedLines:
             session_id=session_id,
         )
 
-    async def check_dangerous_command(self, agent_id: int, agent_name: str, cmdline: str, exe_basename: str = "", session_id: str | None = None) -> None:
+    async def check_dangerous_command(self, agent_id: int, agent_name: str, cmdline: str, exe_basename: str = "", session_id: str | None = None) -> bool:
+        """Returns True if the command matched a red-line pattern (an alert
+        was fired for it), so callers can skip a redundant generic alert."""
         matched = is_dangerous_command(cmdline, exe_basename)
         if matched is None:
-            return
+            return False
+        matched_pattern, severity = matched
         await self._fire(
-            agent_id, "dangerous_command", "medium",
+            agent_id, "dangerous_command", severity,
             title=f"RED LINE: sensitive command spawned by {agent_name}",
             description=f"{agent_name} spawned a potentially sensitive command: {cmdline}",
-            extra_detail={"command": cmdline, "matched_pattern": matched},
+            extra_detail={
+                "command": cmdline, "matched_pattern": matched_pattern,
+                **({"evaluated_command": unwrapped.inner[:500]} if (unwrapped := unwrap_agent_command(cmdline)) else {}),
+            },
             target=exe_basename or cmdline,
             session_id=session_id,
         )
+        return True
 
     async def check_cross_project_read(self, agent_id: int, agent_name: str, path: str, session_id: str | None = None) -> None:
         if not is_cross_project_read(path, get_agent_workspace_dir(agent_id)):

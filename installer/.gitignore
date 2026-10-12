@@ -2,10 +2,10 @@
 # hand-authored/generated source pieces staged under installer/build/,
 # but keep the large copied Electron/PyInstaller artifacts out.
 !build/
-!build/policy/
-!build/policy/**
 !build/assets/
 !build/assets/**
 build/tray/
 build/backend/
 output/
+
+build/frontend/

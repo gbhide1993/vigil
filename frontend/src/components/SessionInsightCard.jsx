@@ -59,8 +59,13 @@ export default function SessionInsightCard() {
       <div className="insight-card-body">
         <span className="insight-card-agent">{summary.agentName}</span> read{' '}
         <strong>{summary.fileReads}</strong> file{summary.fileReads !== 1 ? 's' : ''} and wrote{' '}
-        <strong>{summary.fileWrites}</strong> file{summary.fileWrites !== 1 ? 's' : ''}, contacting{' '}
-        <strong>{summary.netConnectCount}</strong> network destination{summary.netConnectCount !== 1 ? 's' : ''}.
+        <strong>{summary.fileWrites}</strong> file{summary.fileWrites !== 1 ? 's' : ''}
+        {summary.netConnectCount > 0 ? (
+          <>
+            , contacting <strong>{summary.netConnectCount}</strong> network destination{summary.netConnectCount !== 1 ? 's' : ''}
+          </>
+        ) : null}
+        .
         {summary.redLineFired ? (
           <> A <strong className="insight-card-redline">Red Line rule fired</strong> during this session.</>
         ) : (

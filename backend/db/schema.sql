@@ -62,6 +62,15 @@ CREATE TABLE IF NOT EXISTS alerts (
     session_id TEXT,              -- set directly by session-level detectors
                                    -- (e.g. Layer 2b) that have no single
                                    -- triggering event_id to join through
+    reason TEXT,                   -- fine-grained detection reason passed to
+                                    -- Alerter.fire_alert (e.g. "time_anomaly",
+                                    -- "credential_access") -- used with target
+                                    -- below for the open-duplicate guard
+    target TEXT,                   -- the specific thing this alert is about
+                                    -- (a path, a session_id, a destination) --
+                                    -- same value fire_alert's in-memory dedup
+                                    -- already keys on, persisted here so the
+                                    -- guard survives a restart
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -116,7 +125,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     summary TEXT,                 -- plain-English digest, set when the
                                    -- session closes (core/digest.py)
     operator_username TEXT,       -- OS user this session ran under (core/identity.py)
-    operator_hostname TEXT        -- machine hostname this session ran on
+    operator_hostname TEXT,       -- machine hostname this session ran on
+    resumed INTEGER NOT NULL DEFAULT 0  -- 1 if opened on the first poll after a
+                                         -- restart, rediscovering an already-
+                                         -- running process (core/sessions.py::touch)
 );
 
 -- User-defined suppressions for recurring false positives, e.g. a specific
@@ -145,9 +157,42 @@ CREATE TABLE IF NOT EXISTS app_config (
     updated_at TEXT DEFAULT (datetime('now'))
 );
 
+-- One row per backend process lifetime. last_seen_at is advanced every
+-- ~30s by a scheduler tick (see core/monitoring_coverage.py); a gap
+-- between ticks, or between one run's last_seen_at and the next run's
+-- started_at, is what Monitoring coverage in the export is built from.
+CREATE TABLE IF NOT EXISTS vigil_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT UNIQUE NOT NULL,
+    started_at TIMESTAMP NOT NULL,
+    last_seen_at TIMESTAMP NOT NULL,
+    clean_shutdown INTEGER DEFAULT 0  -- informational only, never used to
+                                      -- choose gap reason wording -- the
+                                      -- tray force-kills the backend on a
+                                      -- normal quit, so this is 0 even
+                                      -- for an entirely ordinary shutdown
+);
+CREATE INDEX IF NOT EXISTS idx_vigil_runs_started ON vigil_runs(started_at);
+
+-- Append-only. Every detected gap is stored, including very short
+-- restarts -- folding short ones into a summary line is a display
+-- decision made at export time, not a storage decision made here.
+CREATE TABLE IF NOT EXISTS monitoring_gaps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    gap_start TIMESTAMP NOT NULL,
+    gap_end TIMESTAMP NOT NULL,
+    reason TEXT NOT NULL,
+    detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_monitoring_gaps_start ON monitoring_gaps(gap_start);
+
 CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_id);
+CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
+CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id);
 CREATE INDEX IF NOT EXISTS idx_suppressions_lookup ON noise_suppressions(agent_name, rule_type);

@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from core.analytics import track
-from db.database import get_db
+from db.database import get_db, get_read_db
 
 router = APIRouter()
 
@@ -14,6 +14,20 @@ VALID_ACTIONS = {
     "risk_accepted": "risk_accepted",
 }
 NOTE_REQUIRED_ACTIONS = {"exception_approved", "risk_accepted"}
+
+
+def _invalidate_stats_cache() -> None:
+    """/api/stats caches for _STATS_CACHE_TTL_SECONDS (main.py) so repeated
+    3s polls don't each pay the query cost -- but that means resolving or
+    dismissing an alert here would otherwise not be reflected in
+    needs_review/alerts_open for up to that long. Deferred import (not at
+    module load time) avoids a circular import, since main.py is what
+    imports this router. The cache lives in core/runtime_state.py, shared
+    with main.py; routes must never `import main` (in the exe that loads a
+    second copy of main, with its own empty cache)."""
+    from core.runtime_state import stats_cache
+
+    stats_cache["data"] = None
 
 
 class ResolveAlertRequest(BaseModel):
@@ -43,11 +57,22 @@ async def get_alerts(
     session_id: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    since_hours: float | None = Query(default=None, gt=0),
 ):
-    db = await get_db()
+    db = await get_read_db()
+    try:
+        return await _get_alerts_data(db, status, severity, agent, session_id, limit, offset, since_hours)
+    finally:
+        await db.close()
 
+
+async def _get_alerts_data(db, status, severity, agent, session_id, limit, offset, since_hours=None):
     clauses = []
     params: list = []
+    if since_hours is not None:
+        # Only alerts detected within the last N hours (the Status page's 24h view).
+        clauses.append("al.created_at >= datetime('now', ?)")
+        params.append(f"-{since_hours} hours")
     if status is not None:
         clauses.append("al.status = ?")
         params.append(status)
@@ -151,6 +176,7 @@ async def bulk_dismiss(severity: str = Query(...), actor: str = Query(default="a
             (alert_id, actor, json.dumps({"note": "bulk dismissed from UI", "severity": severity})),
         )
     await db.commit()
+    _invalidate_stats_cache()
     return {"dismissed": len(ids)}
 
 
@@ -215,7 +241,74 @@ async def bulk_resolve(body: BulkResolveRequest, actor: str = Query(default="adm
             (alert_id, actor, json.dumps(body.model_dump(exclude_unset=True))),
         )
     await db.commit()
+    _invalidate_stats_cache()
     return {"resolved": len(ids)}
+
+
+@router.post("/alerts/resolve-older")
+async def resolve_older_alerts(
+    days: int = Query(default=7, ge=1, le=3650),
+    dry_run: bool = Query(default=False),
+    include_red_line: bool = Query(default=False),
+    actor: str = Query(default="admin"),
+):
+    """Resolve open alerts older than `days` days in one action, to clear a
+    backlog of old alerts off the dashboard. Only ever sets status to
+    'resolved' plus a resolution note and an audit-log row per alert; nothing
+    is deleted, so every alert stays available for audit and export.
+
+    Red-line alerts are skipped unless include_red_line=true (the UI asks
+    for that with a separate checkbox): they are the non-disableable safety
+    floor and are never resolved by accident. dry_run=true changes nothing
+    and returns the count and severity breakdown that a real run would
+    resolve, plus how many red-line alerts it is leaving alone."""
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT id, severity, rule_type FROM alerts WHERE status = 'open' AND created_at <= datetime('now', ?)",
+        (f"-{days} days",),
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+
+    red_line_rows = [r for r in rows if r["rule_type"] == "red_line"]
+    selected = rows if include_red_line else [r for r in rows if r["rule_type"] != "red_line"]
+
+    breakdown = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for r in selected:
+        breakdown[r["severity"]] = breakdown.get(r["severity"], 0) + 1
+
+    result = {
+        "dry_run": dry_run,
+        "days": days,
+        "include_red_line": include_red_line,
+        "count": len(selected),
+        "by_severity": breakdown,
+        "red_line_skipped": 0 if include_red_line else len(red_line_rows),
+    }
+    if dry_run or not selected:
+        return result
+
+    note = f"bulk resolved (older than {days} days)"
+    ids = [r["id"] for r in selected]
+    placeholders = ", ".join("?" for _ in ids)
+    await db.execute(
+        f"""
+        UPDATE alerts
+        SET status = 'resolved', resolved_by = ?, resolved_at = CURRENT_TIMESTAMP, resolution_note = ?
+        WHERE id IN ({placeholders}) AND status = 'open'
+        """,
+        (actor, note, *ids),
+    )
+    for alert_id in ids:
+        await db.execute(
+            """
+            INSERT INTO audit_log (action, entity_type, entity_id, actor, detail)
+            VALUES ('bulk_resolve_older', 'alert', ?, ?, ?)
+            """,
+            (alert_id, actor, json.dumps({"note": note, "days": days, "include_red_line": include_red_line})),
+        )
+    await db.commit()
+    _invalidate_stats_cache()
+    return result
 
 
 @router.post("/alerts/{alert_id}/resolve")
@@ -258,6 +351,7 @@ async def resolve_alert(alert_id: int, body: ResolveAlertRequest):
         ),
     )
     await db.commit()
+    _invalidate_stats_cache()
 
     await track("alert_resolved", {"severity": alert["severity"], "rule_type": alert["rule_type"]})
 

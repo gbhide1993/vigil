@@ -37,6 +37,8 @@ import threading
 import time
 
 from core.attributor import Attributor
+from core import watch_stats
+from core.ignore_rules import ignore_and_count
 
 logger = logging.getLogger("vlaw")
 
@@ -76,6 +78,19 @@ EVENT_ID_TO_TYPE = {
     TASK_RENAME: "file_write",
     TASK_DELETE_PATH: "file_delete",
     TASK_RENAME_PATH: "file_write",
+}
+
+# The change type stored with each event (EVENT_ID_TO_TYPE folds create, write
+# and rename into "file_write").
+EVENT_ID_TO_CHANGE = {
+    TASK_NAME_CREATE: "create",
+    TASK_NAME_DELETE: "delete",
+    TASK_WRITE: "write",
+    TASK_SET_INFORMATION: "write",
+    TASK_SET_DELETE: "delete",
+    TASK_RENAME: "move",
+    TASK_DELETE_PATH: "delete",
+    TASK_RENAME_PATH: "move",
 }
 
 # Events whose own properties are checked for a direct path, used to seed
@@ -252,6 +267,11 @@ class ETWFileWatcher:
             if not path:
                 return  # can't safely report a file event with no resolved path
 
+            # Generated / dependency folders are dropped here, before the
+            # attribution lookup and any dispatch (core/ignore_rules.py).
+            if ignore_and_count(path):
+                return
+
             pid = event.process_id
             if not pid:
                 return
@@ -265,7 +285,7 @@ class ETWFileWatcher:
                 return
 
             timestamp = event.timestamp_unix
-            self._dispatch(pid, path, event_type, timestamp)
+            self._dispatch(pid, path, event_type, timestamp, EVENT_ID_TO_CHANGE.get(event_id))
         except Exception:
             logger.exception("ETW file watcher: failed to process one event, skipping it")
 
@@ -300,9 +320,10 @@ class ETWFileWatcher:
             self._file_object_cache.pop(next(iter(self._file_object_cache)))
         self._file_object_cache[file_object] = path
 
-    def _dispatch(self, pid: int, path: str, event_type: str, timestamp: float) -> None:
+    def _dispatch(self, pid: int, path: str, event_type: str, timestamp: float, change: str | None = None) -> None:
         if not self._inflight.acquire(blocking=False):
             self._dropped_count += 1
+            watch_stats.add_dropped("overload")
             if self._dropped_count % 100 == 1:
                 logger.warning(
                     "ETW file watcher: dropping events, %d in-flight events already queued "
@@ -312,12 +333,12 @@ class ETWFileWatcher:
             return
 
         asyncio.run_coroutine_threadsafe(
-            self._invoke_callback(pid, path, event_type, timestamp), self._loop
+            self._invoke_callback(pid, path, event_type, timestamp, change), self._loop
         )
 
-    async def _invoke_callback(self, pid: int, path: str, event_type: str, timestamp: float) -> None:
+    async def _invoke_callback(self, pid: int, path: str, event_type: str, timestamp: float, change: str | None = None) -> None:
         try:
-            await self._callback(pid, path, event_type, timestamp)
+            await self._callback(pid, path, event_type, timestamp, change)
         except Exception:
             logger.exception("ETW file watcher: callback failed for pid=%s path=%s", pid, path)
         finally:
