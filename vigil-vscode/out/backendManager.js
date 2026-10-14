@@ -33,7 +33,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.BackendManager = void 0;
+exports.BackendManager = exports.INSTALL_BACKEND_COMMAND = void 0;
 exports.releaseLock = releaseLock;
 const vscode = __importStar(require("vscode"));
 const fs = __importStar(require("fs"));
@@ -46,6 +46,15 @@ const START_WAIT_TIMEOUT_MS = 30000;
 const START_WAIT_POLL_MS = 1000;
 const ALREADY_RUNNING_EXTRA_WAIT_MS = 30000;
 const LOCK_FILE_PATH = path.join(os.tmpdir(), 'vigil-backend.lock');
+// Where the backend installer comes from. Only this host is trusted: the manifest is read from it, and a
+// manifest that points anywhere else is refused.
+const DOWNLOAD_HOST = 'download.getvvault.com';
+const MANIFEST_URL = `https://${DOWNLOAD_HOST}/manifest.json`;
+const STANDALONE_INSTALLER_URL = `https://${DOWNLOAD_HOST}/Vigil-Setup.exe`;
+const README_INSTALL_URL = 'https://github.com/gbhide1993/vigil/blob/main/vigil-vscode/README.md#if-vigil-is-not-installed-yet';
+// Remembered when the user cancels the install prompt, so it is not shown again on every startup.
+const INSTALL_DECLINED_KEY = 'vigil.installPromptDeclined';
+exports.INSTALL_BACKEND_COMMAND = 'vigil.installBackend';
 function isPidRunning(pid) {
     try {
         const output = (0, child_process_1.execSync)(`tasklist /FI "PID eq ${pid}" /NH`, {
@@ -92,6 +101,17 @@ class BackendManager {
         this._capabilities = null;
         this._onStateChange = new vscode.EventEmitter();
         this.onStateChange = this._onStateChange.event;
+        // "Vigil: Install Backend": runs the install flow on request, even after the prompt was cancelled.
+        context.subscriptions.push(vscode.commands.registerCommand(exports.INSTALL_BACKEND_COMMAND, async () => {
+            await this.context.globalState.update(INSTALL_DECLINED_KEY, false);
+            if (await this.tryDownloadInstall(true)) {
+                this.setState('running');
+                await this.loadCapabilities();
+            }
+            else {
+                this.setState('offline');
+            }
+        }));
     }
     get state() {
         return this._state;
@@ -244,40 +264,62 @@ class BackendManager {
         const buffer = fs.readFileSync(filePath);
         return crypto.createHash('sha256').update(buffer).digest('hex');
     }
-    async downloadAndVerify() {
-        const manifestUrl = 'https://download.getvvault.com/manifest.json';
+    /** Reads the download manifest. Returns the win_x64 asset, or a message that says why there is none. */
+    async readManifest() {
         let manifest;
         try {
-            const res = await fetch(manifestUrl);
+            const res = await fetch(MANIFEST_URL);
             if (!res.ok) {
-                return null;
+                return { problem: `the download manifest could not be read (HTTP ${res.status})` };
             }
             manifest = await res.json();
         }
         catch {
-            return null;
+            return { problem: 'the download manifest could not be reached' };
         }
-        const assetInfo = manifest['win_x64'];
-        if (!assetInfo || !assetInfo.url || !assetInfo.sha256) {
-            return null;
+        const asset = manifest && manifest['win_x64'];
+        if (!asset || !asset.url || !asset.sha256) {
+            return { problem: 'the download manifest has no Windows (win_x64) installer entry' };
         }
-        const storageDir = this.context.globalStorageUri.fsPath;
-        if (!fs.existsSync(storageDir)) {
-            fs.mkdirSync(storageDir, { recursive: true });
+        return { asset: { url: String(asset.url), sha256: String(asset.sha256) } };
+    }
+    /** Null when the url is on the trusted host over https, otherwise the reason it is refused. */
+    untrustedHostProblem(url) {
+        let parsed;
+        try {
+            parsed = new URL(url);
         }
-        // FIX: Keep the correct name — this is the installer, not the backend exe
-        const destPath = path.join(storageDir, 'Vigil-Setup.exe');
+        catch {
+            return `the installer address in the manifest is not a valid URL (${url})`;
+        }
+        if (parsed.protocol !== 'https:' || parsed.host.toLowerCase() !== DOWNLOAD_HOST) {
+            return `the manifest points to ${parsed.protocol}//${parsed.host}, which is not ${DOWNLOAD_HOST}`;
+        }
+        return null;
+    }
+    offerStandaloneInstaller(problem) {
+        vscode.window.showWarningMessage(`Vigil: could not fetch the backend installer automatically (${problem}). ` +
+            `You can download the installer yourself from ${STANDALONE_INSTALLER_URL} and check its SHA256 against the one published with the release.`, 'Open download page').then(selection => {
+            if (selection === 'Open download page') {
+                vscode.env.openExternal(vscode.Uri.parse(STANDALONE_INSTALLER_URL));
+            }
+        });
+    }
+    /** Downloads the installer to destPath and checks it against the expected SHA256. Returns the verified
+     * hash, or null when the download itself failed. Throws on a hash mismatch (the file is deleted). */
+    async downloadToAndVerify(asset, destPath) {
         const downloaded = await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
-            title: 'Vigil: downloading backend installer (one-time setup ~110MB)',
+            title: 'Vigil: downloading backend installer (about 110 MB)',
             cancellable: false
         }, async () => {
             try {
-                const res = await fetch(assetInfo.url);
+                const res = await fetch(asset.url);
                 if (!res.ok || !res.body) {
                     return false;
                 }
                 const arrayBuffer = await res.arrayBuffer();
+                fs.mkdirSync(path.dirname(destPath), { recursive: true });
                 fs.writeFileSync(destPath, Buffer.from(arrayBuffer));
                 return true;
             }
@@ -289,7 +331,7 @@ class BackendManager {
             return null;
         }
         const actualHash = this.sha256File(destPath);
-        if (actualHash.toLowerCase() !== String(assetInfo.sha256).toLowerCase()) {
+        if (actualHash.toLowerCase() !== asset.sha256.toLowerCase()) {
             try {
                 fs.unlinkSync(destPath);
             }
@@ -298,28 +340,70 @@ class BackendManager {
             }
             throw new Error('Vigil backend download failed checksum verification.');
         }
-        return destPath;
+        return actualHash;
     }
-    async tryDownloadInstall() {
+    /** Asks before anything is downloaded. Returns the choice, or undefined when the user cancelled. */
+    async askInstallConsent(asset) {
+        const choice = await vscode.window.showInformationMessage('Vigil needs its local backend. Download and install it now?', {
+            modal: true,
+            detail: `Download: about 110 MB from ${DOWNLOAD_HOST} (Vigil-Setup.exe).\n\n` +
+                'The installer is not code-signed, and it needs administrator approval to install.\n\n' +
+                `It will be checked against this SHA256 before it is used:\n${asset.sha256}\n` +
+                'That value comes from the same server as the installer. For a separate check, download the installer yourself and compare it with the hash published with the release.\n\n' +
+                `"Download only" saves the installer to your Downloads folder and does not run it.\n\n` +
+                `Install steps and the unsigned-installer note: ${README_INSTALL_URL}`
+        }, 'Install now', 'Download only');
+        if (choice === 'Install now') {
+            return 'install';
+        }
+        if (choice === 'Download only') {
+            return 'download';
+        }
+        return undefined;
+    }
+    /** The consent-first install flow. `manual` is true when the user ran "Vigil: Install Backend". */
+    async tryDownloadInstall(manual = false) {
+        // A cancelled prompt is remembered: no prompt and no network call on later startups.
+        if (!manual && this.context.globalState.get(INSTALL_DECLINED_KEY)) {
+            return false;
+        }
+        const manifest = await this.readManifest();
+        if ('problem' in manifest) {
+            this.offerStandaloneInstaller(manifest.problem);
+            return false;
+        }
+        const asset = manifest.asset;
+        const hostProblem = this.untrustedHostProblem(asset.url);
+        if (hostProblem) {
+            vscode.window.showErrorMessage(`Vigil: refusing to download the backend installer: ${hostProblem}. Only ${DOWNLOAD_HOST} is allowed. ` +
+                `Download Vigil from ${STANDALONE_INSTALLER_URL} instead.`);
+            return false;
+        }
+        const consent = await this.askInstallConsent(asset);
+        if (consent === undefined) {
+            await this.context.globalState.update(INSTALL_DECLINED_KEY, true);
+            vscode.window.showInformationMessage('Vigil: backend install skipped. Run "Vigil: Install Backend" from the Command Palette to install it later.');
+            return false;
+        }
+        if (consent === 'download') {
+            return this.downloadOnly(asset);
+        }
         this.setState('downloading');
-        let installerPath;
+        let verifiedHash;
+        const installerPath = path.join(this.context.globalStorageUri.fsPath, 'Vigil-Setup.exe');
         try {
-            installerPath = await this.downloadAndVerify();
+            verifiedHash = await this.downloadToAndVerify(asset, installerPath);
         }
         catch (err) {
             vscode.window.showErrorMessage(`Vigil: backend download failed verification (${err.message}). Please install Vigil manually.`);
             return false;
         }
-        if (!installerPath) {
-            vscode.window.showInformationMessage('Vigil backend not found. Install from download.getvvault.com', 'Download').then(selection => {
-                if (selection === 'Download') {
-                    vscode.env.openExternal(vscode.Uri.parse('https://download.getvvault.com/Vigil-Setup.exe'));
-                }
-            });
+        if (verifiedHash === null) {
+            this.offerStandaloneInstaller('the installer download failed');
             return false;
         }
-        // FIX: Run the installer silently, then wait for it to finish, then start the backend
-        vscode.window.showInformationMessage('Vigil: installing backend, please wait...');
+        // Run the installer silently, wait for it to finish, then start the backend.
+        vscode.window.showInformationMessage(`Vigil: installer verified (SHA256 ${verifiedHash}). Installing the backend, please wait...`);
         try {
             // /SILENT runs without UI, /NORESTART suppresses reboot prompt
             (0, child_process_1.spawnSync)(installerPath, ['/SILENT', '/NORESTART'], {
@@ -345,6 +429,30 @@ class BackendManager {
                 vscode.commands.executeCommand('workbench.action.reloadWindow');
             }
         });
+        return false;
+    }
+    /** "Download only": saves the verified installer to the Downloads folder and does not run it. */
+    async downloadOnly(asset) {
+        const destPath = path.join(os.homedir(), 'Downloads', 'Vigil-Setup.exe');
+        let verifiedHash;
+        try {
+            verifiedHash = await this.downloadToAndVerify(asset, destPath);
+        }
+        catch (err) {
+            vscode.window.showErrorMessage(`Vigil: the download failed verification (${err.message}). Nothing was saved.`);
+            return false;
+        }
+        if (verifiedHash === null) {
+            this.offerStandaloneInstaller('the installer download failed');
+            return false;
+        }
+        vscode.window.showInformationMessage(`Vigil: installer saved to ${destPath} (SHA256 verified: ${verifiedHash}). It was not run. ` +
+            'Run it yourself when you are ready, then restart VS Code.', 'Show in folder').then(selection => {
+            if (selection === 'Show in folder') {
+                vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(destPath));
+            }
+        });
+        // Nothing was installed, so the backend is still not running.
         return false;
     }
     async ensureVigilRunning() {

@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.25] - 2026-10-14
+### Changed
+- README rewritten to match Vigil 0.9.0: network and MCP monitoring moved to "Not in this version",
+  Red Lines section lists only the rules that can fire, "Works with" limited to the agents Vigil
+  recognises, VS Code requirement corrected to 1.85+
+- Added "Privacy and data flow" and "Limits" sections (records are not protected against edits to the local database, best-guess
+  attribution without ETW, file reads not recorded, Windows only)
+- Added the unsigned installer / SmartScreen note with SHA256 verification advice, and described the
+  first-launch installer download
+- Package description and keywords no longer use "evidence" or "audit"
+- The "Copy Evidence Hash" command is now titled "Copy Session Summary Hash": the value is a SHA-256 of
+  the session summary, not a proof of integrity
+
 ## [0.2.12] - 2026-08-15
 ### Fixed
 - Sidebar now correctly displays active sessions, red lines, and findings
