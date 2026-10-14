@@ -272,7 +272,8 @@ async def verify_chain() -> dict:
       status                 "inconsistent" (the chain disagrees with itself), or, for a chain that is
                              consistent, "shorter_than_local_anchor" (fewer sealed events than an anchor
                              recorded: truncation), "disagrees_with_local_anchor" (a different hash at an
-                             anchored event) or "anchor_continuity_break" (the anchor series itself is broken,
+                             anchored event), "timestamp_mismatch" (an external timestamp token held for an
+                             anchor does not match that anchor) or "anchor_continuity_break" (the anchor series itself is broken,
                              for example a replaced database), else "consistent"
       anchors                core/evidence_anchor.check_anchors()'s result
 
@@ -295,7 +296,7 @@ async def verify_chain() -> dict:
         result["status"] = "inconsistent"
         return result
     status = anchors["status"]
-    if status in ("shorter_than_local_anchor", "disagrees_with_local_anchor", "anchor_continuity_break"):
+    if status in ("shorter_than_local_anchor", "disagrees_with_local_anchor", "anchor_continuity_break", "timestamp_mismatch"):
         result["valid"] = False
         result["status"] = status
         result["reason"] = status

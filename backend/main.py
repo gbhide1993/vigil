@@ -447,6 +447,12 @@ async def lifespan(app: FastAPI):
         _anchor_evidence_chain, "interval", hours=1, id="evidence_anchor",
         max_instances=1, coalesce=True,
     )
+    # Opt-in external timestamps (core/external_timestamp.py). A no-op while the setting is off. Its own
+    # job, so a slow or unreachable service can never delay sealing, anchoring or an export.
+    scheduler.add_job(
+        _timestamp_anchors, "interval", minutes=1, id="external_timestamp",
+        max_instances=1, coalesce=True,
+    )
     # SessionManager.close_idle_sessions disabled pending event-loop audit.
     # scheduler.add_job(
     #     attributor.sessions.close_idle_sessions,
@@ -503,6 +509,12 @@ async def _anchor_evidence_chain(trigger: str = "hourly") -> None:
         await refresh_chain_verification_cache()
     except Exception:
         logger.exception("could not refresh the cached evidence verification")
+
+
+async def _timestamp_anchors() -> None:
+    from core.external_timestamp import run_queue
+
+    await run_queue()
 
 
 async def _anchor_after_gap(run_id: str | None) -> None:

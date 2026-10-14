@@ -78,6 +78,8 @@ export const api = {
   getConfigAudit: () => request('/config-audit'),
   getWebhookUrl: () => request('/config/webhook-url'),
   setWebhookUrl: (url) => request('/config/webhook-url', { method: 'POST', body: JSON.stringify({ url }) }),
+  getExternalTimestamp: () => request('/config/external-timestamp'),
+  setExternalTimestamp: (settings) => request('/config/external-timestamp', { method: 'POST', body: JSON.stringify(settings) }),
   sendTestWebhook: () => request('/digest/send-webhook', { method: 'POST' }),
   exportJsonUrl: (date) => `${BASE}/export/json?date=${date}`,
   // For showing the report on the page (every load and date change): the evidence check is the last one

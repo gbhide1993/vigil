@@ -291,7 +291,9 @@ async def check_anchors(*, db_path=None, key_directory: Path | None = None) -> d
     try:
         # One pass: each anchor joined to the chain row of its last event (an indexed lookup), not one query per anchor.
         cur = await conn.execute(
-            "SELECT a.*, c.row_hash AS chain_row_hash FROM evidence_anchors a "
+            "SELECT a.anchor_seq, a.anchor_json, a.anchor_hash, a.prev_anchor_hash, a.chain_head, a.event_count, "
+            "a.last_event_id, a.install_id, a.created_at, a.trigger, a.status, a.attempts, a.error, "
+            "c.row_hash AS chain_row_hash FROM evidence_anchors a "
             "LEFT JOIN event_chain c ON c.event_id = a.last_event_id ORDER BY a.anchor_seq ASC"
         )
         anchors = await cur.fetchall()
@@ -322,14 +324,19 @@ async def check_anchors(*, db_path=None, key_directory: Path | None = None) -> d
             if problem:
                 mismatches.append({"anchor_seq": anchor["anchor_seq"], "kind": problem[0], "detail": problem[1]})
 
+        timestamps, timestamp_problems = await _review_timestamps(conn, anchors)
+        mismatches.extend(timestamp_problems)
+
         continuity = _check_continuity(anchors, load_state(key_directory))
         last_public = _public(anchors[-1]) if anchors else None
 
         # The most serious kind first: truncation, then a different hash, then an altered anchor row.
-        order = {"shorter": 0, "disagrees": 1, "altered": 2}
+        order = {"shorter": 0, "disagrees": 1, "altered": 2, "timestamp": 3}
         first = min(mismatches, key=lambda m: (order[m["kind"]], m["anchor_seq"])) if mismatches else None
         if first and first["kind"] == "shorter":
             status = "shorter_than_local_anchor"
+        elif first and first["kind"] == "timestamp":
+            status = "timestamp_mismatch"
         elif first:
             status = "disagrees_with_local_anchor"
         elif continuity["status"] == "break":
@@ -343,12 +350,84 @@ async def check_anchors(*, db_path=None, key_directory: Path | None = None) -> d
             "anchors_mismatched": len(mismatches),
             "first_mismatch": first,
             "last_anchor": last_public,
-            "anchoring": "local_only" if anchors else "none",
+            "anchoring": (timestamps["status"] if timestamps["timestamped"] else "local_only") if anchors else "none",
+            "timestamps": timestamps,
             "status": status,
             "continuity": continuity,
         }
     finally:
         await conn.close()
+
+
+async def _review_timestamps(conn, anchors) -> tuple[dict, list[dict]]:
+    """Stage 2: what the stored external timestamp tokens say, read from the database; nothing is fetched.
+
+    Every held token is parsed and its message imprint must equal its anchor's hash; a token that does not
+    match is a mismatch (kind "timestamp") and the anchor does not count as timestamped. The signature is
+    checked only for the newest timestamped anchor, and only against a certificate the user supplied
+    (external_timestamp_ca_pem); with none, that token is reported as timestamp_unverified_signature.
+    Overall status: "none" (no anchors), "local_only" (no valid token), "partially_timestamped" (some, but
+    the newest anchor has none: events after the newest token are anchored locally only) or
+    "externally_timestamped" (the newest anchor has a valid token). Anchors recorded before timestamping
+    was turned on are not back-filled; the newest token covers them through the anchor hash chain."""
+    from core import external_timestamp as ts
+
+    settings = await ts.load_settings(conn)
+    cur = await conn.execute(
+        "SELECT anchor_seq, tsa_token, tsa_name, timestamped_at FROM evidence_anchors WHERE status = 'timestamped' ORDER BY anchor_seq")
+    held = {r["anchor_seq"]: r for r in await cur.fetchall()}
+    problems: list[dict] = []
+    valid: dict[int, dict] = {}
+    by_seq = {a["anchor_seq"]: a for a in anchors}
+    for seq, row in held.items():
+        anchor = by_seq.get(seq)
+        if anchor is None or row["tsa_token"] is None:
+            continue
+        try:
+            gen_time = ts.check_imprint(bytes(row["tsa_token"]), anchor["anchor_hash"])
+        except ts.TimestampError as exc:
+            problems.append({"anchor_seq": seq, "kind": "timestamp",
+                             "detail": f"the timestamp token held for anchor {seq} does not match the anchor ({exc})"})
+            continue
+        valid[seq] = {"tsa": row["tsa_name"], "tsa_time": gen_time.strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+    latest = None
+    if valid:
+        seq = max(valid)
+        signature = ts.check_signature(bytes(held[seq]["tsa_token"]), settings["ca_pem"])
+        if signature["signature"] == ts.SIGNATURE_FAILED:
+            problems.append({"anchor_seq": seq, "kind": "timestamp",
+                             "detail": f"the timestamp signature on anchor {seq} failed: {signature['detail']}"})
+            valid.pop(seq)
+            seq = max(valid) if valid else None
+            signature = ts.check_signature(bytes(held[seq]["tsa_token"]), settings["ca_pem"]) if seq else None
+        if seq is not None and signature is not None:
+            latest = {"anchor_seq": seq, "anchor_time": by_seq[seq]["created_at"], "tsa": valid[seq]["tsa"],
+                      "tsa_time": valid[seq]["tsa_time"], "signature": signature["signature"],
+                      "signature_detail": signature["detail"]}
+
+    since = settings["since_seq"] or 1
+    eligible = [a for a in anchors if a["anchor_seq"] >= since]
+    if not anchors:
+        overall = "none"
+    elif not valid:
+        overall = "local_only"
+    elif anchors[-1]["anchor_seq"] in valid:
+        overall = "externally_timestamped"
+    else:
+        overall = "partially_timestamped"
+    recent = [
+        {"anchor_seq": a["anchor_seq"], "status": "externally_timestamped" if a["anchor_seq"] in valid else "local_only",
+         "queue_status": a["status"], "attempts": a["attempts"]}
+        for a in anchors[-20:]
+    ]
+    return {
+        "status": overall, "timestamped": len(valid), "eligible": len(eligible),
+        "enabled": ts.is_active(settings),
+        # Anchors that should have a token and do not (no network, no reply yet). Zero while the feature is off.
+        "waiting": sum(1 for a in eligible if a["anchor_seq"] not in valid) if ts.is_active(settings) else 0,
+        "latest": latest, "recent": recent,
+    }, problems
 
 
 def _check_continuity(anchors, state: dict | None) -> dict:

@@ -127,6 +127,22 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         await db.execute("ALTER TABLE sessions ADD COLUMN resumed INTEGER NOT NULL DEFAULT 0")
         await db.commit()
 
+    # Stage 2 of docs/design/evidence-anchoring.md (opt-in external timestamps), the columns of section 4.2.
+    # tsa_name holds the URL of the service that issued the token; timestamped_at is the token's genTime.
+    cur = await db.execute("PRAGMA table_info(evidence_anchors)")
+    columns = {row["name"] for row in await cur.fetchall()}
+    for name, definition in (
+        ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_try_at", "TEXT"),
+        ("tsa_token", "BLOB"),
+        ("tsa_name", "TEXT"),
+        ("timestamped_at", "TEXT"),
+        ("error", "TEXT"),
+    ):
+        if name not in columns:
+            await db.execute(f"ALTER TABLE evidence_anchors ADD COLUMN {name} {definition}")
+            await db.commit()
+
 
 async def _seed_policy(db: aiosqlite.Connection) -> None:
     if not POLICY_FILE.exists():

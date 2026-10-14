@@ -291,3 +291,38 @@ def test_the_design_doc_says_the_tables_digest_is_recorded_but_not_verified():
     doc = (ROOT / "docs" / "design" / "evidence-anchoring.md").read_text(encoding="utf-8")
     assert doc.count("recorded but not yet verified") >= 2
     assert "After that the report cannot be altered without detection" not in doc
+
+
+# ------------------------------------------------------------------ Stage 2: opt-in external timestamps
+
+def test_the_coverage_block_and_every_readme_say_opt_in_hash_only_second_connection_and_what_a_token_covers():
+    block = " ".join(report_coverage.LINES)
+    assert "External timestamps are off unless you turn them on" in block
+    assert "only a 32-byte hash of an anchor" in block and "a second outbound connection" in block
+    assert "covers only what existed when that anchor was made" in block
+
+    for name in READMES + ["docs/COVERAGE.md"]:
+        text = " ".join((ROOT / name).read_text(encoding="utf-8").split())
+        assert "second outbound connection" in text, name
+        assert "32-byte" in text, name
+        assert re.search(r"off by default|opt-in", text), name
+        assert re.search(r"covers only what existed when (that|the|its) anchor was made", text), name
+        # the old claim that the webhook is the only outbound path must be gone
+        assert "only outbound path" not in text.lower() and "the only outbound" not in text.lower(), name
+
+
+def test_stage_2_text_never_calls_a_timestamp_verified_by_an_authority_or_uses_forbidden_words():
+    doc = (ROOT / "docs" / "design" / "evidence-anchoring.md").read_text(encoding="utf-8")
+    section = doc[doc.index("## 13. Stage 2 as built"):]
+    source = (BACKEND / "core" / "external_timestamp.py").read_text(encoding="utf-8")
+    export = (BACKEND / "api" / "export.py").read_text(encoding="utf-8")
+    lines = export[export.index("def _chain_lines"):export.index("@router.get(\"/export/json\")")]
+    for name, text in (("design section 13", section), ("external_timestamp.py", source), ("report lines", lines)):
+        lowered = text.lower()
+        for phrase in ("verified by authority", "verified by the authority", "tamper-proof", "tamper-evident", "cannot be altered"):
+            assert phrase not in lowered, (name, phrase)
+    # the settings text: the exact disclosure, in the module the UI reads it from
+    from core import external_timestamp
+
+    assert external_timestamp.DISCLOSURE.startswith("When on, Vigil sends only a 32-byte hash of an anchor")
+    assert "unverified" in lines and "was not checked because no certificate was supplied" in lines

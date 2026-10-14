@@ -21,6 +21,9 @@ LINES = [
     "depend on a read (a .env file read outside the project, a cross-project read) cannot fire.",
     "Alerts, sessions, audit entries and monitoring-gap records are stored but not integrity-protected in "
     "this version; only the event chain is.",
+    "External timestamps are off unless you turn them on. When on, only a 32-byte hash of an anchor is sent to the "
+    "timestamp service you choose (a second outbound connection), and a token covers only what existed when that "
+    "anchor was made.",
 ]
 
 

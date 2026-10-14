@@ -703,6 +703,9 @@ def _shape_chain(result: dict, head: dict) -> dict:
         "sealed_count": head["sealed_count"],
         "unsealed_count": head["unsealed_count"],
         "anchoring": anchors["anchoring"],
+        # Stage 2: what the stored external timestamp tokens say (core/evidence_anchor.py _review_timestamps).
+        "timestamps": anchors.get("timestamps") or {"status": "none" if not checked else "local_only", "timestamped": 0,
+                                                    "eligible": 0, "waiting": 0, "latest": None, "recent": []},
         "last_anchor": None if anchors["last_anchor"] is None else {
             "time": anchors["last_anchor"]["created_at"],
             "anchor_seq": anchors["last_anchor"]["anchor_seq"],
@@ -801,6 +804,14 @@ def _chain_lines(chain: dict) -> list[str]:
         )
         if problem.get("detail"):
             lines.append(problem["detail"])
+    elif status == "timestamp_mismatch":
+        problem = chain["anchor_problem"] or {}
+        lines.append(
+            f"Evidence chain: consistent, but an external timestamp token does not match local anchor seq {problem.get('anchor_seq', '?')}. "
+            "Do not rely on this report."
+        )
+        if problem.get("detail"):
+            lines.append(problem["detail"])
     elif status == "disagrees_with_local_anchor":
         problem = chain["anchor_problem"] or {}
         lines.append(
@@ -815,14 +826,41 @@ def _chain_lines(chain: dict) -> list[str]:
             detail = chain["anchor_continuity"]["detail"] or ""
             lines.append(f"Anchor continuity: BREAK. {detail} Do not rely on this report.")
 
+    stamps = chain.get("timestamps") or {}
+    latest_stamp = stamps.get("latest")
     if chain["anchors_checked"]:
         matched = chain["anchors_checked"] - (chain["anchors_mismatched"] or 0)
+        if latest_stamp:
+            lines.append(
+                f"Last anchor: {last['time']} (seq {last['anchor_seq']}), status: "
+                + ("timestamped" if last["anchor_seq"] == latest_stamp["anchor_seq"] else
+                   f"waiting for timestamp (the newest token is for seq {latest_stamp['anchor_seq']})")
+                + f" by {latest_stamp['tsa']} at {latest_stamp['tsa_time']}. "
+                f"{matched} of {chain['anchors_checked']} anchors match the chain. Checked by Vigil itself."
+            )
+        else:
+            lines.append(
+                f"Local anchors: {chain['anchors_checked']} recorded, last {last['time']} (seq {last['anchor_seq']}), "
+                f"status: local only, no external timestamp. {matched} of {chain['anchors_checked']} match the chain. "
+                "Checked by Vigil itself."
+            )
+    if latest_stamp:
         lines.append(
-            f"Local anchors: {chain['anchors_checked']} recorded, last {last['time']} (seq {last['anchor_seq']}), "
-            f"status: local only, no external timestamp. {matched} of {chain['anchors_checked']} match the chain. "
-            "Checked by Vigil itself."
+            f"Anchors up to {latest_stamp['anchor_time']} carry a timestamp issued by {latest_stamp['tsa']}. "
+            f"Events recorded after the last timestamped anchor ({latest_stamp['anchor_time']}) are anchored locally only "
+            "and are not yet externally protected."
         )
-    if status in ("consistent", "anchor_continuity_break"):
+        if latest_stamp["signature"] == "verified":
+            lines.append("Timestamp signature: checked against the certificate you supplied. The service attests only to the time of the hash.")
+        else:
+            lines.append("Timestamp signature: timestamp_unverified_signature. The token's hash and time were read, but its signature "
+                         "was not checked because no certificate was supplied.")
+    elif stamps.get("waiting") and chain["anchors_checked"]:
+        lines.append(
+            f"Waiting for timestamp: {stamps['waiting']} anchors have no external timestamp yet (no network or no reply). "
+            "Events recorded after the last timestamped anchor are not yet externally protected."
+        )
+    if status in ("consistent", "anchor_continuity_break") and not latest_stamp:
         lines.append(NO_ANCHORING_LINE)
     if chain["unsealed_count"]:
         lines.append(f"Not yet sealed into the chain: {chain['unsealed_count']} events (sealed within about 15 seconds).")
