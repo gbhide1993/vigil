@@ -1,12 +1,12 @@
 # Vigil — AI Agent Monitor Plugin for Claude Code
 
-Vigil records the **file changes, process spawns and credential-file activity** your Claude Code agent causes, independently of agent self-reporting, and generates a PDF session report you can share with security and compliance teams. The report states what is not covered: file reads are not recorded, and network monitoring is planned and off in this version.
+Vigil records the **file changes, process spawns and changes to credential files** your Claude Code agent causes, independently of agent self-reporting, and generates a PDF session report you can share with security and compliance teams. The report states what is not covered: file reads are not recorded, and network monitoring is planned and off in this version.
 
 ## What it does
 
 When Vigil is running alongside Claude Code, it:
 
-- **Monitors file activity** — records files the agent creates, changes, moves or deletes (file reads are not recorded), flags out-of-scope paths and credential files (`.env`, SSH keys, AWS credentials)
+- **Monitors file activity** — records files the agent creates, changes, moves or deletes (file reads are not recorded), flags changes outside the watched folders and changes to credential files (`.env`, SSH keys, AWS credentials); reading a credential file is not detected
 - **Network monitoring is planned** — network connections are not monitored in this version, so unrecognised-destination alerts are not produced
 - **Records process spawns** — records the processes the agent launches, with command text (secrets redacted on a best-effort basis). Processes are checked about every 30 seconds, so one that starts and finishes between checks is not recorded
 - **Generates session PDF reports** — a one-click session report with timestamps in your local timezone, color-coded labels, and a policy legend
@@ -80,7 +80,7 @@ Key policy fields:
 
 ## Privacy
 
-Vigil runs **entirely locally**. No event data leaves your machine. The PDF is generated locally and never uploaded anywhere.
+Vigil runs locally and uploads no event data. The only outbound path is an optional Slack or Teams webhook that sends a daily digest (counts and a summary sentence), and only if you save a URL. The native app listens on 127.0.0.1 only. The PDF is generated locally and never uploaded anywhere.
 
 ## Support
 
