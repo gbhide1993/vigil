@@ -19,6 +19,8 @@ LINES = [
     "Records stay on this machine.",
     "A change to a credential file is flagged, but reading one is not detected, so the Red Lines that "
     "depend on a read (a .env file read outside the project, a cross-project read) cannot fire.",
+    "Alerts, sessions, audit entries and monitoring-gap records are stored but not integrity-protected in "
+    "this version; only the event chain is.",
 ]
 
 
