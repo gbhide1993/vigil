@@ -19,7 +19,7 @@ function severityColor(step) {
 
 const STORY_LABELS = {
   file_read: { action: 'opened', severity: 'low' },
-  cred_access: { action: 'accessed credential file', severity: 'critical' },
+  cred_access: { action: 'changed credential file', severity: 'critical' },
   proc_spawn: { action: 'spawned', severity: 'medium' },
   net_connect: { action: 'connected to', severity: 'medium' },
   mcp_connect: { action: 'opened MCP connection', severity: 'high' },

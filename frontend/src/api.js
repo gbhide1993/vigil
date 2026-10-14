@@ -80,6 +80,9 @@ export const api = {
   setWebhookUrl: (url) => request('/config/webhook-url', { method: 'POST', body: JSON.stringify({ url }) }),
   sendTestWebhook: () => request('/digest/send-webhook', { method: 'POST' }),
   exportJsonUrl: (date) => `${BASE}/export/json?date=${date}`,
+  // For showing the report on the page (every load and date change): the evidence check is the last one
+  // made, labelled with its time. Only the download itself (exportJsonUrl, exportPdfUrl) runs a fresh check.
+  exportJsonPreviewUrl: (date) => `${BASE}/export/json?date=${date}&preview=true`,
   exportPdfUrl: (date) => `${BASE}/export/pdf?date=${date}`,
   sessionReportUrl: (sessionId) => `${BASE}/sessions/${encodeURIComponent(sessionId)}/report`,
   getAnalyticsSummary: () => request('/analytics/summary'),

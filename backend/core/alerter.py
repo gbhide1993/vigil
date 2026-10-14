@@ -4,10 +4,10 @@ severity rules and audit logging stay consistent in one place.
 
 Severity rules (per policy / Frank Besadesky model):
   CRITICAL: unapproved agent detected running
-  HIGH:     credential path accessed (~/.ssh, *.pem, etc.)
+  HIGH:     credential path changed (~/.ssh, *.pem, etc.)
   HIGH:     unapproved MCP server connected
-  MEDIUM:   .env file accessed
-  MEDIUM:   out-of-scope directory accessed
+  MEDIUM:   .env file changed
+  MEDIUM:   out-of-scope directory changed
   MEDIUM:   suspicious command spawned
   LOW:      unapproved network destination
   LOW:      anomaly score > 0.7
@@ -204,7 +204,7 @@ class Alerter:
         self, agent_id: int, path: str, event_id: int | None = None, session_id: str | None = None,
         pid: int | None = None, parent_pid: int | None = None, process_path: str | None = None,
     ) -> Optional[VigilEvidence]:
-        """HIGH: credential path accessed. MEDIUM instead for .env
+        """HIGH: credential path changed (created, changed, moved or deleted; reads are not recorded). MEDIUM instead for .env
         specifically, per the severity table.
 
         Additionally builds and returns a VigilEvidence record (core.evidence)
@@ -217,8 +217,8 @@ class Alerter:
         await self.fire_alert(
             agent_id,
             severity,
-            title=f"Credential path accessed: {path}",
-            description=f"Agent accessed a credential-sensitive path: {path}",
+            title=f"Credential path changed: {path}",
+            description=f"Agent created, changed, moved or deleted a credential-sensitive path: {path}. Reads are not recorded, so reading one is not detected.",
             reason="credential_access",
             event_id=event_id,
             extra_detail={"path": path},
@@ -307,7 +307,7 @@ class Alerter:
     async def check_out_of_scope_access(
         self, agent_id: int, path: str, event_id: int | None = None, session_id: str | None = None,
     ) -> None:
-        """MEDIUM: path accessed outside policy scope_directories, or
+        """MEDIUM: path changed outside policy scope_directories, or
         CRITICAL if inside never_scope_directories."""
         db = await get_db()
 
@@ -322,7 +322,7 @@ class Alerter:
                 agent_id,
                 "critical",
                 title=f"Data boundary violation: {path}",
-                description=f"Agent accessed a path inside never_scope_directories: {path}",
+                description=f"Agent changed a path inside never_scope_directories: {path}",
                 reason="data_boundary_violation",
                 event_id=event_id,
                 extra_detail={"path": path},
@@ -336,8 +336,8 @@ class Alerter:
             await self.fire_alert(
                 agent_id,
                 "medium",
-                title=f"Out-of-scope directory access: {path}",
-                description=f"Agent accessed {path}, which is outside the approved scope_directories.",
+                title=f"Out-of-scope directory change: {path}",
+                description=f"Agent changed {path}, which is outside the approved scope_directories.",
                 reason="out_of_scope_access",
                 event_id=event_id,
                 extra_detail={"path": path},

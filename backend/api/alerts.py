@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from core.analytics import track
+from core.digest import display_summary
 from db.database import get_db, get_read_db
 
 router = APIRouter()
@@ -129,8 +130,11 @@ async def _get_alerts_data(db, status, severity, agent, session_id, limit, offse
         params + [limit, offset],
     )
     rows = await cur.fetchall()
+    alerts = [dict(r) for r in rows]
+    for alert in alerts:
+        alert["session_summary"] = display_summary(alert["session_summary"])
     return {
-        "alerts": [dict(r) for r in rows],
+        "alerts": alerts,
         "total": total,
         "limit": limit,
         "offset": offset,

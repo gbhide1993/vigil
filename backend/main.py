@@ -1,7 +1,7 @@
 """FastAPI app entry point. Startup sequence:
 1. Init SQLite DB and run schema
 2. Load policy from vlaw-policy.json
-3. Validate RSA license (14-day trial grace period if no license file)
+3. Validate RSA license (30-day trial if no license file)
 4. Start PollingObserver for file watching
 5. Start APScheduler jobs: process_watcher (30s), aggregator flush,
    baseline update (hourly), evidence chain seal. The network and MCP
@@ -77,6 +77,9 @@ os.makedirs(BASE_DIR, exist_ok=True)
 os.environ.setdefault("VLAW_DATA_DIR", os.path.join(BASE_DIR, "data"))
 os.environ.setdefault("VLAW_POLICY_FILE", os.path.join(BASE_DIR, "policy", "vlaw-policy.json"))
 os.environ.setdefault("VLAW_LICENSE_FILE", os.path.join(BASE_DIR, ".vlaw-license"))
+# Outside the data directory on purpose: the evidence anchor counter and install id live here, so deleting
+# vlaw.db does not reset them (core/evidence_anchor.py).
+os.environ.setdefault("VLAW_KEY_DIR", os.path.join(os.path.dirname(os.path.abspath(os.environ["VLAW_DATA_DIR"])), "keys"))
 
 import asyncio
 import concurrent.futures
@@ -245,14 +248,14 @@ async def lifespan(app: FastAPI):
     # etc. below -- that delay would otherwise show up as a few extra
     # seconds of "Vigil was not running" in the next export.
     from core.monitoring_coverage import start_run as _start_coverage_run
-    await _start_coverage_run()
+    coverage_run_id = await _start_coverage_run()
 
     # 2. Policy
     _ensure_default_policy()
     policy = load_policy()
     logger.info("policy loaded: %d keys", len(policy))
 
-    # 3. License (offline, 14-day trial fallback)
+    # 3. License (offline, 30-day trial fallback)
     license_service = LicenseService()
     license_status = license_service.get_status()
     logger.info("license status: plan=%s valid=%s trial=%s", license_status.plan, license_status.valid, license_status.is_trial)
@@ -439,6 +442,11 @@ async def lifespan(app: FastAPI):
         _seal_evidence_chain, "interval", seconds=15, id="evidence_chain_seal",
         max_instances=1, coalesce=True,
     )
+    # Local evidence anchor (core/evidence_anchor.py): hourly, and only when the chain head changed.
+    scheduler.add_job(
+        _anchor_evidence_chain, "interval", hours=1, id="evidence_anchor",
+        max_instances=1, coalesce=True,
+    )
     # SessionManager.close_idle_sessions disabled pending event-loop audit.
     # scheduler.add_job(
     #     attributor.sessions.close_idle_sessions,
@@ -450,6 +458,7 @@ async def lifespan(app: FastAPI):
     #     coalesce=True,
     # )
     scheduler.start()
+    await _anchor_after_gap(coverage_run_id)
     _state["scheduler"] = scheduler
     from core.monitoring_status import bind_scheduler
     bind_scheduler(scheduler)
@@ -479,6 +488,34 @@ async def _baseline_tick(baseline: Baseline) -> None:
     rows = await cur.fetchall()
     for row in rows:
         await baseline.update_from_session(row["id"])
+
+
+async def _anchor_evidence_chain(trigger: str = "hourly") -> None:
+    from core.evidence_anchor import create_anchor
+    from core.evidence_chain import seal_new_events
+
+    await seal_new_events()
+    await create_anchor(trigger)
+    # Keep the "last verification" the Export page shows reasonably fresh without a request paying for it.
+    try:
+        from api.export import refresh_chain_verification_cache
+
+        await refresh_chain_verification_cache()
+    except Exception:
+        logger.exception("could not refresh the cached evidence verification")
+
+
+async def _anchor_after_gap(run_id: str | None) -> None:
+    """A restart after a monitoring gap is itself pinned with an anchor (design doc section 4.1)."""
+    if not run_id:
+        return
+    try:
+        db = await get_db()
+        cur = await db.execute("SELECT 1 FROM monitoring_gaps WHERE run_id = ? LIMIT 1", (run_id,))
+        if await cur.fetchone() is not None:
+            await _anchor_evidence_chain("startup_gap")
+    except Exception:
+        logger.exception("evidence anchor after a monitoring gap failed -- continuing startup")
 
 
 async def _seal_evidence_chain() -> None:

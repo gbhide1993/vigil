@@ -26,7 +26,7 @@ export default function Export() {
     }
     async function load() {
       try {
-        const res = await fetch(api.exportJsonUrl(date))
+        const res = await fetch(api.exportJsonPreviewUrl(date))
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const data = await res.json()
         if (!cancelled) {

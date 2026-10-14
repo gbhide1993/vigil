@@ -14,6 +14,9 @@ import os
 import tempfile
 
 os.environ.setdefault("VLAW_DATA_DIR", tempfile.mkdtemp(prefix="vlaw_test_data_"))
+# The evidence anchor counter lives outside the database (core/evidence_anchor.py). Keep it inside this run's
+# temp directory so a test run never reads another run's key directory.
+os.environ.setdefault("VLAW_KEY_DIR", os.path.join(os.environ["VLAW_DATA_DIR"], "keys"))
 
 
 def pytest_sessionfinish(session, exitstatus):

@@ -26,12 +26,16 @@ router = APIRouter()
 
 _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 
+# Only the end of each log goes into the bundle: a log can be far larger than 5 MB (an old unrotated one
+# was 117 MB), and the recent lines are what support needs.
+LOG_TAIL_BYTES = 5 * 1024 * 1024
+
 # Fixed names inside the zip; log files are added as logs/<name> (see _log_files).
 BUNDLE_ENTRIES = ("README.txt", "health.json", "build-info.json", "monitoring-status.txt", "watched-folders.txt")
 LOG_DIR_IN_ZIP = "logs/"
 
 INCLUDED = [
-    "Vigil's log file and its rotated copies (vlaw-backend.log*)",
+    "The last 5 MB of Vigil's log file and of each rotated copy (vlaw-backend.log*)",
     "The health check output (what /api/health returns)",
     "Version and build information",
     "Monitoring and coverage status text",
@@ -48,7 +52,8 @@ README = """Vigil support bundle
 
 Made on this computer when you chose "Save support logs". Nothing was uploaded.
 
-Included: the Vigil log file and its rotated copies (logs/), the health check output
+Included: the last 5 MB of the Vigil log file and of each rotated copy (logs/; a larger file is cut
+from the front at a line boundary and starts with a line saying so), the health check output
 (health.json), version and build information (build-info.json), monitoring and coverage
 status text (monitoring-status.txt) and the list of watched folder paths
 (watched-folders.txt).
@@ -65,6 +70,23 @@ def _require_loopback(request: Request) -> None:
     client = request.client.host if request.client else None
     if client not in _LOOPBACK and client != "testclient":
         raise HTTPException(status_code=403, detail="The support bundle can only be made from this computer.")
+
+
+def _log_tail(path: str) -> bytes:
+    """The last LOG_TAIL_BYTES of a log. A longer file is cut from the front at a line boundary and gets a
+    first line saying how much was left out."""
+    size = os.path.getsize(path)
+    if size <= LOG_TAIL_BYTES:
+        with open(path, "rb") as fh:
+            return fh.read()
+    with open(path, "rb") as fh:
+        fh.seek(size - LOG_TAIL_BYTES)
+        data = fh.read()
+    newline = data.find(b"\n")
+    if newline != -1:
+        data = data[newline + 1:]
+    note = f"[Vigil support bundle: the first {size - len(data)} of {size} bytes of this log were left out; this is the end of it.]\n"
+    return note.encode("utf-8") + data
 
 
 def _log_files() -> list[str]:
@@ -145,7 +167,7 @@ async def support_bundle(request: Request):
         archive.writestr("monitoring-status.txt", _monitoring_text())
         archive.writestr("watched-folders.txt", await _watched_text())
         for path in _log_files():
-            archive.write(path, LOG_DIR_IN_ZIP + os.path.basename(path))
+            archive.writestr(LOG_DIR_IN_ZIP + os.path.basename(path), _log_tail(path))
     name = f"vigil-support-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
     return Response(
         content=buffer.getvalue(), media_type="application/zip",

@@ -10,7 +10,7 @@ Callers (watchers / aggregator) run RedLines checks BEFORE their own
 policy-based checks for the same event. Each rule fires at most once
 per RED_LINE_WINDOW_SECONDS per agent; activity in between is counted
 and folded into the next alert's message as a batch summary, e.g.
-"3 more SSH access events in the last minute" — this keeps a busy
+"3 more SSH directory change events in the last 5 min" — this keeps a busy
 agent from flooding the alerts view while still surfacing everything.
 
 RL7/RL7b (env var redirect, malicious config execution) were added for
@@ -32,7 +32,7 @@ from core.priors import get_prior
 RED_LINE_WINDOW_SECONDS = 60  # default, overridden per-rule in RED_LINE_WINDOWS
 
 RED_LINE_WINDOWS = {
-    "ssh_access":            300,   # 5 min — SSH access is rare, keep tight
+    "ssh_access":            300,   # 5 min — changes under .ssh are rare, keep tight
     "env_outside_workspace": 300,
     "claude_cache_write":    300,   # genuinely anomalous tier — no active session
     "checkpoint_activity":   300,   # normal /rewind tier — dismissible, not a Red Line
@@ -42,6 +42,14 @@ RED_LINE_WINDOWS = {
     "env_redirect":          300,   # CVE-2026-21852 pattern
     "config_exec":           300,   # CVE-2025-59536 pattern
     "mcp_autoapproval":      300,   # CVE-2026-21852 pattern (MCP attack surface)
+}
+
+# What the batch summary calls a rule ("3 more SSH directory change events ..."). The rule keys above are
+# logic and stay unchanged (they are stored in alerts as red_line_<key>). Rules that need file reads say so.
+RULE_DISPLAY_NAMES = {
+    "ssh_access": "SSH directory change",
+    "env_outside_workspace": "environment file read outside the workspace (needs file-read events)",
+    "cross_project_read": "cross-project file read (needs file-read events)",
 }
 
 # RL3: how long after a session's ended_at a hidden-cache write is still
@@ -497,7 +505,8 @@ class RedLines:
             return
 
         if state is not None and state["batched"] > 0:
-            description = f"{description} ({state['batched']} more {rule_key.replace('_', ' ')} events in the last {window // 60} min)"
+            name = RULE_DISPLAY_NAMES.get(rule_key, rule_key.replace('_', ' '))
+            description = f"{description} ({state['batched']} more {name} events in the last {window // 60} min)"
 
         self._state[state_key] = {"last_fired": now, "batched": 0}
 
@@ -518,8 +527,10 @@ class RedLines:
             return
         await self._fire(
             agent_id, "ssh_access", "high",
-            title=f"RED LINE: SSH directory accessed by {agent_name}",
-            description=f"{agent_name} accessed your SSH directory. This is unusual and worth reviewing.",
+            # Vigil sees creates, changes, moves and deletes, not reads, so the text says "changed".
+            title=f"RED LINE: SSH directory changed by {agent_name}",
+            description=f"{agent_name} created, changed, moved or deleted a file in your SSH directory. "
+                         "Reads are not recorded, so reading a key is not detected. This is unusual and worth reviewing.",
             extra_detail={"path": path},
             target=path,
             session_id=session_id,
@@ -530,8 +541,11 @@ class RedLines:
             return
         await self._fire(
             agent_id, "env_outside_workspace", "high",
-            title=f"RED LINE: environment file read outside workspace by {agent_name}",
-            description=f"{agent_name} read an environment file outside your active project.",
+            # This rule needs a file-read event; none is recorded on Windows in this version (see docs/COVERAGE.md).
+            title=f"RED LINE: environment file read outside workspace by {agent_name} "
+                  "(requires file-read events, which are not recorded on Windows in this version)",
+            description=f"{agent_name} read an environment file outside your active project. This rule requires "
+                         "file-read events, which Vigil does not record on Windows in this version.",
             extra_detail={"path": path},
             target=path,
             session_id=session_id,
@@ -617,8 +631,11 @@ class RedLines:
             return
         await self._fire(
             agent_id, "cross_project_read", "medium",
-            title=f"RED LINE: cross-project file read by {agent_name}",
-            description=f"{agent_name} read files from a different project directory than the active workspace.",
+            # This rule needs a file-read event; none is recorded on Windows in this version (see docs/COVERAGE.md).
+            title=f"RED LINE: cross-project file read by {agent_name} "
+                  "(requires file-read events, which are not recorded on Windows in this version)",
+            description=f"{agent_name} read files from a different project directory than the active workspace. "
+                         "This rule requires file-read events, which Vigil does not record on Windows in this version.",
             extra_detail={"path": path},
             target=path,
             session_id=session_id,
