@@ -257,3 +257,37 @@ async def test_both_endpoints_rewrite_the_legacy_summary_and_leave_the_stored_ro
             await db.commit()
     finally:
         await database.close_db()
+
+
+# ------------------------------------------------------------------ only the event chain is protected
+
+NOT_PROTECTED_LINE = ("Alerts, sessions, audit entries and monitoring-gap records are stored but not "
+                      "integrity-protected in this version; only the event chain is.")
+
+
+@pytest.mark.asyncio
+async def test_the_coverage_block_and_the_json_export_say_only_the_event_chain_is_protected(tmp_path, monkeypatch):
+    import db.database as database
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import api.export as export_module
+
+    assert NOT_PROTECTED_LINE in report_coverage.LINES
+    monkeypatch.setattr("config.policy.POLICY_FILE", tmp_path / "no-such-policy.json")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    database._db = None
+    await database.get_db()
+    try:
+        app = FastAPI()
+        app.include_router(export_module.router)
+        body = TestClient(app).get("/export/json", params={"preview": "true"}).json()
+    finally:
+        await database.close_db()
+    assert NOT_PROTECTED_LINE in body["what_this_report_covers"]["lines"]
+
+
+def test_the_design_doc_says_the_tables_digest_is_recorded_but_not_verified():
+    doc = (ROOT / "docs" / "design" / "evidence-anchoring.md").read_text(encoding="utf-8")
+    assert doc.count("recorded but not yet verified") >= 2
+    assert "After that the report cannot be altered without detection" not in doc
