@@ -141,15 +141,33 @@ async def get_chain_head(db) -> dict:
     cur = await db.execute("SELECT COUNT(*) c FROM events WHERE id > ?", (last_sealed_id,))
     unsealed_count = (await cur.fetchone())["c"]
 
+    last_anchor = None
+    try:
+        cur = await db.execute(
+            "SELECT anchor_seq, created_at, chain_head, event_count, last_event_id, status FROM evidence_anchors "
+            "ORDER BY anchor_seq DESC LIMIT 1"
+        )
+        anchor_row = await cur.fetchone()
+        if anchor_row is not None:
+            last_anchor = {
+                "anchor_seq": anchor_row["anchor_seq"], "time": anchor_row["created_at"],
+                "position": anchor_row["event_count"], "head": anchor_row["chain_head"],
+                "last_event_id": anchor_row["last_event_id"], "status": anchor_row["status"],
+            }
+    except Exception:
+        last_anchor = None
+
     return {
         "sealed_count": sealed_count,
         "head_hash": head_hash,
         "last_sealed_event_id": last_sealed_id,
         "unsealed_count": unsealed_count,
+        "last_anchor": last_anchor,
+        "anchoring": "local_only" if last_anchor else "none",
     }
 
 
-async def verify_chain() -> dict:
+async def _verify_chain_internal() -> dict:
     """Re-walks every sealed event in order, recomputing each hash from
     the event row's CURRENT content and comparing it to what was stored
     when it was sealed. A mismatch means that event row was edited after
@@ -243,3 +261,46 @@ async def verify_chain() -> dict:
             return {"valid": True, "checked_count": checked, "first_bad_event_id": None, "reason": None, "detail": None}
         finally:
             await conn.close()
+
+
+async def verify_chain() -> dict:
+    """The internal walk above, plus a check of every stored local anchor (core/evidence_anchor.py).
+
+    Result keys: the internal walk's (valid, checked_count, first_bad_event_id, reason, detail), and
+
+      internally_consistent  the internal walk's own verdict
+      status                 "inconsistent" (the chain disagrees with itself), or, for a chain that is
+                             consistent, "shorter_than_local_anchor" (fewer sealed events than an anchor
+                             recorded: truncation), "disagrees_with_local_anchor" (a different hash at an
+                             anchored event) or "anchor_continuity_break" (the anchor series itself is broken,
+                             for example a replaced database), else "consistent"
+      anchors                core/evidence_anchor.check_anchors()'s result
+
+    valid is False for every status except "consistent". This is Vigil checking its own records against
+    its own anchors: it constrains an edit that does not also rewrite the anchors and the key directory."""
+    result = await _verify_chain_internal()
+    result["internally_consistent"] = result["valid"]
+    try:
+        from core import evidence_anchor
+
+        anchors = await evidence_anchor.check_anchors()
+    except Exception:
+        logging.getLogger("vlaw").exception("evidence anchors could not be checked")
+        anchors = {"anchors_checked": 0, "anchors_mismatched": 0, "first_mismatch": None, "last_anchor": None,
+                   "anchoring": "none", "status": "none", "continuity": {"status": "none", "kind": None, "detail": None},
+                   "error": True}
+    result["anchors"] = anchors
+
+    if not result["valid"]:
+        result["status"] = "inconsistent"
+        return result
+    status = anchors["status"]
+    if status in ("shorter_than_local_anchor", "disagrees_with_local_anchor", "anchor_continuity_break"):
+        result["valid"] = False
+        result["status"] = status
+        result["reason"] = status
+        first = anchors.get("first_mismatch")
+        result["detail"] = first["detail"] if first else anchors["continuity"]["detail"]
+        return result
+    result["status"] = "consistent"
+    return result

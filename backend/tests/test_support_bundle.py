@@ -1,6 +1,7 @@
 """The support bundle holds only allow-listed entries and nothing from the database."""
 
 import io
+from pathlib import Path
 import json
 import types
 import uuid
@@ -137,3 +138,37 @@ def test_the_real_app_serves_the_endpoints_and_the_host_guard_still_applies():
     assert runtime_state.state.get("health_fn") is main_module.health
     client = TestClient(main_module.app, base_url="http://evil.example")
     assert client.post("/api/support/bundle").status_code == 403, "DNS-rebinding style host is refused"
+
+
+# ------------------------------------------------------------------ only the end of each log
+
+@pytest.mark.asyncio
+async def test_a_large_log_is_cut_to_its_last_5_mb_at_a_line_boundary(seeded_db, client_and_files):
+    log = Path(runtime_state.state["log_path"])
+    line = "2026-10-14 10:00:00,000 INFO a log line of a typical length for the backend, number "
+    count = 90_000                      # about 7.9 MB
+    with open(log, "w", encoding="utf-8", newline="\n") as fh:
+        for i in range(count):
+            fh.write(f"{line}{i}\n")
+    assert log.stat().st_size > support.LOG_TAIL_BYTES
+
+    archive = _zip(client_and_files.post("/api/support/bundle"))
+    data = archive.read("logs/vlaw-backend.log")
+    assert len(data) <= support.LOG_TAIL_BYTES + 300, "at most 5 MB plus the one-line notice"
+    lines = data.decode("utf-8").split("\n")
+    assert lines[0].startswith("[Vigil support bundle: the first ") and "bytes of this log were left out" in lines[0]
+    assert lines[1].startswith(line), "cut at a line boundary: the first kept line is whole"
+    assert lines[-2] == f"{line}{count - 1}", "the end of the log is what is kept"
+
+    readme = archive.read("README.txt").decode()
+    assert "last 5 MB of the Vigil log file and of each rotated copy" in readme
+    assert "last 5 MB" in readme
+
+
+@pytest.mark.asyncio
+async def test_small_logs_are_included_whole_and_the_contents_list_says_5_mb(seeded_db, client_and_files):
+    archive = _zip(client_and_files.post("/api/support/bundle"))
+    assert archive.read("logs/vlaw-backend.log.1").decode().strip() == "rotated one"
+    assert not archive.read("logs/vlaw-backend.log").decode().startswith("[Vigil support bundle")
+    included = client_and_files.get("/api/support/contents").json()["included"]
+    assert any("last 5 MB" in entry for entry in included)

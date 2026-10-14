@@ -1,8 +1,8 @@
 # Evidence anchoring and signed export: design
 
-Status: design only, no code written. Date: 2026-10-10.
+Status: design. Stage 1 (local anchors, section 11) is implemented as of 2026-10-14; stages 2 to 6 are design only. Date: 2026-10-10, updated 2026-10-14.
 Scope: make the exported report honestly "tamper-evident" against someone who can edit the local database after the fact (the monitored agent, or the user it runs as).
-Source read: branch pilot/p1-backend-safety at 15d23e6. The live database was not read; everything below comes from code and schema.
+Source read: branch pilot/p1-backend-safety at 15d23e6; the line numbers in section 1 were refreshed on 2026-10-14 after Stage 1 (section 11 lists what changed). The live database was not read; everything below comes from code and schema.
 
 One rule runs through the whole document: **only a hash (32 bytes, plus a few counters) may ever leave the machine.** No event, path, command, alert text or agent name is sent to any anchor target.
 
@@ -33,25 +33,25 @@ Recommended MVP is stages 1 to 3 below (about 11 working days). Until stage 1 sh
 
 - Genesis `prev_hash` is the constant `"0" * 64` (evidence_chain.py:23). It is not derived from anything install-specific, so every install starts from the same value.
 - Ordering is `events.id ASC`. Sealing resumes from `MAX(event_id)` in `event_chain` (evidence_chain.py:100-107).
-- The sealer is a scheduler job every 15 s (backend/main.py:401, function at main.py:444-449). A single run seals at most `SEAL_BATCH_LIMIT = 500` rows (evidence_chain.py:33), so a backlog drains over several cycles.
+- The sealer is a scheduler job every 15 s (backend/main.py:442, function `_seal_evidence_chain` at main.py:514). A single run seals at most `SEAL_BATCH_LIMIT = 500` rows (evidence_chain.py:33), so a backlog drains over several cycles.
 - Sealing opens its own connection to the same SQLite file (evidence_chain.py:93), so the chain lives in the very file an attacker can edit.
 
 ### 1.3 Where the head and sequence are stored
 
-- There is no separate head record. The head is "the `row_hash` of the highest `event_chain.id`" (`get_chain_head`, evidence_chain.py:128-149), together with `COUNT(*)` and `MAX(event_id)`.
+- There is no separate head record. The head is "the `row_hash` of the highest `event_chain.id`" (`get_chain_head`, evidence_chain.py:128-168), together with `COUNT(*)` and `MAX(event_id)`.
 - The "sequence" is `event_chain.id`, which is just SQLite autoincrement in the same file.
 - Nothing outside the DB file remembers any of these values.
 
 ### 1.4 How verification and export use it
 
-- `verify_chain()` (evidence_chain.py:152-242) re-reads every chain row joined to its event and checks, in order: `prev_hash` equals the previous row's `row_hash` (broken_link), the event still exists (event_deleted), and the recomputed hash equals the stored one (hash_mismatch). It stops at the first failure.
-- It is called in the PDF export only (backend/api/export.py:548-556) and by `GET` routes in backend/api/chain_routes.py:13-22. **The JSON export does not call it and carries no chain status** (export_json is export.py:485-487 and returns `_build_summary` unchanged).
-- The PDF line reads "Evidence chain: VERIFIED INTACT (N events checked)". The verifier is Vigil itself, reading the same DB.
+- `_verify_chain_internal()` (evidence_chain.py:170-264) re-reads every chain row joined to its event and checks, in order: `prev_hash` equals the previous row's `row_hash` (broken_link), the event still exists (event_deleted), and the recomputed hash equals the stored one (hash_mismatch). It stops at the first failure.
+- It is called by both exports, through `_chain_verification()` (backend/api/export.py:680), and by `GET` routes in backend/api/chain_routes.py:13-22. The JSON export carries `chain_verification` (export_json, export.py:776). This corrects the first version of this document, which said the JSON export carried no chain status; that changed before Stage 1 and Stage 1 extended it. Since Stage 1, `verify_chain()` (evidence_chain.py:266) wraps the internal walk and also checks every stored local anchor (section 11).
+- The original PDF line read "Evidence chain: VERIFIED INTACT (N events checked)". That wording was replaced before Stage 1 ("consistent ... Checked by Vigil itself; not yet independently anchored"), and Stage 1 replaced it again with the section 4.3 lines (export.py `_chain_lines`, line 728). The verifier is still Vigil itself, reading the same DB.
 
 ### 1.5 What the chain does not cover
 
 - `alerts` (schema.sql:47-75, including `status`, `resolved_by`, `resolution_note`), `audit_log` (schema.sql:101-109; dismissals and approvals are written at backend/api/alerts.py:156/221/262 and api/agents.py:144/184, with audit rows at alerts.py:166,231,270, agents.py:156,198 and core/alerter.py:148), `policy` (schema.sql:78-83; written at api/agents.py:35 and db/database.py:155), `sessions` (schema.sql:112-132), `vigil_runs` and `monitoring_gaps` (schema.sql:164-187; written by core/monitoring_coverage.py:78,136,198), `app_config` (schema.sql:154-158, holds the webhook URL).
-- The export reads those tables directly: coverage from `vigil_runs` and `monitoring_gaps` (export.py:219-290), alerts from `alerts` joined to `agents`.
+- The export reads those tables directly: coverage from `vigil_runs` and `monitoring_gaps` (`_compute_coverage`, export.py:302-379), alerts from `alerts` joined to `agents`.
 - Events not yet sealed (up to 500 per 15 s cycle, more during a backlog) are outside the chain until sealed.
 
 ### 1.6 What an attacker with DB write access can do undetected
@@ -64,7 +64,7 @@ All of these assume the attacker can run SQL against vlaw.db (the monitored agen
 4. **Append forged events.** Insert new `events` rows with higher ids. The next seal cycle chains them as if genuine. `created_at` is free text the attacker controls.
 5. **Pre-seal edits.** Change or delete an event in the window before it is sealed. There is nothing to compare against.
 6. **Alerts, dismissals, policy, sessions, coverage.** Edit them freely. No hash covers them, so `UPDATE alerts SET status='dismissed'`, deleting a red-line alert, or deleting a `monitoring_gaps` row leaves no trace in any check.
-7. **Delete or replace the DB file.** A fresh DB starts a new valid chain at genesis. The PDF says "VERIFIED INTACT" for it.
+7. **Delete or replace the DB file.** A fresh DB starts a new valid chain at genesis. Before Stage 1 nothing recorded that an earlier chain had existed, so the report said the chain was fine. With Stage 1 the key directory keeps the anchor counter, and the report shows "Anchor continuity: BREAK" (series restarted); an attacker who also edits the key directory is not caught (section 12).
 8. **Export file edits.** The PDF and JSON are unsigned plain files.
 
 What is genuinely detected today: a partial, unsophisticated edit that touches an event row without recomputing the rows after it (hash_mismatch), deleting one event or one chain row in the middle (event_deleted, broken_link). That is accident detection, not adversary resistance.
@@ -192,7 +192,7 @@ When things are missing or wrong, exact wording:
 - Some pending: `Last anchor: <time> (seq N), status: waiting for timestamp since <time> (no network). Events recorded after the last timestamped anchor (<time>) are not yet externally protected.`
 - No anchors at all (local-only mode or never reached a TSA): `Anchoring: none. The chain is consistent but is stored only on this machine; this report cannot show that earlier records were not altered.`
 - Gap in the series: `Anchor continuity: BREAK between seq 12 and seq 14` (verifier-style failure line).
-- Chain failure: unchanged `INTEGRITY FAILURE: <reason>` (export.py:551).
+- Chain failure: `Evidence chain: INCONSISTENT at event <id>. Do not rely on this report.` (export.py `_chain_lines`). The first version of this document called it `INTEGRITY FAILURE: <reason>`; the wording changed before Stage 1 and Stage 1 kept the current one.
 - A missing-anchor line must never be omitted or softened to "OK". Absence is printed as absence.
 
 ---
@@ -349,7 +349,7 @@ May say (report and sales):
 
 Must NOT say:
 - "Tamper-evident", "tamper-proof", "immutable", "cryptographically verified", "audit-grade", "cannot be altered", "evidence that stands up in court."
-- The current PDF wording "VERIFIED INTACT" (export.py:551) overstates this; change it to "Chain internally consistent" no later than stage 1.
+- The old PDF wording "VERIFIED INTACT" overstated this and has been replaced (done before Stage 1; the Stage 1 wording is in section 11).
 
 ### 8.2 Anchored (stage 1 and 2)
 
@@ -394,7 +394,7 @@ After stage 6 an additional sentence is allowed, scoped to the configuration: "W
 
 ### 9.2 Risks
 
-- **Report size and speed**: `events.jsonl` for a busy day may be large; mitigate with hourly anchors and zip. Chain walks already cost real time (evidence_chain.py:152-242 comment); the verifier is a separate process so it does not touch the event loop.
+- **Report size and speed**: `events.jsonl` for a busy day may be large; mitigate with hourly anchors and zip. Chain walks already cost real time (evidence_chain.py:170-264 comment); the verifier is a separate process so it does not touch the event loop.
 - **Canonical form lock-in**: the field order in `_canonical_row_string` (evidence_chain.py:47-62) can never change once anchored. Document it as a versioned format (`v: 1`) and make the verifier carry its own copy; any future format gets a new version and a new chain segment.
 - **Clock**: anchor `created_at` is the local clock; only the TSA time is trusted. Report must say so (4.2).
 - **Pending/offline machines** get weaker claims by design; the report wording is the safeguard, so it must be tested (9.4).
@@ -442,3 +442,48 @@ Unit and integration tests, in the existing `backend/tests` style (fresh `VLAW_D
 3. How is the public key fingerprint delivered out of band at install time (installer prompt, customer webhook first message, printed in the UI)?
 4. Is local-only mode a supported product tier, and if so what is its permitted claim (section 8.1 wording only)?
 5. Does any customer require protection from local administrators? If so, stage 6 is not enough and a remote anchor target held by the customer becomes mandatory.
+
+---
+
+## 11. Stage 1 as built (2026-10-14)
+
+What shipped: local anchors only. Nothing leaves the machine and nothing here is an external timestamp.
+
+- **Table** `evidence_anchors` (backend/db/schema.sql:197): `anchor_seq` (primary key), `anchor_json`, `anchor_hash`, `prev_anchor_hash`, `chain_head`, `event_count`, `last_event_id`, `tables_digest`, `install_id`, `created_at`, `trigger` (`hourly`, `export` or `startup_gap`) and `status` (`local_only`). It is created with `IF NOT EXISTS` from schema.sql, the existing mechanism, so an existing database gains the table with no change to any existing row, and an empty database works. The Stage 2 columns (attempts, next_try_at, tsa_token and so on) are not there yet and will be added with `ALTER TABLE` in `_migrate`.
+- **Anchor record** (backend/core/evidence_anchor.py): the JSON of section 2.1 with `meta_head` null. `anchor_hash` is the SHA-256 of the canonical JSON (sorted keys, no whitespace).
+- **Key directory**: `anchor-state.json` in `VLAW_KEY_DIR` (set by main.py to the folder `keys` next to the data directory, `%LOCALAPPDATA%\V-LAW\keys` when installed) holds `install_id`, the sequence counter and the last anchor hash. Deleting `vlaw.db` does not reset it; the next anchor continues from the remembered counter.
+- **When anchors are made**: hourly, only if the chain head or count changed since the last anchor and at least 55 minutes have passed (scheduler job `evidence_anchor`, main.py:445); at every export; and at startup after a monitoring gap (`_anchor_after_gap`, main.py:500). There is no shutdown anchor: the tray force-ends the backend, so a clean shutdown cannot be relied on.
+- **Digest of the other tables**: SHA-256 over `alerts`, `audit_log`, `sessions`, `monitoring_gaps`, `vigil_runs` and `policy`, in that order, each table's rows in rowid order (primary-key order for the integer-keyed tables; insertion order for `sessions` and `policy`), columns in `SELECT *` order, one JSON array per row. Because these tables change legitimately, only the digest taken at export time is meaningful to a reader; it does not prove rows were unmodified before the first anchor that covered them.
+- **Local check** (`verify_chain()`, evidence_chain.py:266, and `check_anchors()`): every stored anchor is compared with the chain as it is now. Result states: `inconsistent` (the chain disagrees with itself), `disagrees_with_local_anchor` (consistent, but a different hash at an anchored event), `shorter_than_local_anchor` (fewer sealed events than an anchor recorded, which is what truncation looks like), and `anchor_continuity_break` (the anchor series is broken: `series_restarted`, `history_missing`, `link_broken`, `install_changed` or `state_missing`). `valid` is False for all of them.
+- **Report wording** (export.py `_chain_lines`, line 728): the section 4.3 lines. With no external anchor, which is every case in Stage 1, the report prints `Anchoring: none. The chain is consistent but is stored only on this machine; this report cannot show that earlier records were not altered.` Local anchors are shown on a separate line, marked `local only, no external timestamp`. When no anchor was checked, `anchors_mismatched` is null in the JSON and no mismatch count is printed, so "0 mismatches" is never shown as a pass.
+- **JSON export** `chain_verification` gained: `head_hash`, `sealed_count`, `unsealed_count`, `anchoring`, `last_anchor` (`time`, `anchor_seq`, `position`, `head`, `status`), `anchors_checked`, `anchors_mismatched`, `anchor_continuity` and `anchor_problem`. `GET /api/evidence/chain/head` returns `last_anchor` and `anchoring` too.
+
+Deviations from sections 2 to 4 of this document, and why:
+
+1. **Export anchors are reused when nothing changed.** Section 4.1 says every export forces an anchor. The Export page fetches the JSON on every page load and date change, so a literal reading would add a row per preview. An export anchors only when the chain head, the sealed count or the tables digest differs from the last anchor; otherwise the last anchor, which already pins exactly this state, is the one the report cites.
+2. **No `status`/queue columns for Stage 2 yet**, as above.
+3. **The "Evidence integrity" lines** are printed in the PDF header block and in the JSON, not as a separate titled section.
+4. **Digest order** is rowid, not sorted primary key (the two agree for the integer-keyed tables).
+5. **Seal before anchor**: an export seals pending events first so the anchor is as current as possible; unsealed events are reported (`unsealed_count`).
+6. **Page loads do not run the check.** The Export page fetches the JSON on every load and date change, and a full check measured 0.3 s at 20,000 events and 5,000 rows in each of alerts, audit_log and sessions, and 1.4 s at 50,000 events and 50,000 rows each. `GET /export/json?preview=true` therefore returns the last verification with an `as_of` time (`cached: true`), or `status: "not_checked"` with the cheap facts (head, counts, last anchor) when none has been made since Vigil started. It seals nothing, computes no digest and records no anchor. Downloads (the PDF, and `/export/json` without `preview`) run the full check and record or reuse an anchor, and refresh the remembered result; so does the hourly job. A cached "consistent" is always printed with the time it was true, and a preview never says "consistent" without a check behind it.
+7. **Crash-safe key directory write.** The key directory first records the anchor about to be added as pending, then the row is committed, then the committed fields advance and the pending marker is cleared. A crash between the steps leaves either a pending anchor the database never got (ignored; the next anchor reuses the number) or a database one anchor ahead of the key directory (accepted). Neither is reported as tampering, and the sequence stays monotonic with no repeated `anchor_seq`.
+
+Measured cost (synthetic chain of 50,000 events, 2026-10-14, one machine, SQLite on SSD): reading the head and count 0.6 ms; creating an anchor 15 to 33 ms in total (insert, commit and the key-directory file write dominate); a full re-walk of the chain, which anchoring never does, 0.7 to 0.8 s. The tables digest is linear in the rows of the six tables: 3,000 rows in total 27 ms, 30,000 rows 180 ms, 150,000 rows 1.1 s, 600,000 rows 3.8 s. Checking 9,011 stored anchors (about a year of hourly anchors) takes 136 ms.
+
+## 12. Stage 1 limits
+
+### Deleting vlaw.db alone is reported by design
+
+The key directory (`%LOCALAPPDATA%\V-LAW\keys`, next to the `data` folder) keeps the anchor counter, the install id and the hash of the last anchor. If the database is deleted or replaced and the key directory is not, Vigil reports `Anchor continuity: BREAK` (series restarted), and after new anchors are made, `history missing`. That is the intended behaviour: it is exactly what a quietly replaced database looks like, and Vigil cannot tell an attack from a careless delete.
+
+A legitimate reset removes both together, with Vigil stopped:
+- Uninstalling and answering Yes to "delete everything Vigil stored" removes the whole `%LOCALAPPDATA%\V-LAW` folder, key directory included (the uninstaller also names the keys folder explicitly). A later install starts a new series with no failure state.
+- By hand: stop Vigil, then delete `vlaw.db` (with its `-wal` and `-shm` files) and the `keys` folder together.
+- Answering No keeps the database and the key directory, so a reinstall continues the same series.
+- A database with events but no key directory (a fresh install over an old database, or a version from before anchors) is not flagged: the first anchor starts the series, and until then the report says `Anchoring: none`.
+
+### What local anchors do not do
+
+Local anchors do not constrain someone who can write the same database. The database, the key directory and the process that makes anchors all run as the Windows user that also runs the monitored agent, so an attacker with that access can edit events, recompute the chain, rebuild the anchors table and update `anchor-state.json` to match, and Vigil's own check then reports a consistent chain. That case is pinned down by the test `test_stage1_does_not_constrain_attacker_who_rewrites_anchors` (backend/tests/test_evidence_anchor.py). What Stage 1 does catch: an edit that does not also rewrite the anchors and the key directory record (a recomputed chain alone, a truncation, a deleted or replaced database, deleted or edited anchor rows), because those leave the three places disagreeing.
+
+An anchor that exists only on this machine is not independent evidence. Stage 2, an external timestamp of each anchor's hash by a party the attacker does not control, is what removes that limit: after it, a rewrite has to match an anchor that was recorded elsewhere. Until Stage 2 ships the report says `Anchoring: none` and must not claim more (section 8). Other limits that remain: events between anchors are not pinned until the next anchor (up to about one hour); the alert, dismissal, policy, session and coverage rows are bound only by the digest taken at each anchor; and the digest cannot show those rows were unmodified before the first anchor that covered them (stage 4, the meta chain, addresses that).

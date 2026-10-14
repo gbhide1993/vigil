@@ -2,7 +2,10 @@ services:
   vlaw:
     build: ./backend
     ports:
-      - "7422:7422"
+      # Published on the host's loopback only. The Vigil API has NO authentication, and inside the
+      # container the server listens on all interfaces (backend/Dockerfile), so this mapping is what
+      # keeps it off the network. Do not change it to "7422:7422" or expose it any other way.
+      - "127.0.0.1:7422:7422"
     volumes:
       - ./data:/app/data          # SQLite DB
       - ./policy:/app/policy      # policy file

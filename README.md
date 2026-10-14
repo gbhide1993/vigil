@@ -1,7 +1,7 @@
 # Vigil — AI Session Monitor
 
 See what Claude Code, Cursor, Codex, and GitHub Copilot actually do on your machine.
-OS-level evidence. Runs locally. Nothing leaves your machine.
+OS-level evidence. Runs locally. Vigil uploads no event data (the only outbound path is an optional daily-digest webhook, off until you save a URL).
 
 ## What it shows
 
@@ -32,7 +32,7 @@ There are nine red-line rules (RL1 to RL8, plus RL7b). They cannot be disabled, 
 
 Active:
 
-- Changes inside your `.ssh` directory
+- A file in your `.ssh` directory is created, changed, moved or deleted (the alert says "SSH directory changed"; reading a key is not detected)
 - Claude's hidden cache folder written when no session is active
 - Agent launches a sensitive command (`curl`, `wget`, `ssh`, `nc`, `git push --force`, recursive deletes, and similar)
 - `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL` pointed at an unrecognized host (checked about every 30 seconds)
@@ -40,7 +40,7 @@ Active:
 
 Not active in this version:
 
-- `.env` file read outside the project and cross-project file read (file reads are not recorded)
+- `.env` file read outside the project and cross-project file read: both need file-read events, which are not recorded on Windows in this version, so they cannot fire (the rules stay in the code)
 - Connection to an unrecognized network destination (network monitoring is off)
 - MCP server auto-approval (MCP connection monitoring is off)
 

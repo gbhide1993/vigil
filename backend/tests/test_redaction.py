@@ -146,6 +146,88 @@ def test_empty_string_is_unchanged():
     assert redact_cmdline(None) is None
 
 
+# ------------------------------------------------ more secret forms (before -> after)
+
+R = REDACTED
+NEW_FORMS = [
+    # PowerShell / Windows single-dash flags, any case
+    ("tool -Password hunter2", f"tool -Password {R}"),
+    ("tool -PASSWORD hunter2", f"tool -PASSWORD {R}"),
+    ("tool -password:hunter2", f"tool -password:{R}"),
+    ("tool -Pwd=hunter2", f"tool -Pwd={R}"),
+    ("tool -Token abc123 -Secret def456", f"tool -Token {R} -Secret {R}"),
+    ("pwsh -Command Connect-Thing -User bob -Password hunter2 -Force", f"pwsh -Command Connect-Thing -User bob -Password {R} -Force"),
+    # /password:x and /pwd:x
+    ("net use Z: \\\\srv\\share /user:bob /password:hunter2", f"net use Z: \\\\srv\\share /user:bob /password:{R}"),
+    ("tool /PWD:hunter2 /quiet", f"tool /PWD:{R} /quiet"),
+    # curl -u / --user user:pass (the user name stays visible)
+    ("curl -u admin:hunter2 https://example.com/api", f"curl -u admin:{R} https://example.com/api"),
+    ("curl --user admin:hunter2 https://example.com/api", f"curl --user admin:{R} https://example.com/api"),
+    ("curl.exe -u admin:hunter2 https://example.com", f"curl.exe -u admin:{R} https://example.com"),
+    # Authorization with any scheme (the scheme stays visible), with and without quotes
+    ("curl -H 'Authorization: Token abc123def' https://x", f"curl -H 'Authorization: Token {R}' https://x"),
+    ('curl -H "Authorization: ApiKey k123abc" https://x', f'curl -H "Authorization: ApiKey {R}" https://x'),
+    ("curl -H 'Authorization: Bearer abc.def.ghi' https://x", f"curl -H 'Authorization: Bearer {R}' https://x"),
+    ("curl -H 'Authorization: abc123def' https://x", f"curl -H 'Authorization: {R}' https://x"),
+    ("curl -H 'authorization: Negotiate YIIabc' https://x", f"curl -H 'authorization: Negotiate {R}' https://x"),
+    # X-*-Key / X-*-Token / X-*-Secret headers
+    ('curl -H "X-Api-Key: abcdef123456" https://x', f'curl -H "X-Api-Key: {R}" https://x'),
+    ("curl -H 'X-Auth-Token: t0k3n' https://x", f"curl -H 'X-Auth-Token: {R}' https://x"),
+    ("curl -H 'X-Service-Secret: s3cr3t' -H 'X-Request-Id: 42' https://x", f"curl -H 'X-Service-Secret: {R}' -H 'X-Request-Id: 42' https://x"),
+]
+
+
+@pytest.mark.parametrize("before,after", NEW_FORMS)
+def test_new_secret_forms_are_redacted(before, after):
+    assert redact_cmdline(before) == after
+    assert redact_cmdline(after) == after, "redacting twice changes nothing"
+
+
+def test_the_secret_value_is_gone_from_every_new_form():
+    for before, _after in NEW_FORMS:
+        out = redact_cmdline(before)
+        for secret in ("hunter2", "abc123def", "k123abc", "abcdef123456", "t0k3n", "s3cr3t", "YIIabc", "abc.def.ghi", "abc123", "def456"):
+            assert secret not in out, (before, out)
+
+
+HARMLESS = [
+    "git status",
+    "ls -la",
+    "python -m pytest -q",
+    "npm run build",
+    "node server.js --port 3000",
+    "git push -u origin main",
+    "docker run -u 1000:1000 --rm alpine echo hi",
+    "pip install --user requests",
+    "curl -s -o out.json https://example.com/data.json",
+    "psql -W -h localhost -U app mydb",
+    "powershell -NoProfile -Command Get-ChildItem C:\\Users\\bob\\project",
+    "curl -H 'Accept: application/json' -H 'X-Request-Id: 42' https://example.com",
+]
+
+
+@pytest.mark.parametrize("command", HARMLESS)
+def test_harmless_commands_stay_unchanged(command):
+    assert redact_cmdline(command) == command
+
+
+def test_dash_w_is_deliberately_not_redacted():
+    """psql/pg_dump/ldapsearch -W means 'prompt for the password' and takes no value, so the
+    next argument is not a secret. Hiding it would only damage the record."""
+    assert redact_cmdline("psql -W -h db.example.com") == "psql -W -h db.example.com"
+
+
+def test_curl_user_rule_only_applies_to_curl():
+    assert redact_cmdline("docker run -u 1000:1000 alpine") == "docker run -u 1000:1000 alpine"
+    assert redact_cmdline("tool --user alice:notasecret") == "tool --user alice:notasecret"
+
+
+def test_the_flag_name_survives_next_to_the_mysql_style_p_rule():
+    assert redact_cmdline("tool -pwd=hunter2") == f"tool -pwd={R}"
+    assert redact_cmdline("mysql -phunter2 -h db") == f"mysql -p{R} -h db"
+    assert redact_cmdline("mysql -p 3306") == "mysql -p 3306"
+
+
 # --------------------------------------------------- end-to-end wiring
 
 @pytest.mark.asyncio

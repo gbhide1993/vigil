@@ -8,7 +8,9 @@ from fastapi.responses import StreamingResponse
 
 from collections import Counter
 
+from core import report_coverage
 from core.alerter import Alerter
+from core.digest import display_summary
 from core.file_changes import scope_label, session_changes
 from core.monitoring_status import network_monitoring
 from core.scope_store import get_scope_directories
@@ -61,7 +63,10 @@ async def get_sessions(status: str | None = Query(default=None)):
             """
         )
         rows = await cur.fetchall()
-        return {"sessions": [dict(r) for r in rows]}
+        sessions = [dict(r) for r in rows]
+        for s in sessions:
+            s["summary"] = display_summary(s.get("summary"))
+        return {"sessions": sessions}
     finally:
         await db.close()
 
@@ -318,6 +323,7 @@ async def get_session_report_preview(session_id: str):
         "red_lines": report["red_lines_count"],
         "events": events,
         "alerts": report["red_lines"],
+        "what_this_report_covers": report_coverage.as_dict(),
     }
 
 
@@ -359,7 +365,21 @@ async def get_session_report_pdf(session_id: str):
 
     c.setStrokeColor(colors.HexColor("#cccccc"))
     c.line(margin, y, width - margin, y)
-    y -= 0.3 * inch
+    y -= 0.25 * inch
+
+    # WHAT THIS REPORT COVERS: the same block as the daily PDF and the JSON export (core/report_coverage.py).
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(margin, y, report_coverage.TITLE)
+    y -= 0.19 * inch
+    c.setFont("Helvetica", 8.5)
+    for line in report_coverage.LINES:
+        for part in _wrap_text(line, 105):
+            if y < margin:
+                y = new_page()
+                c.setFont("Helvetica", 8.5)
+            c.drawString(margin, y, part)
+            y -= 0.15 * inch
+    y -= 0.2 * inch
 
     # While network monitoring is off a count of 0 means "not measured".
     net_off = report.get("network_monitoring") == "off" and report["network_connections_count"] == 0

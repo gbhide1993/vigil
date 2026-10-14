@@ -16,7 +16,7 @@ Registered at startup in `backend/main.py`.
 | File burst check | Running | Every 30 s | Correlates bursts of file changes with agent processes. |
 | Evidence chain sealing | Running | Every 15 s | Hash-chains the events table only. |
 | Baseline update | Running | Hourly | Folds ended sessions into the per-agent baseline. |
-| Credential detection | Running, no separate watcher | Event-driven | Credential access is a classification of file events on paths containing `.env`, `.ssh`, `.aws`, `.pem` or `.key`, made by the file watcher. |
+| Credential detection | Running, no separate watcher | Event-driven | A change to a credential-looking path is classified from file events on paths containing `.env`, `.ssh`, `.aws`, `.pem` or `.key`, made by the file watcher. |
 | Network watcher (`watchers/network_watcher.py`) | **Disabled** | n/a | Commented out at `main.py:411`. Disabled in commit e821731 (2026-09-29, watcher-starvation deadlock fix): its resolution phase does blocking I/O. Re-enable needs bounded work per tick, an off-switch and a loop-delay measurement (see the comment in `main.py`). |
 | MCP watcher (`watchers/mcp_watcher.py`) | **Disabled** | n/a | Commented out at `main.py:430`. Disabled in commit e821731: it contended with the process watcher for the same PowerShell/WMI scans. |
 | Idle session sweep (`SessionManager.close_idle_sessions`) | **Disabled** | n/a | Commented out at `main.py:445`. Disabled in commit e821731 pending an event-loop audit. |
@@ -47,6 +47,7 @@ Consequence of the disabled sweep: a session is closed (and scored by the volume
 ### Not watchers, but they affect what you see
 
 - **Attribution** works from process names (Claude Code, Cursor, Copilot, Codex and a few others), parent chains and a behaviour score. An agent that is not recognized is only seen if it scores as agent-like.
+- Session durations and counts can be off: sessions close lazily because the scheduled idle sweep is off.
 - **Running, open (idle) and active:** an agent is *running* when one of its processes exists (a desktop app or an editor extension's background helper counts). It is *active* only after real activity in the last 5 minutes: a file change attributed to it, a network or MCP event, or a new tool or shell process started under one of its processes. A long-lived helper, a process that was already running when Vigil started, or an open session alone is not activity; such an agent is shown as "open, idle". The tray tooltip, the sidebar and `/api/agents` use the same rule. A process Vigil has already recorded (same pid and creation time) is not recorded again after a restart.
 - **Evidence chain:** hashes the stored events and checks them for consistency, run by Vigil itself on its own database. It does not cover alerts, dismissals, policy, sessions or coverage data, and nothing outside this computer holds a copy.
 
@@ -56,24 +57,24 @@ There are nine rules (RL1 to RL8, plus RL7b). They cannot be disabled. The READM
 
 | Rule | Fires on | Depends on | Available now |
 |---|---|---|---|
-| RL1 SSH directory | A change to a file under a `.ssh` directory | File events (watched path) | Yes |
-| RL2 `.env` outside workspace | A `.env` file read outside the active project | A file-read event | **No.** Reads are never produced, so this cannot fire. |
+| RL1 SSH directory | A file under a `.ssh` directory is created, changed, moved or deleted. The alert title is "SSH directory changed". Reading a key is not detected. | File events (watched path) | Yes |
+| RL2 `.env` outside workspace | A `.env` file read outside the active project. The alert text says the rule requires file-read events, which are not recorded on Windows in this version. | A file-read event | **No.** Reads are never produced, so this cannot fire. |
 | RL3 Claude cache write | A write to Claude's hidden file-history folder when the agent has no active or recent session | File events | Yes. A write during an active session raises no alert; the report shows an info line. |
 | RL4 Unrecognised destination | A connection to a destination outside the approved list | Network watcher | **No.** Network watcher is off. |
 | RL5 Sensitive command | A process whose command matches the sensitive list (`curl`, `wget`, `ssh`, `nc`, force push, recursive delete, encoded PowerShell, download-and-execute, and similar) | Process watcher | Yes, for processes caught by the 30-second check |
-| RL6 Cross-project read | A read of files in a different project than the active one | A file-read event | **No.** Same reason as RL2. |
+| RL6 Cross-project read | A read of files in a different project than the active one. The alert text says the rule requires file-read events, which are not recorded on Windows in this version. | A file-read event | **No.** Same reason as RL2. |
 | RL7 Environment redirect | `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL` set to an unrecognized host | Process environment, 30-second check | Yes |
 | RL7b Config then execute | A project config file (`.claude`, `.cursor`, `.vscode`) written, then a spawn or write elsewhere within a short window | File events and process watcher | Yes, if the config path is in the watched set |
 | RL8 MCP auto-approval | An `.mcp.json` write followed by a connection to an unapproved MCP server | MCP watcher | **No.** The rule is only evaluated from the MCP watcher, which is off. |
 
-Rules that read "read" in their alert text (RL2, RL6) describe file-read events that never arrive on this platform. Rule titles for RL1 use "accessed"; what is detected is a change.
+RL2 and RL6 stay in the code, but their alert text now says they require file-read events, which Vigil does not record on Windows in this version, so they cannot fire. RL1 detects creates, changes, moves and deletes under `.ssh`; its title says "changed" and the report text says reading is not detected. Rule checks run only on the events the watchers produce; none of them sees a read.
 
 ## 4. Other alerts
 
 | Alert | State |
 |---|---|
-| Credential access (policy) | Active, on file changes to credential-looking paths in the watched set |
-| Out-of-scope and never-scope directory access (policy) | Active only if `scope_directories` / `never_scope_directories` are set; empty by default |
+| Credential path change (policy; title "Credential path changed") | Active, on file changes to credential-looking paths in the watched set |
+| Out-of-scope and never-scope directory changes (policy) | Active only if `scope_directories` / `never_scope_directories` are set; empty by default |
 | Unapproved agent detected | Active |
 | Suspicious command (policy) | Active; skipped when RL5 already fired for the same process |
 | Unusual activity volume | Active at session close; needs floors and 5 history sessions (see `core/activity_filter.py`) |

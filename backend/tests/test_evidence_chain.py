@@ -55,9 +55,27 @@ def _uniq(label: str) -> str:
 # ------------------------------------------------------------- 1. empty db
 
 @pytest.mark.asyncio
-async def test_seal_and_verify_empty(test_db):
+async def test_seal_and_verify_empty(test_db, tmp_path, monkeypatch):
+    """An empty chain verifies as valid with nothing checked. Run on its own fresh database: the shared test
+    database is empty only if this test happens to run first (exports seal pending events, so any earlier
+    export test makes it non-empty)."""
+    import sqlite3
+
+    from core import evidence_chain
+    from db.database import SCHEMA_PATH
+
+    fresh = tmp_path / "empty.db"
+    conn = sqlite3.connect(fresh)
+    conn.executescript(SCHEMA_PATH.read_text())
+    conn.close()
+    monkeypatch.setattr(evidence_chain, "DB_PATH", fresh)
+    monkeypatch.setenv("VLAW_KEY_DIR", str(tmp_path / "keys"))
+
     result = await verify_chain()
-    assert result == {"valid": True, "checked_count": 0, "first_bad_event_id": None, "reason": None, "detail": None}
+    assert {k: result[k] for k in ("valid", "checked_count", "first_bad_event_id", "reason", "detail")} == {
+        "valid": True, "checked_count": 0, "first_bad_event_id": None, "reason": None, "detail": None,
+    }
+    assert result["status"] == "consistent" and result["anchors"]["status"] == "none"
 
 
 # -------------------------------------------------------- 2. seal creates chain
@@ -70,7 +88,11 @@ async def test_seal_creates_chain(test_db):
     own events unsealed. Asserted as a delta against the pre-test
     unsealed count, not a hardcoded absolute, so this isn't sensitive to
     what ran before it."""
-    unsealed_before = (await get_chain_head(test_db))["unsealed_count"]
+    # Exports seal pending events too (api/export.py), so an earlier test may already have sealed
+    # part of the shared database: compare against the chain length before this test, not zero.
+    head_before = await get_chain_head(test_db)
+    unsealed_before = head_before["unsealed_count"]
+    sealed_before = head_before["sealed_count"]
 
     agent_id = await _make_agent(test_db, _uniq("claude_code_sealtest"))
     session_id = _uniq("sess")
@@ -82,16 +104,16 @@ async def test_seal_creates_chain(test_db):
     assert sealed == unsealed_before + 3
 
     cur = await test_db.execute("SELECT COUNT(*) c FROM event_chain")
-    assert (await cur.fetchone())["c"] == sealed
+    assert (await cur.fetchone())["c"] == sealed_before + sealed
 
     head = await get_chain_head(test_db)
-    assert head["sealed_count"] == sealed
+    assert head["sealed_count"] == sealed_before + sealed
     assert head["unsealed_count"] == 0
     assert head["head_hash"] != GENESIS_HASH
 
     result = await verify_chain()
     assert result["valid"] is True
-    assert result["checked_count"] == sealed
+    assert result["checked_count"] == sealed_before + sealed
 
 
 # --------------------------------------------------- 3. tampering detection
@@ -299,8 +321,13 @@ async def test_exports_say_consistent_for_a_good_chain(test_db):
     assert "not externally anchored" in chain["scope"]
 
     text = _pdf_text()
-    assert "Evidence chain: consistent (" in text
-    assert "events checked). Checked by Vigil itself; not yet independently anchored." in text
+    import re
+
+    from api.export import NO_ANCHORING_LINE
+
+    assert re.search(r"Evidence chain: consistent, \d+ events, head [0-9a-f]{12}( |$)", text)
+    assert NO_ANCHORING_LINE in text, "no external anchor exists yet, and the report says so"
+    assert "Checked by Vigil itself." in text
     assert "INCONSISTENT" not in text
 
 

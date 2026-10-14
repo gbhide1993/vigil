@@ -6,6 +6,20 @@ rather than a wall of zeros.
 """
 
 
+import re
+
+_LEGACY_ZERO_READS =re.compile(r"\bread 0 and wrote (\d+) (files?)\b")
+
+
+def display_summary(summary):
+    """Display-time rewrite of summaries stored before reads were described honestly:
+    "read 0 and wrote N files" -> "wrote N files (file reads are not recorded)". Only a read count of 0 is
+    rewritten (a nonzero count is a real number and stays). The stored row is never changed."""
+    if not summary:
+        return summary
+    return _LEGACY_ZERO_READS.sub(r"wrote \1 \2 (file reads are not recorded)", summary)
+
+
 def generate_summary(agent_name: str, session: dict) -> str:
     """session: a sessions row (dict) already rolled up — file_reads,
     file_writes, net_egress_bytes, proc_spawns, cred_accesses,
@@ -14,8 +28,15 @@ def generate_summary(agent_name: str, session: dict) -> str:
 
     file_reads = session.get("file_reads") or 0
     file_writes = session.get("file_writes") or 0
-    if file_reads or file_writes:
-        parts.append(f"read {file_reads} and wrote {file_writes} files")
+    # File reads are not recorded on Windows, so file_reads is 0 there. Say what was recorded and that
+    # reads are not recorded, instead of printing "read 0".
+    def files(n: int) -> str:
+        return f"{n} file{'s' if n != 1 else ''}"
+
+    if file_reads:
+        parts.append(f"read {files(file_reads)}" + (f" and wrote {files(file_writes)}" if file_writes else ""))
+    elif file_writes:
+        parts.append(f"wrote {files(file_writes)} (file reads are not recorded)")
 
     net_mb = (session.get("net_egress_bytes") or 0) / (1024 * 1024)
     if net_mb >= 0.01:

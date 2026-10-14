@@ -187,6 +187,28 @@ CREATE TABLE IF NOT EXISTS monitoring_gaps (
 );
 CREATE INDEX IF NOT EXISTS idx_monitoring_gaps_start ON monitoring_gaps(gap_start);
 
+-- Local evidence anchors (core/evidence_anchor.py, docs/design/evidence-anchoring.md section 2.1).
+-- Append-only. Each row pins the event chain head, the sealed count and a digest of the
+-- non-event tables at one moment, and links to the previous anchor by hash. anchor_hash is
+-- SHA-256 of anchor_json (canonical, sorted keys, no whitespace). Additive: created with
+-- IF NOT EXISTS, so an existing database gains the table with no data change. The sequence
+-- counter and install_id are also kept outside this file (the key directory), so deleting
+-- vlaw.db does not reset them. status is 'local_only' until an external timestamp exists.
+CREATE TABLE IF NOT EXISTS evidence_anchors (
+    anchor_seq INTEGER PRIMARY KEY,
+    anchor_json TEXT NOT NULL,
+    anchor_hash TEXT NOT NULL,
+    prev_anchor_hash TEXT NOT NULL,
+    chain_head TEXT NOT NULL,
+    event_count INTEGER NOT NULL,
+    last_event_id INTEGER NOT NULL,
+    tables_digest TEXT NOT NULL,
+    install_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    trigger TEXT NOT NULL,            -- hourly | export | startup_gap
+    status TEXT NOT NULL DEFAULT 'local_only'
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_id);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);

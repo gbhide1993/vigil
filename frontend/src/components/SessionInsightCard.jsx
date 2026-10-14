@@ -27,7 +27,6 @@ export default function SessionInsightCard() {
         if (!cancelled) {
           setSummary({
             agentName: firstSession.agent_name || 'unknown agent',
-            fileReads: firstSession.file_reads || 0,
             fileWrites: firstSession.file_writes || 0,
             netConnectCount: firstSession.net_connect_count || 0,
             redLineFired,
@@ -57,9 +56,8 @@ export default function SessionInsightCard() {
       </button>
       <div className="insight-card-title">Your first session, at a glance</div>
       <div className="insight-card-body">
-        <span className="insight-card-agent">{summary.agentName}</span> read{' '}
-        <strong>{summary.fileReads}</strong> file{summary.fileReads !== 1 ? 's' : ''} and wrote{' '}
-        <strong>{summary.fileWrites}</strong> file{summary.fileWrites !== 1 ? 's' : ''}
+        <span className="insight-card-agent">{summary.agentName}</span> wrote{' '}
+        <strong>{summary.fileWrites}</strong> file{summary.fileWrites !== 1 ? 's' : ''} (file reads are not recorded)
         {summary.netConnectCount > 0 ? (
           <>
             , contacting <strong>{summary.netConnectCount}</strong> network destination{summary.netConnectCount !== 1 ? 's' : ''}

@@ -1,8 +1,8 @@
 {
   "name": "vigil-ai-monitor",
   "displayName": "Vigil: Verify Coding Agent",
-  "description": "Independent OS-level record of the file changes, processes and credential-file activity your coding agent causes.",
-  "version": "0.2.24",
+  "description": "Records the file changes, process spawns and credential-path activity your coding agent causes, at the OS level, on Windows. Local only. Records are not protected against edits to the local database; network and MCP monitoring are not included.",
+  "version": "0.2.25",
   "publisher": "vvault",
   "repository": {
     "type": "git",
@@ -15,7 +15,7 @@
   "keywords": [
     "claude code", "cursor", "github copilot",
     "AI coding", "AI agents", "observability",
-    "security", "evidence", "audit"
+    "security", "monitoring", "windows"
   ],
   "activationEvents": ["onStartupFinished"],
   "main": "./out/extension.js",
@@ -37,7 +37,7 @@
     "commands": [
       { "command": "vigil.openDashboard",         "title": "Vigil: Open Dashboard" },
       { "command": "vigil.refresh",               "title": "Vigil: Refresh" },
-      { "command": "vigil.copyEvidenceHash",      "title": "Vigil: Copy Evidence Hash" },
+      { "command": "vigil.copyEvidenceHash",      "title": "Vigil: Copy Session Summary Hash" },
       { "command": "vigil.downloadSessionReport", "title": "Vigil: Download Session Report (PDF)" }
     ],
     "configuration": {

@@ -9,12 +9,13 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Query
 
+from core import runtime_state
 from core.mcp_service import _derive_friction_findings, _expand_file_paths
 from db.database import get_db
 
 router = APIRouter(tags=["Git"])
 
-VIGIL_VERSION = "0.2.1-beta"
+# The single version source is VERSION in main.py, shared through core/runtime_state.py (not `import main`).
 
 
 @router.get("/git/commit-summary")
@@ -99,7 +100,7 @@ async def commit_summary(lookback_minutes: int = Query(default=60, ge=1, le=1440
     response = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "lookback_minutes": lookback_minutes,
-        "vigil_version": VIGIL_VERSION,
+        "vigil_version": runtime_state.state.get("version", "unknown"),
         "sessions": sessions,
         "friction_signals": friction_signals,
         "red_lines": red_lines,

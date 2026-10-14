@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from core import ignore_rules, watch_stats
+from core import ignore_rules, report_coverage, watch_stats
 from core.file_changes import session_changes, summarise
 from core.monitoring_status import file_watcher_tier, mcp_monitoring, network_monitoring
 from core.scope_store import get_scope_directories, get_scope_entries
@@ -662,47 +662,180 @@ async def _build_summary(date: str, tz=None) -> dict:
         "sessions": sessions,
         "alerts": alerts,
         "report_notes": current_report_notes(),
+        "what_this_report_covers": report_coverage.as_dict(),
         **coverage,
     }
 
 
 CHAIN_SCOPE = (
-    "Covers the events table only, not alerts, dismissals, policy, sessions or coverage. "
-    "Checked by Vigil itself; not externally anchored."
+    "The hash chain covers the events table only. Alerts, dismissals, policy, sessions and coverage rows are "
+    "covered only by a digest taken when a local anchor is recorded. Checked by Vigil itself; not externally anchored."
+)
+
+NO_ANCHORING_LINE = (
+    "Anchoring: none. The chain is consistent but is stored only on this machine; "
+    "this report cannot show that earlier records were not altered."
 )
 
 
-async def _chain_verification() -> dict:
-    """Runs verify_chain() (which opens its own dedicated connection) and
-    shapes the result for the exports. Shared by the JSON and PDF outputs
-    so they cannot word the same check differently."""
-    from core.evidence_chain import verify_chain
+# The last verification, kept in memory so a page load or a date change in the Export page does not
+# repeat the whole check (about 0.3 s at 20,000 events, 1.4 s at 50,000 events and 50,000 rows in each
+# of alerts, audit_log and sessions). Filled by every explicit export and by the hourly anchor job.
+_chain_cache: dict = {"value": None}
 
-    result = await verify_chain()
-    consistent = bool(result["valid"])
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _shape_chain(result: dict, head: dict) -> dict:
+    anchors = result["anchors"]
+    status = result["status"]
+    consistent = status == "consistent"
+    checked = anchors["anchors_checked"]
     return {
-        "status": "consistent" if consistent else "inconsistent",
+        "status": status,
         "events_checked": result["checked_count"],
-        "first_bad_event_id": None if consistent else result.get("first_bad_event_id"),
+        "first_bad_event_id": result.get("first_bad_event_id") if status == "inconsistent" else None,
+        "detail": None if consistent else result.get("detail"),
         "scope": CHAIN_SCOPE,
+        "head_hash": head["head_hash"],
+        "sealed_count": head["sealed_count"],
+        "unsealed_count": head["unsealed_count"],
+        "anchoring": anchors["anchoring"],
+        "last_anchor": None if anchors["last_anchor"] is None else {
+            "time": anchors["last_anchor"]["created_at"],
+            "anchor_seq": anchors["last_anchor"]["anchor_seq"],
+            "position": anchors["last_anchor"]["event_count"],
+            "head": anchors["last_anchor"]["chain_head"],
+            "status": anchors["last_anchor"]["status"],
+        },
+        "anchors_checked": checked,
+        # Null, not 0, when nothing was checked: "0 mismatches" must not read as a pass.
+        "anchors_mismatched": anchors["anchors_mismatched"] if checked else None,
+        "anchor_continuity": anchors["continuity"],
+        "anchor_problem": anchors["first_mismatch"],
     }
 
 
-def _chain_header_text(chain: dict) -> str:
-    if chain["status"] == "consistent":
-        return (
-            f"Evidence chain: consistent ({chain['events_checked']} events checked). "
-            "Checked by Vigil itself; not yet independently anchored."
+async def _chain_head_snapshot() -> dict:
+    from core import evidence_anchor
+    from core.evidence_chain import get_chain_head
+
+    conn = await evidence_anchor.connect()
+    try:
+        return await get_chain_head(conn)
+    finally:
+        await conn.close()
+
+
+async def refresh_chain_verification_cache() -> dict:
+    """Runs the verification (no sealing, no new anchor) and remembers it with the time it was made."""
+    from core.evidence_chain import verify_chain
+
+    result = await verify_chain()
+    shaped = {**_shape_chain(result, await _chain_head_snapshot()), "as_of": _now_iso(), "cached": False}
+    _chain_cache["value"] = shaped
+    return shaped
+
+
+async def _chain_not_checked() -> dict:
+    """What a preview shows before any verification has been made since Vigil started: the cheap facts
+    (head, counts, last anchor) and an explicit "not checked", never a verdict."""
+    head = await _chain_head_snapshot()
+    last = head["last_anchor"]
+    return {
+        "status": "not_checked", "events_checked": None, "first_bad_event_id": None, "detail": None,
+        "scope": CHAIN_SCOPE, "head_hash": head["head_hash"], "sealed_count": head["sealed_count"],
+        "unsealed_count": head["unsealed_count"], "anchoring": head["anchoring"],
+        "last_anchor": None if last is None else {
+            "time": last["time"], "anchor_seq": last["anchor_seq"], "position": last["position"],
+            "head": last["head"], "status": last["status"],
+        },
+        "anchors_checked": None, "anchors_mismatched": None, "anchor_continuity": None, "anchor_problem": None,
+        "as_of": None, "cached": False,
+        "note": "Not verified since Vigil started. Download the report to run the check.",
+    }
+
+
+async def _chain_verification(fresh: bool = True) -> dict:
+    """fresh=True (a report download, the PDF): seals what is pending, records a local anchor for this
+    export (core/evidence_anchor.py; the last anchor is reused when nothing at all changed since it),
+    runs verify_chain() and shapes the result. fresh=False (a page load or a date change in the Export
+    page): returns the last verification with its "as_of" time, or "not_checked" if there is none yet;
+    it seals nothing, digests nothing and records no anchor. Shared by the JSON and PDF outputs so they
+    cannot word the same check differently. Anchoring failures never block an export."""
+    from core import evidence_anchor
+    from core.evidence_chain import seal_new_events
+
+    if not fresh:
+        cached = _chain_cache["value"]
+        return {**cached, "cached": True} if cached else await _chain_not_checked()
+
+    try:
+        await seal_new_events()
+        await evidence_anchor.create_anchor("export")
+    except Exception:
+        pass
+    return await refresh_chain_verification_cache()
+
+
+def _chain_lines(chain: dict) -> list[str]:
+    """The "Evidence integrity" lines of the PDF (design doc section 4.3 wording). The first line is the
+    chain verdict. A missing anchor is printed as absence, never softened."""
+    status = chain["status"]
+    if status == "not_checked":
+        return ["Evidence chain: not checked in this view. Download the report to run the check."]
+    if status == "inconsistent":
+        bad = chain["first_bad_event_id"]
+        where = f"event {bad}" if bad is not None else "an unknown event"
+        return [f"Evidence chain: INCONSISTENT at {where}. Do not rely on this report."]
+
+    last = chain["last_anchor"]
+    lines: list[str] = []
+    if status == "shorter_than_local_anchor":
+        problem = chain["anchor_problem"] or {}
+        lines.append(
+            f"Evidence chain: SHORTER than local anchor seq {problem.get('anchor_seq', '?')}. Records may have been removed. "
+            "Do not rely on this report."
         )
-    bad = chain["first_bad_event_id"]
-    where = f"event {bad}" if bad is not None else "an unknown event"
-    return f"Evidence chain: INCONSISTENT at {where}. Do not rely on this report."
+        if problem.get("detail"):
+            lines.append(problem["detail"])
+    elif status == "disagrees_with_local_anchor":
+        problem = chain["anchor_problem"] or {}
+        lines.append(
+            f"Evidence chain: consistent, but it DISAGREES with local anchor seq {problem.get('anchor_seq', '?')}. "
+            "Do not rely on this report."
+        )
+        if problem.get("detail"):
+            lines.append(problem["detail"])
+    else:
+        lines.append(f"Evidence chain: consistent, {chain['events_checked']} events, head {chain['head_hash'][:12]}")
+        if status == "anchor_continuity_break":
+            detail = chain["anchor_continuity"]["detail"] or ""
+            lines.append(f"Anchor continuity: BREAK. {detail} Do not rely on this report.")
+
+    if chain["anchors_checked"]:
+        matched = chain["anchors_checked"] - (chain["anchors_mismatched"] or 0)
+        lines.append(
+            f"Local anchors: {chain['anchors_checked']} recorded, last {last['time']} (seq {last['anchor_seq']}), "
+            f"status: local only, no external timestamp. {matched} of {chain['anchors_checked']} match the chain. "
+            "Checked by Vigil itself."
+        )
+    if status in ("consistent", "anchor_continuity_break"):
+        lines.append(NO_ANCHORING_LINE)
+    if chain["unsealed_count"]:
+        lines.append(f"Not yet sealed into the chain: {chain['unsealed_count']} events (sealed within about 15 seconds).")
+    return lines
 
 
 @router.get("/export/json")
-async def export_json(date: str = Query(default="today")):
+async def export_json(date: str = Query(default="today"), preview: bool = Query(default=False)):
+    """preview=true is for a page showing the report (the Export page calls it on every load and date
+    change): the evidence check is the last one made, labelled with its as_of time, and nothing is sealed,
+    digested or anchored. The default, used by downloads and integrations, runs the check now."""
     summary = await _build_summary(date)
-    summary["chain_verification"] = await _chain_verification()
+    summary["chain_verification"] = await _chain_verification(fresh=not preview)
     return with_utc_offsets(summary)
 
 
@@ -773,7 +906,16 @@ async def export_pdf(date: str = Query(default="today")):
 
     chain = await _chain_verification()
     c.setFont("Helvetica-Bold", 10)
-    y = draw(y, _chain_header_text(chain), "Helvetica-Bold", 10, 0.3 * inch)
+    chain_lines = _chain_lines(chain)
+    y = draw(y, chain_lines[0], "Helvetica-Bold", 10, 0.3 * inch)
+    for extra in chain_lines[1:]:
+        y = draw(y, extra, "Helvetica", 9, 0.22 * inch)
+
+    # What the report does and does not cover: the same block as the session PDF and the JSON export.
+    y = draw(y, report_coverage.TITLE, "Helvetica-Bold", 10, 0.22 * inch)
+    for line in report_coverage.LINES:
+        y = draw(y, line, "Helvetica", 9, 0.19 * inch)
+    y -= 0.12 * inch
 
     period_start_utc = datetime.fromisoformat(summary["period_start"])
 

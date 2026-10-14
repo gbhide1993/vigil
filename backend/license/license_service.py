@@ -2,7 +2,7 @@
 home, no network calls. The license file is a JSON payload plus a
 base64 RSA-PSS/SHA-256 signature, verified against a public key baked
 into the app. If no license file is found, the service falls back to a
-14-day trial (1 agent, 24h retention) starting from first run.
+30-day trial (1 agent, 24h retention) starting from first run.
 
 License file format (.vlaw-license), JSON:
 {
@@ -34,6 +34,8 @@ LICENSE_FILE = Path(os.environ.get("VLAW_LICENSE_FILE", "./.vlaw-license"))
 # held offline by V-LAW's license issuer — never shipped with the app.
 VLAW_PUBLIC_KEY_PEM = os.environ.get("VLAW_PUBLIC_KEY_PEM", "")
 
+# The trial length is used for the status shown by /api/health. The agent limit and the retention hours below are
+# carried in the status but are not enforced anywhere: nothing blocks, limits or deletes based on them.
 TRIAL_DAYS = 30
 TRIAL_AGENT_LIMIT = 1
 TRIAL_RETENTION_HOURS = 24
@@ -166,7 +168,7 @@ class LicenseService:
 
     def _get_or_set_trial_start(self) -> datetime:
         """Trial start is persisted to a marker file on first run so the
-        14-day window survives restarts and can't be reset by deleting
+        30-day window survives restarts and can't be reset by deleting
         just the DB."""
         if self._trial_marker_path.exists():
             try:

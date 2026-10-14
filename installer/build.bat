@@ -54,8 +54,17 @@ echo Step 5: Writing SHA256 of the installer...
 powershell -NoProfile -Command "$f='output\Vigil-Setup-%APP_VERSION%.exe'; $h=(Get-FileHash $f -Algorithm SHA256).Hash; Set-Content -Path ($f + '.sha256') -Value ($h + '  ' + (Split-Path $f -Leaf)) -Encoding ASCII; Write-Host $h"
 if errorlevel 1 goto error
 
+echo Step 6: Writing manifest.json next to the installer (a build output only, nothing is uploaded)...
+node manifest.js write "output\Vigil-Setup-%APP_VERSION%.exe" %APP_VERSION% output\manifest.json
+if errorlevel 1 goto error
+
+echo Step 7: Checking the manifest against the installer and the version...
+node manifest.js check output\manifest.json "output\Vigil-Setup-%APP_VERSION%.exe" %APP_VERSION%
+if errorlevel 1 goto error
+
 echo Done. Installer at installer\output\Vigil-Setup-%APP_VERSION%.exe
 echo SHA256 at installer\output\Vigil-Setup-%APP_VERSION%.exe.sha256
+echo Manifest at installer\output\manifest.json
 goto end
 
 :error
