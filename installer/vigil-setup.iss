@@ -189,19 +189,25 @@ begin
   begin
     Question :=
       'Vigil has been removed. Do you also want to delete everything Vigil stored on this PC?' + #13#10 + #13#10 +
-      'Yes: deletes the whole folder %LOCALAPPDATA%\V-LAW (the evidence database, policy, license, logs and rotated logs, and backups) ' +
-      'and Vigil''s settings folder under %APPDATA%. This cannot be undone.' + #13#10 + #13#10 +
-      'No: keeps all of it. Reinstalling Vigil later picks it up again.';
+      'Yes: deletes the whole folder %LOCALAPPDATA%\V-LAW (the evidence database, policy, license, logs and rotated logs, and backups, ' +
+      'and the keys folder that holds the evidence anchor records) ' +
+      'and Vigil''s settings folder under %APPDATA%. A new install then starts a fresh evidence series. This cannot be undone.' + #13#10 + #13#10 +
+      'No: keeps all of it, the keys folder included. Reinstalling Vigil later picks it up again.';
     if MsgBox(Question, mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
     begin
       // As the original user, so %LOCALAPPDATA% and %APPDATA% are that user's, not the elevated account's.
+      // The evidence anchor counter and install id live in %LOCALAPPDATA%\V-LAW\keys (backend VLAW_KEY_DIR,
+      // the folder next to "data"). It is deleted here together with the database, on purpose: a database
+      // without its key folder is a clean start, a key folder without its database is reported as a
+      // restarted series. The keys folder is named explicitly so this stays true if the folder delete is
+      // ever narrowed.
       ExecAsOriginalUser(ExpandConstant('{cmd}'),
-        '/C rmdir /S /Q "%LOCALAPPDATA%\V-LAW" & rmdir /S /Q "%APPDATA%\vigil-tray" & rmdir /S /Q "%APPDATA%\vlaw-tray"',
+        '/C rmdir /S /Q "%LOCALAPPDATA%\V-LAW\keys" & rmdir /S /Q "%LOCALAPPDATA%\V-LAW" & rmdir /S /Q "%APPDATA%\vigil-tray" & rmdir /S /Q "%APPDATA%\vlaw-tray"',
         '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     end
     else
       MsgBox('Your Vigil data was kept:' + #13#10 +
-             '  %LOCALAPPDATA%\V-LAW' + #13#10 +
+             '  %LOCALAPPDATA%\V-LAW (including its keys folder)' + #13#10 +
              '  %APPDATA%\vigil-tray' + #13#10 +
              'Delete those folders yourself if you no longer need them.', mbInformation, MB_OK);
   end;

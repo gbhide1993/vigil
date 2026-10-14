@@ -133,7 +133,7 @@ def test_no_policy_file_is_shipped_and_build_bat_cleans_assets_and_policy():
     assert "policy" not in _section("Files").lower().replace("stop-vigil", "")
     assert not (INSTALLER / "build" / "policy").exists()
     assert "for %%D in (tray backend frontend assets policy)" in BAT
-    assert "manifest" not in BAT.lower()
+    assert "manifest.js write" in BAT and "manifest.js check" in BAT, "the manifest the extension reads is a build output"
     assert ".sha256" in BAT and "Get-FileHash" in BAT
     backend_main = (ROOT / "backend" / "main.py").read_text(encoding="utf-8")
     assert "DEFAULT_POLICY" in backend_main, "the backend writes its own default policy, so a shipped copy was dead"
@@ -214,3 +214,20 @@ def test_port_check_reports_another_program_but_not_one_under_the_app_folder(tmp
         sock.close()
     free = _powershell("-AppDir", tmp_path / "app", "-CheckPort", port)
     assert free.returncode == 0
+
+
+def test_uninstall_yes_deletes_the_evidence_key_folder_and_no_keeps_it():
+    """The evidence anchor counter lives in %LOCALAPPDATA%\\V-LAW\\keys. Yes removes it with the database (a
+    fresh install then starts a clean series); No keeps it and says so. Static check only: the Pascal code
+    has not been run (see the manual checks in the report)."""
+    code = _section("Code")
+    yes_branch = code[code.index("if MsgBox(Question"):code.index("else\n      MsgBox('Your Vigil data was kept")]
+    assert 'rmdir /S /Q "%LOCALAPPDATA%\\V-LAW\\keys"' in yes_branch
+    assert 'rmdir /S /Q "%LOCALAPPDATA%\\V-LAW"' in yes_branch
+    assert "MB_YESNO or MB_DEFBUTTON2" in code, "No stays the default"
+    assert "the keys folder that holds the evidence anchor records" in code
+    assert "including its keys folder" in code[code.index("Your Vigil data was kept"):]
+    # the backend's key folder really is that folder: next to the data folder, inside V-LAW
+    main_py = (ROOT / "backend" / "main.py").read_text(encoding="utf-8")
+    assert 'os.path.join(os.path.dirname(os.path.abspath(os.environ["VLAW_DATA_DIR"])), "keys")' in main_py
+    assert 'os.environ.setdefault("VLAW_DATA_DIR", os.path.join(BASE_DIR, "data"))' in main_py
