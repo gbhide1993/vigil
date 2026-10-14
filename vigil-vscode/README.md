@@ -104,7 +104,7 @@ Four more rules exist but do not fire in this version: two need file-read events
 - Vigil does not store file contents, diffs or prompts.
 - Everything is stored locally in a SQLite database under `%LOCALAPPDATA%\V-LAW`.
 - The native app listens on `127.0.0.1` only. The local API has no authentication, so never expose port 7422 to a network. The Docker setup publishes the port on `127.0.0.1` only, but inside the container the server listens on all interfaces.
-- Vigil uploads no event data. The only outbound path is an optional Slack or Teams daily-digest webhook (counts and a summary sentence), and only if you save a URL in Settings.
+- Vigil uploads no event data. The outbound paths are an optional Slack or Teams daily-digest webhook (counts and a summary sentence), only if you save a URL in Settings, and an optional external timestamp (off by default) that, once you turn it on and set a service address, sends only a 32-byte hash of an anchor to that service. That is a second outbound connection; no events, paths or names are sent, and a token covers only what existed when the anchor was made.
 - There is no automatic retention yet: events stay in the database until you remove them.
 - The uninstaller asks before deleting the stored evidence.
 

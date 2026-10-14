@@ -130,6 +130,97 @@ function WebhookSection() {
   )
 }
 
+function ExternalTimestampSection() {
+  const [form, setForm] = useState({ enabled: false, url: '', fallback_url: '', ca_pem: '' })
+  const [disclosure, setDisclosure] = useState('')
+  const [saved, setSaved] = useState(false)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    let cancelled = false
+    async function load() {
+      try {
+        const data = await api.getExternalTimestamp()
+        if (cancelled) return
+        setDisclosure(data.disclosure)
+        setForm({ enabled: data.enabled, url: data.url, fallback_url: data.fallback_url, ca_pem: data.ca_pem })
+      } catch {
+        // non-fatal; the section stays at its defaults (off)
+      }
+    }
+    load()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  async function handleSave() {
+    setError(null)
+    try {
+      const data = await api.setExternalTimestamp(form)
+      setForm({ enabled: data.enabled, url: data.url, fallback_url: data.fallback_url, ca_pem: data.ca_pem })
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+    } catch (e) {
+      setError(e.message || 'could not save')
+    }
+  }
+
+  return (
+    <div className="settings-section">
+      <h3>External timestamp (optional)</h3>
+      <p className="settings-desc">
+        {disclosure || 'When on, Vigil sends only a 32-byte hash of an anchor to the timestamp service you choose. No events, file paths or names leave this machine. This is a second outbound connection.'}
+      </p>
+      <label className="settings-note" style={{ display: 'block', fontStyle: 'normal' }}>
+        <input
+          type="checkbox"
+          checked={form.enabled}
+          onChange={(e) => setForm({ ...form, enabled: e.target.checked })}
+        />{' '}
+        Request an RFC 3161 timestamp for each anchor (off by default; nothing is sent until you turn this on and set an address)
+      </label>
+      <div className="settings-input-row">
+        <input
+          type="url"
+          className="settings-input mono"
+          placeholder="Timestamp service address (https://...)"
+          value={form.url}
+          onChange={(e) => setForm({ ...form, url: e.target.value })}
+        />
+      </div>
+      <div className="settings-input-row">
+        <input
+          type="url"
+          className="settings-input mono"
+          placeholder="Fallback address, only tried if the first fails (optional)"
+          value={form.fallback_url}
+          onChange={(e) => setForm({ ...form, fallback_url: e.target.value })}
+        />
+      </div>
+      <div className="settings-input-row">
+        <textarea
+          className="settings-input mono"
+          rows={4}
+          placeholder="Certificate (PEM) of the timestamp service, to check its signature (optional)"
+          value={form.ca_pem}
+          onChange={(e) => setForm({ ...form, ca_pem: e.target.value })}
+        />
+      </div>
+      <div className="settings-input-row">
+        <button className="btn-settings-save" onClick={handleSave}>
+          {saved ? '✓ Saved' : 'Save'}
+        </button>
+      </div>
+      {error && <p className="settings-note" style={{ color: 'var(--critical)', fontStyle: 'normal' }}>Save failed: {error}</p>}
+      <p className="settings-note">
+        A timestamp covers only what existed when the anchor was made. Without a certificate, tokens are marked
+        "timestamp_unverified_signature": their hash and time are read but their signature is not checked.
+      </p>
+    </div>
+  )
+}
+
 function ConfigAuditSection() {
   const [configAudit, setConfigAudit] = useState(null)
 
@@ -350,6 +441,7 @@ export default function Settings() {
       <AgentsSection />
       <WatchedFoldersSection />
       <WebhookSection />
+      <ExternalTimestampSection />
       <ConfigAuditSection />
       <AnalyticsSection />
     </div>

@@ -80,7 +80,7 @@ Key policy fields:
 
 ## Privacy
 
-Vigil runs locally and uploads no event data. The only outbound path is an optional Slack or Teams webhook that sends a daily digest (counts and a summary sentence), and only if you save a URL. The native app listens on 127.0.0.1 only. The PDF is generated locally and never uploaded anywhere.
+Vigil runs locally and uploads no event data. The outbound paths are an optional Slack or Teams webhook that sends a daily digest (counts and a summary sentence), only if you save a URL, and an optional external timestamp (off by default) that sends only a 32-byte anchor hash to the service you choose, a second outbound connection; a token covers only what existed when the anchor was made. The native app listens on 127.0.0.1 only. The PDF is generated locally and never uploaded anywhere.
 
 ## Support
 

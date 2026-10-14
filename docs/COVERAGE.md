@@ -15,6 +15,7 @@ Registered at startup in `backend/main.py`.
 | Aggregator flush | Running | Every 15 s | Writes buffered file events to the database. |
 | File burst check | Running | Every 30 s | Correlates bursts of file changes with agent processes. |
 | Evidence chain sealing | Running | Every 15 s | Hash-chains the events table only. |
+| External timestamp queue | Running, does nothing unless you turn it on | Every minute | Opt-in. Off by default; with the switch off or no address set, nothing is sent. |
 | Baseline update | Running | Hourly | Folds ended sessions into the per-agent baseline. |
 | Credential detection | Running, no separate watcher | Event-driven | A change to a credential-looking path is classified from file events on paths containing `.env`, `.ssh`, `.aws`, `.pem` or `.key`, made by the file watcher. |
 | Network watcher (`watchers/network_watcher.py`) | **Disabled** | n/a | Commented out at `main.py:411`. Disabled in commit e821731 (2026-09-29, watcher-starvation deadlock fix): its resolution phase does blocking I/O. Re-enable needs bounded work per tick, an off-switch and a loop-delay measurement (see the comment in `main.py`). |
@@ -93,7 +94,7 @@ RL2 and RL6 stay in the code, but their alert text now says they require file-re
 | Agent environment redirect (two variables) | Any other environment value (deliberately not kept) | none |
 | Which agent was active, for known or behaviourally agent-like processes | Unrecognized tools | none |
 | When Vigil itself was running (coverage heartbeat and gaps) | Anything while it was not running | none |
-| A consistency check of stored events | Alerts, dismissals, policy, sessions, coverage data in that check | Anchoring and signed export (`docs/design/evidence-anchoring.md`) |
+| A consistency check of stored events, against local anchors; an external timestamp of anchor hashes only if you turn it on (a token covers only what existed when its anchor was made) | Alerts, dismissals, policy, sessions, coverage data in that check; events after the newest token | Signed export and a standalone verifier (`docs/design/evidence-anchoring.md`) |
 | Nothing for network connections | All network connections and destinations | Network monitoring |
 | Nothing for MCP connections | MCP server connections and tool calls | MCP connection monitoring |
 | Nothing for reachable credentials | What the agent's account could reach but did not use | Permission inventory (`docs/design/reachable-set-inventory.md`) |
@@ -111,5 +112,13 @@ What the shipped app (backend, tray and web interface) contacts over the network
 - **Only if you save a webhook URL in Settings:** the backend POSTs the daily summary text (summary sentence, clean-day
   and agent counts) to that URL, at 9:00 each day and when you press the test button. With no URL saved, nothing is
   sent. `VLAW_CORE_ONLY=1` disables this feature entirely.
+- **Only if you turn on the external timestamp in Settings and set a service address (opt-in, off by default):** the
+  backend POSTs an RFC 3161 request to that address (and to a fallback address if you set one) for each anchor
+  that has no token. The request is 59 bytes: the 32-byte SHA-256 anchor hash, and no events, file paths, names or other
+  data. This is a second outbound connection, after the webhook. A failed or offline attempt is retried (1 minute, 5
+  minutes, 30 minutes, then hourly) and never delays monitoring, sealing, anchoring or an export. A token covers
+  only what existed when that anchor was made; later events are anchored locally only until the next token.
+  Without a certificate you supply in Settings, the token's signature is not checked and the token is marked
+  `timestamp_unverified_signature`. Nothing is sent while the switch is off or the address is empty.
 - A test (`backend/tests/test_no_external_loads.py`) fails if the interface source or the built interface loads
   any script, style, font or image from outside the machine.

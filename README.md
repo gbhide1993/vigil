@@ -1,7 +1,7 @@
 # Vigil — AI Session Monitor
 
 See what Claude Code, Cursor, Codex, and GitHub Copilot actually do on your machine.
-OS-level evidence. Runs locally. Vigil uploads no event data (the only outbound path is an optional daily-digest webhook, off until you save a URL).
+OS-level evidence. Runs locally. Vigil uploads no event data. Two optional outbound paths, both off until you set them: the daily-digest webhook, and an external timestamp that sends only a 32-byte anchor hash.
 
 ## What it shows
 
@@ -54,6 +54,12 @@ from your own machine, and there is no update check, telemetry upload or license
 The one exception is the daily summary webhook (Slack, Teams or any webhook URL). It is off until you
 save a URL in Settings; then Vigil sends the daily summary text to exactly that URL. Leave the URL empty
 and nothing is sent. The full list is in `docs/COVERAGE.md` ("Network contact").
+
+The second exception is the optional external timestamp (Settings, off by default). When you turn it on and
+set the address of an RFC 3161 timestamp service, Vigil sends only a 32-byte hash of an anchor to that service.
+No events, file paths or names leave the machine. This is a second outbound connection. A returned token covers
+only what existed when that anchor was made, not later events, and without a certificate you supply its
+signature is not checked (it is marked "timestamp_unverified_signature").
 
 ## Requirements
 

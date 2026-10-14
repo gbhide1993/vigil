@@ -206,7 +206,14 @@ CREATE TABLE IF NOT EXISTS evidence_anchors (
     install_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
     trigger TEXT NOT NULL,            -- hourly | export | startup_gap
-    status TEXT NOT NULL DEFAULT 'local_only'
+    status TEXT NOT NULL DEFAULT 'local_only',
+    -- Stage 2 (opt-in RFC 3161 timestamps; also added to older databases by db/database.py _migrate)
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_try_at TEXT,
+    tsa_token BLOB,                   -- DER token
+    tsa_name TEXT,                    -- URL of the service that issued the token
+    timestamped_at TEXT,              -- the token's genTime
+    error TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_id);
