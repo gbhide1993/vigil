@@ -37,6 +37,12 @@ data/
 # Logs
 *.log
 logs/
+# Rotated logs (vlaw-backend.log.1, .2, .3) and any other numbered log file
+backend/*.log*
+*.log.[0-9]*
+# Runtime key directory of a development run (evidence anchor counter, install id): never committed
+backend/keys/
+keys/
 
 # OS
 .DS_Store
