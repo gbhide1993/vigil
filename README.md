@@ -61,6 +61,10 @@ No events, file paths or names leave the machine. This is a second outbound conn
 only what existed when that anchor was made, not later events, and without a certificate you supply its
 signature is not checked (it is marked "timestamp_unverified_signature").
 
+## Evidence bundle and verifier
+
+The Export page can produce a signed evidence bundle (a zip) for a day: the events with their chain rows, the anchors that bind them, any stored timestamp tokens and a manifest signed with a per-install key. verifier/vigil_verify.py checks it offline, with no network and no Vigil code. It shows the bundle was not edited after export by anyone without the signing key, and that the exported events re-hash into the chain the anchors recorded. It does not show who exported it (the key is readable by the Windows user Vigil runs as), that the record is complete (file reads, network and MCP calls are not recorded), or anything about events after the newest timestamp. Alerts, sessions and audit entries are not integrity-protected in this version. The format is in `docs/design/evidence-bundle-spec.md`.
+
 ## Requirements
 
 - Windows 10 or 11

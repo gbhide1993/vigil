@@ -1,6 +1,6 @@
 # Evidence anchoring and signed export: design
 
-Status: design. Stage 1 (local anchors, section 11) is implemented as of 2026-10-14, and Stage 2 (opt-in external timestamps, section 13) as of 2026-10-15; stages 3 to 6 are design only. Date: 2026-10-10, updated 2026-10-14.
+Status: design. Stage 1 (local anchors, section 11) is implemented as of 2026-10-14, Stage 2 (opt-in external timestamps, section 13) and Stage 3 (signed bundle and offline verifier, section 14) as of 2026-10-15; stages 4 to 6 are design only. Date: 2026-10-10, updated 2026-10-14.
 Scope: make the exported report honestly "tamper-evident" against someone who can edit the local database after the fact (the monitored agent, or the user it runs as).
 Source read: branch pilot/p1-backend-safety at 15d23e6; the line numbers in section 1 were refreshed on 2026-10-14 after Stage 1 (section 11 lists what changed). The live database was not read; everything below comes from code and schema.
 
@@ -518,3 +518,30 @@ Deviations from the task description and from sections 4 and 9, and why, in one 
 - **The stamp time is the service's clock** and is the only time the report treats as proof of when (section 4.2). The anchor's own `created_at` is the local clock.
 - **Not tested here:** a real timestamp service. Every test uses a fake service built from a throwaway key and certificate, and no request leaves the machine.
 - **Frozen build:** the new module imports only `cryptography`, `httpx` and the standard library, all already in the executable, but a build was not made to confirm it (section 9.4, item 9).
+
+## 14. Stage 3 as built (2026-10-15)
+
+What shipped: a per-install signing key, a signed evidence bundle, and a standalone offline verifier. The bundle format and the exact hashing rules are written down in `evidence-bundle-spec.md` so a third party can reimplement the check. Code: `backend/core/signing_key.py`, `backend/core/evidence_bundle.py`, `GET /api/export/bundle?start=&end=` (the Export page has an "Export evidence bundle" card), and `verifier/vigil_verify.py`.
+
+- **Signing key.** An Ed25519 key pair created on first use (when the first anchor is made, or the first bundle is exported) in the key directory (`VLAW_KEY_DIR`): `install.key` (the private key, wrapped with DPAPI in user scope on Windows, a plain file elsewhere or if DPAPI fails, the `protection` field says which) and `install.pub.json` (install id, public key, fingerprint = SHA-256 of the 32 public bytes). Only the public part is ever exported.
+- **Anchor format v2.** New anchors carry `key_fingerprint`, so a timestamped anchor also pins the key. Anchors are checked by hashing their stored JSON as it is, so v1 anchors made before Stage 3 keep verifying. If the key cannot be created, a v1 anchor is recorded and anchoring is not blocked.
+- **Bundle.** One zip: `events.jsonl` (the events of the range, every hashed column as text, with `row_hash` and `prev_hash`), `chain-proof.json` (the manifest: install id, public key and fingerprint, creation time, SHA-256 of every other file, the UTC date range, where the chain starts, the anchors that bind the range with any stored timestamp token inline, the limits), `chain-proof.sig` (Ed25519 over the manifest bytes), `coverage.json` (the report coverage block) and `gaps.json` (monitoring gaps overlapping the range). Exporting seals pending events and records an export anchor first. The rows run from the first event of the range through the last event of the first anchor that is at or after the range's last event, so that anchor's head can be recomputed. The anchors included run from the last anchor before the range through that end anchor. No settings, no private key, no webhook or certificate setting is included.
+- **Verifier.** One file, standard library and `cryptography` only, no import from the backend, no network. Checks, each printed `PASS`, `FAIL` or `NOT CHECKED`: files (hashes, nothing unlisted), signature, key (fingerprint, and against the anchors), chain (re-hashed from the exported rows), anchors (hash, links, install), anchor-binds, timestamps. It prints the coverage block and the gaps. Exit code 0 nothing failed and nothing unchecked, 1 a check failed, 2 nothing failed but a check could not be made, 3 not a readable bundle. A timestamp token is `PASS` only with `--tsa-ca` and a checked signature; otherwise `NOT CHECKED: signature not authenticated`.
+
+Deviations from the task description, and why (the doc was followed):
+
+1. **File names follow section 5.3**: `chain-proof.json` and `chain-proof.sig` (the task called them `manifest.json` and `manifest.sig`), plus `events.jsonl`. Timestamp tokens are inline in the manifest's `anchors` list as in section 5.3, not separate files, so the signature covers them.
+2. **Key storage follows section 5.1**: DPAPI-wrapped on Windows, with the plain-file fallback the doc names.
+3. **Exit codes follow section 6.4**: 2 when nothing failed but a check could not be made. Exit 0 therefore means every check passed, which is stricter than "nothing failed".
+4. **Result lines**: the failure result line of section 6.4 is replaced by `RESULT: FAILED`, because it names a cause the check cannot know, and a failed check shows a mismatch, not who or what caused it. `RESULT: CONSISTENT` and `RESULT: INCONCLUSIVE` are the doc's.
+5. **`--trust-key`** (section 6.2) is supported; without it the verifier prints a note that nothing ties the key to an installation you expect, and does not count that as a failed check. `--earlier-anchor` is not implemented.
+6. **No `report.pdf` or `report.json`** (section 5.3): Vigil does not store the PDF it generates, so there is none to include. The coverage block is `coverage.json`.
+7. **The PDF "Evidence integrity" lines are unchanged** and do not mention the bundle.
+
+### Stage 3 limits
+
+- **The key is readable by the same Windows user.** DPAPI user scope gives no protection from a process of that user (section 5.2). A valid signature shows the bundle was not edited after export by anyone without the key; it does not show who exported it. Anyone with that access can also edit the data, sign a new bundle, and recompute the anchors; what then still constrains them is only a timestamp token whose signature you check against a certificate you hold, and a copy of an earlier anchor or bundle kept elsewhere.
+- **Completeness is not shown.** Events that were never recorded (file reads, network, MCP calls, processes shorter than the polling interval) are not in the bundle, and nothing in it can show they happened.
+- **Events after the last timestamp** are anchored on this machine only. The bundle's end is bound by an anchor, but only a checked token turns that into "not altered since <time>".
+- **Alerts, sessions, audit entries and monitoring-gap records** are not integrity-protected in this version; `gaps.json` is included for reading, not as a protected record.
+- **Not tested here:** a real timestamp service, a frozen build of the verifier (it is a source file; nothing was built), and the DPAPI path on a non-Windows machine.

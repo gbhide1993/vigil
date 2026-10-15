@@ -80,6 +80,8 @@ Key policy fields:
 
 ## Privacy
 
+The Export page can produce a signed evidence bundle that `verifier/vigil_verify.py` checks offline. It shows the bundle was not edited after export by anyone without the signing key (readable by the Windows user Vigil runs as); it does not show who exported it, that the record is complete, or anything about events after the newest timestamp.
+
 Vigil runs locally and uploads no event data. The outbound paths are an optional Slack or Teams webhook that sends a daily digest (counts and a summary sentence), only if you save a URL, and an optional external timestamp (off by default) that sends only a 32-byte anchor hash to the service you choose, a second outbound connection; a token covers only what existed when the anchor was made. The native app listens on 127.0.0.1 only. The PDF is generated locally and never uploaded anywhere.
 
 ## Support
