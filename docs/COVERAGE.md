@@ -15,6 +15,7 @@ Registered at startup in `backend/main.py`.
 | Aggregator flush | Running | Every 15 s | Writes buffered file events to the database. |
 | File burst check | Running | Every 30 s | Correlates bursts of file changes with agent processes. |
 | Evidence chain sealing | Running | Every 15 s | Hash-chains the events table only. |
+| Evidence bundle export and `verifier/vigil_verify.py` | Available on request (Export page) | When you export | Signed zip of a day's events with chain rows, anchors and timestamp tokens, checked offline. Shows no edit after export without the key; not who exported it, not completeness, not events after the newest timestamp. |
 | External timestamp queue | Running, does nothing unless you turn it on | Every minute | Opt-in. Off by default; with the switch off or no address set, nothing is sent. |
 | Baseline update | Running | Hourly | Folds ended sessions into the per-agent baseline. |
 | Credential detection | Running, no separate watcher | Event-driven | A change to a credential-looking path is classified from file events on paths containing `.env`, `.ssh`, `.aws`, `.pem` or `.key`, made by the file watcher. |

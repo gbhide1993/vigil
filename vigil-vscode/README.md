@@ -112,6 +112,7 @@ Four more rules exist but do not fire in this version: two need file-read events
 
 ## Limits
 
+- Evidence bundle: the Export page can produce a signed zip checked offline by `verifier/vigil_verify.py`. It shows the bundle was not edited after export by anyone without the signing key; it does not show who exported it, that the record is complete, or anything about events after the newest timestamp.
 - Vigil does not protect its records against someone who can edit the local database. The report's hash chain is checked by Vigil itself and is not anchored anywhere outside your machine.
 - Without the optional ETW tier (needs Administrator), file changes are attributed to the agent running at the time on a best-guess basis. A change you make yourself while an agent is running may be shown under the agent.
 - File reads are not recorded. Network and MCP connections are not monitored.

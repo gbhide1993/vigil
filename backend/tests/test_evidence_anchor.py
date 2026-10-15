@@ -561,7 +561,8 @@ async def test_anchor_hash_is_the_sha256_of_the_canonical_json_and_the_key_direc
     fields = json.loads(row[0])
     assert list(fields) == sorted(fields), "canonical: sorted keys"
     assert set(fields) == {"v", "install_id", "anchor_seq", "prev_anchor_hash", "chain_head", "event_count",
-                           "last_event_id", "meta_head", "tables_digest", "created_at"}
+                           "last_event_id", "meta_head", "tables_digest", "created_at", "key_fingerprint"}
+    assert fields["v"] == 2 and len(fields["key_fingerprint"]) == 64, "Stage 3: v2 anchors pin the signing key"
     state = anchors.load_state(env.keys)
     assert state["install_id"] == row[3] and state["anchor_seq"] == 1 and state["last_anchor_hash"] == row[1]
     assert not str(env.keys).startswith(str(env.db_path.parent / "data")), "the key directory is not the data directory"

@@ -105,6 +105,23 @@ export default function Export() {
             Download JSON
           </a>
         </div>
+        <div className="export-card">
+          <h3>Export evidence bundle</h3>
+          <p>
+            A signed zip of the day's events with their chain rows, the anchors and any timestamp tokens, which
+            verifier/vigil_verify.py can check offline. Days are UTC dates. It shows the bundle was not edited
+            after export by anyone without the signing key (readable by this Windows user); it does not show who
+            exported it or that the record is complete.
+          </p>
+          <a
+            className={`btn primary ${problem ? 'disabled' : ''}`}
+            href={problem ? undefined : api.exportBundleUrl(preview ? preview.date : date, preview ? preview.date : date)}
+            aria-disabled={Boolean(problem)}
+            download={`vigil-evidence-${preview ? preview.date : date}.zip`}
+          >
+            Export evidence bundle
+          </a>
+        </div>
       </div>
 
       <button className="raw-json-toggle" onClick={() => setShowRawJson((v) => !v)}>
