@@ -877,6 +877,27 @@ async def export_json(date: str = Query(default="today"), preview: bool = Query(
     return with_utc_offsets(summary)
 
 
+@router.get("/export/bundle")
+async def export_bundle(start: str = Query(default="today"), end: str = Query(default="today")):
+    """The signed evidence bundle for a range of UTC dates (core/evidence_bundle.py): events with their chain
+    rows, the anchors that bind them, any stored timestamp tokens, a manifest and its Ed25519 signature. Check
+    it offline with verifier/vigil_verify.py. start and end default to today (UTC)."""
+    from fastapi import HTTPException
+    from fastapi.responses import Response
+
+    from core.evidence_bundle import BundleError, build_bundle
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    start = today if start == "today" else start
+    end = today if end == "today" else end
+    try:
+        data, summary = await build_bundle(start, end)
+    except BundleError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    name = f"vigil-evidence-{summary['install_id'][:8]}-{start}_{end}.zip"
+    return Response(content=data, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
 @router.get("/export/pdf")
 async def export_pdf(date: str = Query(default="today")):
     from reportlab.lib.pagesizes import letter

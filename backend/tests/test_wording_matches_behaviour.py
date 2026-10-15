@@ -326,3 +326,20 @@ def test_stage_2_text_never_calls_a_timestamp_verified_by_an_authority_or_uses_f
 
     assert external_timestamp.DISCLOSURE.startswith("When on, Vigil sends only a 32-byte hash of an anchor")
     assert "unverified" in lines and "was not checked because no certificate was supplied" in lines
+
+
+# ------------------------------------------------------------------ Stage 3: bundle and verifier
+
+def test_the_docs_state_what_the_bundle_and_verifier_do_and_do_not_show():
+    for name in READMES + ["docs/COVERAGE.md"]:
+        text = " ".join((ROOT / name).read_text(encoding="utf-8").split())
+        assert "vigil_verify.py" in text, name
+        assert "does not show who exported" in text or "not who exported" in text, name
+        assert "complete" in text and "newest timestamp" in text, name
+    doc = (ROOT / "docs" / "design" / "evidence-anchoring.md").read_text(encoding="utf-8")
+    section = doc[doc.index("## 14. Stage 3 as built"):]
+    for needed in ("readable by the same Windows user", "Completeness is not shown", "Events after the last timestamp"):
+        assert needed in section, needed
+    lowered = section.lower()
+    for phrase in ("tamper", "authentic", "verified by authority", "cannot be altered"):
+        assert phrase not in lowered.replace("signature not authenticated", ""), phrase

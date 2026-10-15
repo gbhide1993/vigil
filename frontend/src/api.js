@@ -85,6 +85,7 @@ export const api = {
   // For showing the report on the page (every load and date change): the evidence check is the last one
   // made, labelled with its time. Only the download itself (exportJsonUrl, exportPdfUrl) runs a fresh check.
   exportJsonPreviewUrl: (date) => `${BASE}/export/json?date=${date}&preview=true`,
+  exportBundleUrl: (start, end) => `${BASE}/export/bundle?start=${start}&end=${end}`,
   exportPdfUrl: (date) => `${BASE}/export/pdf?date=${date}`,
   sessionReportUrl: (sessionId) => `${BASE}/sessions/${encodeURIComponent(sessionId)}/report`,
   getAnalyticsSummary: () => request('/analytics/summary'),

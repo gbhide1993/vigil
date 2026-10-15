@@ -32,7 +32,11 @@ from core.evidence_chain import GENESIS_HASH
 
 logger = logging.getLogger("vlaw")
 
-ANCHOR_VERSION = 1
+# Anchor format versions. v1: the fields of design doc section 2.1. v2 (Stage 3) adds "key_fingerprint", the
+# fingerprint of the install's Ed25519 signing key (core/signing_key.py), so a timestamped anchor also pins
+# the key. An anchor is checked by hashing the stored JSON as it is, so v1 anchors keep verifying unchanged.
+ANCHOR_VERSION = 2
+LEGACY_ANCHOR_VERSION = 1
 STATE_FILE_NAME = "anchor-state.json"
 
 # The scheduled job runs hourly; this guard keeps two anchors from landing close together if the job
@@ -216,8 +220,16 @@ async def _create_locked(conn, trigger: str, key_directory, now) -> dict | None:
     else:
         anchor_seq, prev_hash = 1, GENESIS_HASH
 
+    key_fingerprint = None
+    try:
+        from core import signing_key
+
+        key_fingerprint = signing_key.ensure_key(key_directory or key_dir(), install_id)["fingerprint"]
+    except Exception:
+        logger.exception("evidence anchor: the signing key is unavailable, recording a v1 anchor without a key fingerprint")
+
     anchor = {
-        "v": ANCHOR_VERSION,
+        "v": ANCHOR_VERSION if key_fingerprint else LEGACY_ANCHOR_VERSION,
         "install_id": install_id,
         "anchor_seq": anchor_seq,
         "prev_anchor_hash": prev_hash,
@@ -228,6 +240,8 @@ async def _create_locked(conn, trigger: str, key_directory, now) -> dict | None:
         "tables_digest": digest,
         "created_at": created_at,
     }
+    if key_fingerprint:
+        anchor["key_fingerprint"] = key_fingerprint
     anchor_json = canonical_json(anchor)
     anchor_hash = anchor_hash_of(anchor_json)
 
