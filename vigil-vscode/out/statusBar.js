@@ -66,7 +66,7 @@ class StatusBarManager {
             `Session: ${session.session_id}`,
             `Agent: ${session.agent}`,
             `Duration: ${session.duration_min} min`,
-            `Files touched: ${session.files_touched.length}`,
+            `Files touched: ${session.files_touched.length > 0 ? session.files_touched.length : session.files_touched_count}`,
             `Friction signals: ${session.friction_signals}`,
             `Red Lines: ${session.red_lines}`,
             '',
@@ -88,6 +88,12 @@ class StatusBarManager {
         this.item.tooltip = 'Vigil is running — start an AI coding session';
         this.item.backgroundColor = undefined;
     }
+    setNotInstalled() {
+        this.item.text = '$(cloud-download) Vigil: Not installed';
+        this.item.tooltip = 'Vigil backend not found. Click to install it.';
+        this.item.command = 'vigil.installBackend';
+        this.item.backgroundColor = undefined;
+    }
     setOffline() {
         this.item.text = '$(eye-closed) Vigil: Offline';
         this.item.tooltip = 'Vigil is not running';
@@ -95,6 +101,7 @@ class StatusBarManager {
     }
     async refresh() {
         const state = this.backendManager.state;
+        this.item.command = 'vigil.openDashboard';
         if (state === 'downloading') {
             this.setDownloading();
             return;
@@ -105,6 +112,10 @@ class StatusBarManager {
         }
         const online = await this.api.isOnline();
         if (!online) {
+            if (this.backendManager.backendMissing) {
+                this.setNotInstalled();
+                return;
+            }
             this.setOffline();
             return;
         }

@@ -72,7 +72,7 @@ Other agent-like processes may be flagged as an "unidentified agent" on a best-e
 
 ### If Vigil is not installed yet
 
-On first launch the extension can download the installer for you (about 110 MB) from `download.getvvault.com`, check its SHA256 against the value in the download manifest, and run it silently. Windows will ask for administrator approval. The SHA256 in that manifest comes from the same server as the installer, so it protects against a corrupted download, not against a compromised server. If you prefer, install Vigil yourself first and the extension will not download anything.
+If Vigil is not found, the Vigil sidebar shows an install panel. Nothing is downloaded until you choose "Install Vigil backend" or "Download installer only". The extension can then download the installer (over 100 MB) from `download.getvvault.com`, check its SHA256 against the value in the download manifest, and run it silently. Windows will ask for administrator approval. The SHA256 in that manifest comes from the same server as the installer, so it protects against a corrupted download, not against a compromised server. If you prefer, install Vigil yourself first and the extension will not download anything.
 
 ### Windows SmartScreen and the unsigned installer
 
