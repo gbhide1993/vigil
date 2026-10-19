@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.27] - 2026-10-19
+### Fixed
+- Starting an installed Vigil from VS Code now works. VS Code runs extensions with `ELECTRON_RUN_AS_NODE=1`, which the Vigil tray app (also Electron) inherited, so it started as plain Node and exited at once. The extension now removes that variable before launching Vigil and starts it in its own folder
+
 ## [0.2.26] - 2026-10-19
 ### Fixed
 - "Files touched" now shows the real count (the backend returns a number, the extension was reading it as an empty list)

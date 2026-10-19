@@ -172,9 +172,19 @@ export class BackendManager {
 
   private spawnDetached(exePath: string) {
     this.spawnedThisRun = true;
+    // VS Code runs extensions with ELECTRON_RUN_AS_NODE=1. If the Vigil tray app (also Electron) inherits it,
+    // it starts as a plain Node process and exits at once, so remove it before launching.
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    delete env.ELECTRON_RUN_AS_NODE;
+    delete env.ELECTRON_NO_ATTACH_CONSOLE;
     const child = spawn(exePath, [], {
       detached: true,
-      stdio: 'ignore'
+      stdio: 'ignore',
+      cwd: path.dirname(exePath),
+      env
+    });
+    child.on('error', (err) => {
+      console.error(`[vigil] could not start ${exePath}: ${err.message}`);
     });
     child.unref();
   }
