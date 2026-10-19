@@ -1,3 +1,7 @@
+# The frontend container reaches the native backend through host.docker.internal, which is not loopback. Since
+# run_native.py binds 127.0.0.1 by default, this setup needs VLAW_HOST=0.0.0.0 set explicitly when starting the
+# native backend (VLAW_HOST=0.0.0.0 python run_native.py). That makes the unauthenticated API reachable from your
+# network unless a firewall blocks port 7422; the installed app does not need this.
 services:
   vlaw-frontend:
     environment:
