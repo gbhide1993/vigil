@@ -4,6 +4,7 @@ export interface SessionStatus {
   agent: string | null;
   duration_min: number;
   files_touched: string[];
+  files_touched_count: number;
   red_lines: number;
   friction_signals: number;
   status: 'active' | 'idle' | 'complete' | 'offline';
@@ -29,7 +30,8 @@ export interface FrictionFinding {
 }
 
 const REQUEST_TIMEOUT_MS = 3000;
-const HEALTH_CHECK_TIMEOUT_MS = 10000;
+const ONLINE_PROBE_TIMEOUT_MS = 3000;
+const ONLINE_CACHE_MS = 2000;
 const REPORT_TIMEOUT_MS = 15000;
 
 export class VigilAPI {
@@ -86,21 +88,38 @@ export class VigilAPI {
     }
   }
 
+  private onlineInflight: Promise<boolean> | null = null;
+  private onlineCheckedAt = 0;
+  private onlineLast = false;
+  private onlineLogged: boolean | null = null;
+
+  /** Health check shared by every view. Results are reused for a couple of seconds and concurrent
+   * callers share one request, so one refresh cycle makes one probe, not one per view. */
   async isOnline(): Promise<boolean> {
-    const url = `${this.baseUrl()}/health`;
+    if (Date.now() - this.onlineCheckedAt < ONLINE_CACHE_MS) {
+      return this.onlineLast;
+    }
+    if (this.onlineInflight) {
+      return this.onlineInflight;
+    }
+    this.onlineInflight = this.probeOnline().then((ok) => {
+      this.onlineLast = ok;
+      this.onlineCheckedAt = Date.now();
+      this.onlineInflight = null;
+      if (this.onlineLogged !== ok) {
+        console.log(`[health] backend ${ok ? 'reachable' : 'not reachable'} at ${this.baseUrl()}/health`);
+        this.onlineLogged = ok;
+      }
+      return ok;
+    });
+    return this.onlineInflight;
+  }
+
+  private async probeOnline(): Promise<boolean> {
     try {
-      console.log(
-        `[health] attempting ${url} port=${this.port} pid=${process.pid} platform=${process.platform} node=${process.version}`
-      );
-      const res = await this.fetchWithTimeout(url, undefined, HEALTH_CHECK_TIMEOUT_MS);
-      console.log(`[health] response status=${res.status} url=${url} port=${this.port}`);
-      console.log(`[health] response ok=${res.ok} url=${url} port=${this.port}`);
+      const res = await this.fetchWithTimeout(`${this.baseUrl()}/health`, undefined, ONLINE_PROBE_TIMEOUT_MS);
       return res.ok;
-    } catch (err: any) {
-      console.error(
-        `[health] exception name=${err?.name ?? 'unknown'} message=${err?.message ?? 'unknown'} url=${url} port=${this.port} pid=${process.pid} platform=${process.platform} node=${process.version}`
-      );
-      console.error(err?.stack ?? '[health] no stack available');
+    } catch {
       return false;
     }
   }
@@ -159,6 +178,12 @@ export class VigilAPI {
         files_touched: Array.isArray(result.files_touched)
           ? result.files_touched
           : [],
+        // The backend returns files_touched as a number; older shapes return a list.
+        files_touched_count: typeof result.files_touched === 'number'
+          ? result.files_touched
+          : Array.isArray(result.files_touched)
+            ? result.files_touched.length
+            : (result.files_touched_count ?? 0),
         red_lines: result.red_lines ?? 0,
         friction_signals: result.friction_signals ?? 0,
         status: result.status ?? 'offline'
@@ -204,7 +229,7 @@ export class VigilAPI {
     return Array.isArray(result) ? result : [];
   }
 
-  /** Fetches the PDF evidence report for a session as raw bytes. Throws on
+  /** Fetches the PDF report for a session as raw bytes. Throws on
    * a non-2xx response or network failure — unlike getJson/mcpCall, the
    * caller needs to distinguish "no report" from "couldn't reach Vigil" to
    * show the right error message. */

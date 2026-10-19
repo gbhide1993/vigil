@@ -3,12 +3,13 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { execSync, spawn, spawnSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 
 const HEALTH_CHECK_TIMEOUT_MS = 10000;
-const START_WAIT_TIMEOUT_MS = 30000;
+const START_WAIT_TIMEOUT_MS = 60000;
 const START_WAIT_POLL_MS = 1000;
 const ALREADY_RUNNING_EXTRA_WAIT_MS = 30000;
+const INSTALL_TIMEOUT_MS = 300000;
 
 const LOCK_FILE_PATH = path.join(os.tmpdir(), 'vigil-backend.lock');
 
@@ -21,6 +22,8 @@ const README_INSTALL_URL = 'https://github.com/gbhide1993/vigil/blob/main/vigil-
 // Remembered when the user cancels the install prompt, so it is not shown again on every startup.
 const INSTALL_DECLINED_KEY = 'vigil.installPromptDeclined';
 export const INSTALL_BACKEND_COMMAND = 'vigil.installBackend';
+export const DOWNLOAD_ONLY_COMMAND = 'vigil.downloadInstallerOnly';
+const BACKEND_MISSING_CONTEXT = 'vigil.backendMissing';
 
 interface InstallerAsset {
   url: string;
@@ -69,6 +72,9 @@ export type BackendState = 'downloading' | 'starting' | 'running' | 'offline';
 
 export class BackendManager {
   private _state: BackendState = 'offline';
+  private _missing = false;
+  // True once this extension has started Vigil itself, so a slow start is never mistaken for a missing install.
+  private spawnedThisRun = false;
   private _capabilities: any | null = null;
   private _onStateChange = new vscode.EventEmitter<BackendState>();
   readonly onStateChange = this._onStateChange.event;
@@ -84,8 +90,24 @@ export class BackendManager {
         } else {
           this.setState('offline');
         }
+      }),
+      vscode.commands.registerCommand(DOWNLOAD_ONLY_COMMAND, async () => {
+        await this.downloadInstallerOnlyFlow();
       })
     );
+  }
+
+  /** True when no installed backend was found. The sidebar shows an install panel instead of a prompt. */
+  get backendMissing(): boolean {
+    return this._missing;
+  }
+
+  private setMissing(missing: boolean) {
+    if (this._missing === missing) {
+      return;
+    }
+    this._missing = missing;
+    void vscode.commands.executeCommand('setContext', BACKEND_MISSING_CONTEXT, missing);
   }
 
   get state(): BackendState {
@@ -97,6 +119,9 @@ export class BackendManager {
   }
 
   private setState(state: BackendState) {
+    if (state === 'running') {
+      this.setMissing(false);
+    }
     this._state = state;
     this._onStateChange.fire(state);
   }
@@ -145,20 +170,8 @@ export class BackendManager {
     }
   }
 
-  // FIX: Kill zombie vigil-backend processes that are running but not healthy
-  private killZombieBackends(): void {
-    try {
-      execSync('taskkill /F /IM vigil-backend.exe', {
-        encoding: 'utf8',
-        windowsHide: true
-      });
-      console.log('[vigil] killed zombie vigil-backend.exe processes');
-    } catch {
-      // no processes to kill, ignore
-    }
-  }
-
   private spawnDetached(exePath: string) {
+    this.spawnedThisRun = true;
     const child = spawn(exePath, [], {
       detached: true,
       stdio: 'ignore'
@@ -427,26 +440,34 @@ export class BackendManager {
     vscode.window.showInformationMessage(
       `Vigil: installer verified (SHA256 ${verifiedHash}). Installing the backend, please wait...`
     );
-    try {
-      // /SILENT runs without UI, /NORESTART suppresses reboot prompt
-      spawnSync(installerPath, ['/SILENT', '/NORESTART'], {
-        windowsHide: true,
-        timeout: 120000  // 2 minute timeout for install
-      });
-    } catch (err: any) {
-      console.error(`[vigil] installer failed: ${err.message}`);
+    const exitCode = await this.runInstaller(installerPath);
+    if (exitCode !== 0) {
+      const why = exitCode === null ? 'it could not be started or did not finish in 5 minutes' : `exit code ${exitCode}`;
+      vscode.window.showErrorMessage(
+        `Vigil: the installer did not finish successfully (${why}). You can run it yourself from ${installerPath}.`
+      );
+      this.setState('offline');
       return false;
     }
 
     // After silent install, try registry and fallback paths to find and start the exe
     this.setState('starting');
+    this.spawnedThisRun = false;
 
     if (await this.tryRegistryInstall()) {
       return true;
     }
 
-    if (await this.tryFallbackPath()) {
+    if (!this.spawnedThisRun && (await this.tryFallbackPath())) {
       return true;
+    }
+
+    if (this.spawnedThisRun) {
+      vscode.window.showWarningMessage(
+        'Vigil is installed and was started, but it is taking longer than usual to respond. Give it a minute, then run "Vigil: Refresh".'
+      );
+      this.setState('offline');
+      return false;
     }
 
     // If still not found, ask user to restart VS Code
@@ -460,6 +481,59 @@ export class BackendManager {
     });
 
     return false;
+  }
+
+  /** Runs the installer without blocking the extension host. Resolves with the exit code, or null when it
+   * could not be started or did not exit within INSTALL_TIMEOUT_MS. */
+  private runInstaller(installerPath: string): Promise<number | null> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const done = (code: number | null) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer) {
+          clearTimeout(timer);
+        }
+        resolve(code);
+      };
+      timer = setTimeout(() => {
+        console.error('[vigil] installer did not exit within the time limit');
+        done(null);
+      }, INSTALL_TIMEOUT_MS);
+      try {
+        // /SILENT runs without UI, /NORESTART suppresses reboot prompt
+        const child = spawn(installerPath, ['/SILENT', '/NORESTART'], { windowsHide: true, stdio: 'ignore' });
+        child.on('error', (err) => {
+          console.error(`[vigil] installer failed: ${err.message}`);
+          done(null);
+        });
+        child.on('exit', (code) => done(code));
+      } catch (err: any) {
+        console.error(`[vigil] installer failed: ${err?.message ?? 'unknown'}`);
+        done(null);
+      }
+    });
+  }
+
+  /** "Download installer only" from the sidebar: no install, no run. */
+  private async downloadInstallerOnlyFlow(): Promise<void> {
+    const manifest = await this.readManifest();
+    if ('problem' in manifest) {
+      this.offerStandaloneInstaller(manifest.problem);
+      return;
+    }
+    const hostProblem = this.untrustedHostProblem(manifest.asset.url);
+    if (hostProblem) {
+      vscode.window.showErrorMessage(
+        `Vigil: refusing to download the installer: ${hostProblem}. Only ${DOWNLOAD_HOST} is allowed. ` +
+          `Download Vigil from ${STANDALONE_INSTALLER_URL} instead.`
+      );
+      return;
+    }
+    await this.downloadOnly(manifest.asset);
   }
 
   /** "Download only": saves the verified installer to the Downloads folder and does not run it. */
@@ -508,11 +582,14 @@ export class BackendManager {
         await this.loadCapabilities();
         return true;
       }
-      // Still not healthy after 30s — treat as zombie and kill
-      console.log('[vigil] backend still not healthy after wait — killing zombie processes');
-      this.killZombieBackends();
-      // Small delay to let OS release the port
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // Still not healthy. The extension does not stop the recorder: it may be mid-write.
+      console.log('[vigil] backend process found but not healthy after wait; leaving it running');
+      this.setState('offline');
+      vscode.window.showWarningMessage(
+        'Vigil: the backend process is running but not answering. Restart Vigil from the system tray, ' +
+          'or end vigil-backend.exe in Task Manager. The extension will not stop it for you.'
+      );
+      return false;
     }
 
     if (!acquireLock()) {
@@ -526,24 +603,31 @@ export class BackendManager {
       return false;
     }
 
+    this.spawnedThisRun = false;
     if (await this.tryRegistryInstall()) {
       this.setState('running');
       await this.loadCapabilities();
       return true;
     }
 
-    if (await this.tryFallbackPath()) {
+    if (!this.spawnedThisRun && (await this.tryFallbackPath())) {
       this.setState('running');
       await this.loadCapabilities();
       return true;
     }
 
-    if (await this.tryDownloadInstall()) {
-      this.setState('running');
-      await this.loadCapabilities();
-      return true;
+    if (this.spawnedThisRun) {
+      // Vigil was found and started but did not answer in time. That is not a missing install.
+      this.setState('offline');
+      vscode.window.showWarningMessage(
+        'Vigil was started but is taking longer than usual to respond. It should appear in the sidebar shortly; run "Vigil: Refresh" if it does not.'
+      );
+      return false;
     }
 
+    // Nothing found. Do not download or prompt at startup: the Vigil sidebar shows an install panel, and
+    // the install flow (with its consent dialog) runs only when the user chooses it.
+    this.setMissing(true);
     this.setState('offline');
     return false;
   }

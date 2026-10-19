@@ -58,10 +58,20 @@ abstract class BaseTreeProvider implements vscode.TreeDataProvider<VigilTreeItem
 }
 
 export class SessionTreeProvider extends BaseTreeProvider {
+  constructor(api: VigilAPI, private isBackendMissing: () => boolean = () => false) {
+    super(api);
+  }
+
   async refresh(): Promise<void> {
     const online = await this.api.isOnline();
     if (!online) {
       console.log('[VIGIL DEBUG][SessionTreeProvider.refresh] branch=offline');
+      if (this.isBackendMissing()) {
+        // An empty tree lets the install panel (viewsWelcome) show.
+        this.rootItems = [];
+        this.fireChange();
+        return;
+      }
       this.rootItems = [
         new VigilTreeItem('Vigil is not running', vscode.TreeItemCollapsibleState.None, {
           iconPath: new vscode.ThemeIcon('eye-closed')
@@ -100,6 +110,9 @@ export class SessionTreeProvider extends BaseTreeProvider {
       (f) => new VigilTreeItem(f, vscode.TreeItemCollapsibleState.None, { iconPath: new vscode.ThemeIcon('file') })
     );
 
+    const filesCount =
+      session.files_touched.length > 0 ? session.files_touched.length : session.files_touched_count;
+
     const items = [
       new VigilTreeItem('Agent', vscode.TreeItemCollapsibleState.None, {
         description: session.agent ?? 'Unknown',
@@ -114,7 +127,7 @@ export class SessionTreeProvider extends BaseTreeProvider {
         iconPath: new vscode.ThemeIcon('pulse')
       }),
       new VigilTreeItem(
-        `Files touched (${session.files_touched.length})`,
+        `Files touched (${filesCount})`,
         session.files_touched.length > 0
           ? vscode.TreeItemCollapsibleState.Collapsed
           : vscode.TreeItemCollapsibleState.None,
@@ -135,7 +148,7 @@ export class SessionTreeProvider extends BaseTreeProvider {
     if (session.session_id) {
       items.push(
         new VigilTreeItem('Download Session Report (PDF)', vscode.TreeItemCollapsibleState.None, {
-          tooltip: 'Download a PDF evidence report for this session',
+          tooltip: 'Download a PDF report of this session',
           iconPath: new vscode.ThemeIcon('cloud-download'),
           command: {
             command: 'vigil.downloadSessionReport',

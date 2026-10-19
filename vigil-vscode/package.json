@@ -2,7 +2,7 @@
   "name": "vigil-ai-monitor",
   "displayName": "Vigil: Verify Coding Agent",
   "description": "Records the file changes, process spawns and credential-path activity your coding agent causes, at the OS level, on Windows. Local only. Records are not protected against edits to the local database; network and MCP monitoring are not included.",
-  "version": "0.2.25",
+  "version": "0.2.26",
   "publisher": "vvault",
   "repository": {
     "type": "git",
@@ -34,11 +34,20 @@
         { "id": "vigil.findings",       "name": "Findings" }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "vigil.currentSession",
+        "when": "vigil.backendMissing",
+        "contents": "Vigil needs its local backend to record activity. The installer is over 100 MB, is not code-signed, and asks for administrator approval. Nothing is downloaded until you choose.\n[Install Vigil backend](command:vigil.installBackend)\n[Download installer only](command:vigil.downloadInstallerOnly)"
+      }
+    ],
     "commands": [
       { "command": "vigil.openDashboard",         "title": "Vigil: Open Dashboard" },
       { "command": "vigil.refresh",               "title": "Vigil: Refresh" },
       { "command": "vigil.copyEvidenceHash",      "title": "Vigil: Copy Session Summary Hash" },
-      { "command": "vigil.downloadSessionReport", "title": "Vigil: Download Session Report (PDF)" }
+      { "command": "vigil.downloadSessionReport", "title": "Vigil: Download Session Report (PDF)" },
+      { "command": "vigil.installBackend",        "title": "Vigil: Install Backend" },
+      { "command": "vigil.downloadInstallerOnly", "title": "Vigil: Download Installer Only" }
     ],
     "configuration": {
       "title": "Vigil",
@@ -63,6 +72,7 @@
     }
   },
   "scripts": {
+    "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch":   "tsc -watch -p ./",
     "package": "npx vsce package"

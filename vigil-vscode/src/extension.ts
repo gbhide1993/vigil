@@ -14,7 +14,7 @@ export async function activate(context: vscode.ExtensionContext) {
   console.log('[VIGIL TRACE][activate] entered activate()');
   const config = vscode.workspace.getConfiguration('vigil');
   const port = config.get<number>('apiPort', 7422);
-  const pollIntervalSeconds = config.get<number>('pollIntervalSeconds', 10);
+  const pollIntervalSeconds = config.get<number>('pollIntervalSeconds', 30);
   const showFileDecorations = config.get<boolean>('showFileDecorations', true);
   const redLineNotifications = config.get<boolean>('redLineNotifications', true);
 
@@ -24,7 +24,7 @@ export async function activate(context: vscode.ExtensionContext) {
   const statusBar = new StatusBarManager(api, backendManager);
   context.subscriptions.push({ dispose: () => statusBar.dispose() });
 
-  const sessionProvider = new SessionTreeProvider(api);
+  const sessionProvider = new SessionTreeProvider(api, () => backendManager.backendMissing);
   const redLineProvider = new RedLineTreeProvider(api);
   const findingsProvider = new FindingsTreeProvider(api);
 
@@ -43,7 +43,7 @@ export async function activate(context: vscode.ExtensionContext) {
     redLineWatcher = new RedLineWatcher(api, port);
   }
 
-  const refreshAll = async () => {
+  const refreshAllOnce = async () => {
     await Promise.all([
       statusBar.refresh(),
       (async () => {
@@ -75,6 +75,20 @@ export async function activate(context: vscode.ExtensionContext) {
 
     if (redLineWatcher) {
       await redLineWatcher.poll();
+    }
+  };
+
+  // One refresh at a time: if the backend is slow or down, cycles must not pile up.
+  let refreshing = false;
+  const refreshAll = async () => {
+    if (refreshing) {
+      return;
+    }
+    refreshing = true;
+    try {
+      await refreshAllOnce();
+    } finally {
+      refreshing = false;
     }
   };
 
@@ -133,11 +147,11 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('vigil.copyEvidenceHash', async () => {
       const summary = await api.getEvidenceSummary();
       if (!summary || !summary.evidence_hash) {
-        vscode.window.showErrorMessage('Vigil: no evidence hash available.');
+        vscode.window.showErrorMessage('Vigil: no session summary hash available.');
         return;
       }
       await vscode.env.clipboard.writeText(summary.evidence_hash);
-      vscode.window.showInformationMessage('Evidence hash copied');
+      vscode.window.showInformationMessage('Session summary hash copied');
     })
   );
 
