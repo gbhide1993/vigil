@@ -12,6 +12,9 @@ services:
       - /:/host:ro                # host filesystem READ-ONLY
       - /proc:/host/proc:ro       # process info
     environment:
+      # Explicit, on purpose: inside the container the server must listen on all interfaces for the published
+      # port to reach it. The port mapping above (127.0.0.1 only) is what keeps it off the network.
+      - VLAW_HOST=0.0.0.0
       - VLAW_HOST_ROOT=/host
       - VLAW_POLICY_FILE=/app/policy/vlaw-policy.json
       - VLAW_DATA_DIR=/app/data

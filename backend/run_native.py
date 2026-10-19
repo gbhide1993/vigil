@@ -28,4 +28,7 @@ os.environ.setdefault("VLAW_PORT", "7422")
 import uvicorn
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ["VLAW_PORT"]), reload=False)
+    # Loopback by default, like main.py: the API has no authentication and has mutating routes. VLAW_HOST is the
+    # only way to change it (docker-compose.native.yml needs VLAW_HOST=0.0.0.0, see the note there).
+    HOST = os.environ.get("VLAW_HOST", "127.0.0.1")
+    uvicorn.run("main:app", host=HOST, port=int(os.environ["VLAW_PORT"]), reload=False)
