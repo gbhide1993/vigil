@@ -1,5 +1,28 @@
 # Changelog
 
+Product versions follow the installer (Vigil-Setup.exe). The VS Code extension has its own changelog in vigil-vscode/CHANGELOG.md.
+
+## 0.9.0 (October 2026)
+### Added
+- Signed evidence bundle (Export page) and a standalone offline verifier (verifier/vigil_verify.py).
+- Optional external timestamp of the anchor hash (RFC 3161), off by default.
+- Local evidence anchors (hourly, at export and after a monitoring gap) and a hash chain over the recorded events, both checked by Vigil itself.
+- Coverage and limits wording in reports and docs matched to actual behaviour.
+### Changed
+- The native launcher binds to 127.0.0.1 by default, and the Docker setup publishes its port on 127.0.0.1 only.
+- Agent status separates running, open (idle) and active.
+- The installer can remove the keys folder on uninstall (when you choose to delete stored data) and generates the download manifest.
+### Known limits
+- Windows only; the installer is unsigned.
+- Nine Red Line rules exist; five can fire. The two that need file reads and the two that need network or MCP monitoring cannot fire in this version.
+- File reads, network connections and MCP connections are not monitored.
+- Processes are checked about every 30 seconds.
+- Records are not protected against someone who can edit the local database; only the event chain is checked, and by Vigil itself.
+- The 30-day trial status is reported by the health endpoint only and is not enforced.
+
+## Historical (July 2026), not re-verified against 0.9.0
+The entries below were written during the beta and may not match current behaviour. See the README for what fires today.
+
 ## v0.2.0-beta — July 2026
 
 ### Added
@@ -7,7 +30,7 @@
   matches CVE-2026-21852 pattern) and RL7b (malicious config execution, 
   matches CVE-2025-59536 pattern), with per-process scanning to correctly 
   attribute the exact process, not just the first match found
-- **RL8: MCP auto-approval detection** — extends CVE-2026-21852 coverage 
+- **RL8: MCP auto-approval detection (does not fire in 0.9.0)** — extends CVE-2026-21852 coverage 
   to the MCP server attack surface, session-gated to early-project usage 
   where the exploit actually applies
 - **Session Verification Report** — independently compares OS-level 
@@ -38,7 +61,7 @@
   Electron single-instance lock to prevent multiple backend instances 
   running simultaneously on launch
 - **Attribution performance** — added PID-based caching to agent 
-  attribution logic, reducing repeat-poll cost by roughly 1300x
+  attribution logic, reducing repeat-poll cost
 - **MAD scoring silent-zero edge case** — Layer 2b now falls back to 
   percentage-deviation scoring when historical variance is exactly 
   zero, instead of silently missing anomalies for agents with very 
@@ -57,8 +80,8 @@
 
 ### Added
 - System tray icon with green/amber/red status states
-- Real-time monitoring of Claude Code, Cursor, Copilot
-- Six Red Line rules (non-disableable safety floor)
+- Agents recognised by process name: Claude Code, Cursor, GitHub Copilot, Codex and Agentforce (core/attributor.py KNOWN_AGENTS)
+- Nine Red Line rules, RL1 to RL8 plus RL7b (non-disableable safety floor; five can fire in 0.9.0, see the README)
 - Layer 2a anomaly detection — works from session 1
 - Layer 2b MAD scoring — activates from session 3
 - Desktop toast notifications on new alerts
@@ -70,7 +93,7 @@
 ### Known Limitations
 - Windows only (macOS planned)
 - Unsigned installer (SmartScreen warning on install)
-- 14-day trial license included
+- 30-day trial license included (the status is shown by the health endpoint only; nothing is enforced in 0.9.0)
 
 ## Roadmap
 
