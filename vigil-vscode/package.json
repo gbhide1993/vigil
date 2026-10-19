@@ -2,7 +2,7 @@
   "name": "vigil-ai-monitor",
   "displayName": "Vigil: Verify Coding Agent",
   "description": "Records the file changes, process spawns and credential-path activity your coding agent causes, at the OS level, on Windows. Local only. Records are not protected against edits to the local database; network and MCP monitoring are not included.",
-  "version": "0.2.26",
+  "version": "0.2.27",
   "publisher": "vvault",
   "repository": {
     "type": "git",
