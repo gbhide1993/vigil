@@ -482,12 +482,15 @@ def run(bundle_path: str, tsa_ca: str | None, trust_key: str | None) -> int:
     except ValueError:
         print("  (coverage.json could not be read)")
     try:
-        gaps = json.loads(contents.get("gaps.json", b"[]"))
+        gap_doc = json.loads(contents.get("gaps.json", b"{}"))
+        # {"time_basis": "UTC", "gaps": [...]}; a bare list (older bundles) is read the same way
+        gaps = gap_doc if isinstance(gap_doc, list) else gap_doc.get("gaps", [])
+        basis = "UTC" if isinstance(gap_doc, list) else gap_doc.get("time_basis", "UTC")
     except ValueError:
-        gaps = []
-    print(f"Monitoring gaps overlapping the period: {len(gaps)}")
+        gaps, basis = [], "UTC"
+    print(f"Monitoring gaps overlapping the period: {len(gaps)} (times in {basis})")
     for gap in gaps[:20]:
-        print(f"  - {gap.get('gap_start')} to {gap.get('gap_end')} ({gap.get('reason')})")
+        print(f"  - {gap.get('gap_start')} {basis} to {gap.get('gap_end')} {basis} ({gap.get('reason')})")
     print("Anchors are hourly at most: events after the newest anchor, and events Vigil could not see, are outside every check above.")
     print()
 
@@ -511,11 +514,18 @@ def run(bundle_path: str, tsa_ca: str | None, trust_key: str | None) -> int:
             "the anchors in the bundle agree with that chain" if covers_end else "",
         ])) + ".")
         if verified_tokens and covers_end:
-            newest = max(verified_tokens, key=lambda t: t[1])
-            at = newest[0]["fields"]["last_event_id"]
-            print(f"A timestamp whose signature was checked against the certificate you supplied supports this: events up to event {at} "
-                  f"were consistent with the anchor head at {newest[1].strftime('%Y-%m-%d %H:%M:%SZ')} and not altered since that time. "
-                  "The timestamp attests only to the time of the hash.")
+            # Several anchors can share one chain head. The earliest checked timestamp at the head the bundle ends on
+            # is the one that says how long the records have been unchanged; a later one says less.
+            head = covers_end[0]["fields"]["chain_head"]
+            at = covers_end[0]["fields"]["last_event_id"]
+            same_head = [t for t in verified_tokens if t[0]["fields"]["chain_head"] == head and t[0]["fields"]["last_event_id"] == at]
+            if same_head:
+                earliest = min(same_head, key=lambda t: t[1])
+                print(f"A timestamp whose signature was checked against the certificate you supplied supports this: events up to event {at} "
+                      f"were consistent with the anchor head at {earliest[1].strftime('%Y-%m-%d %H:%M:%SZ')} (the earliest checked timestamp at "
+                      "that head) and not altered since that time. The timestamp attests only to the time of the hash.")
+            else:
+                print("No checked timestamp is at the head the bundle ends on, so no statement is made about when these records last matched.")
         else:
             print("No timestamp with a checked signature supports a statement about when these records last matched; "
                   "the anchors alone are held on the same machine as the events.")

@@ -24,7 +24,7 @@ The sidebar updates live while your AI agent works:
 
 ## How it works
 
-Vigil runs a local backend that monitors your machine at the OS level — independently of what the AI agent reports. File changes (created, changed, moved or deleted; reads are not recorded), process spawns with their command text (secrets are redacted on a best-effort basis), and changes to credential files are captured and attributed to the active agent session. Processes are checked about every 30 seconds, so a program that starts and finishes between checks is not recorded. Network monitoring is planned; it is off in this version. Everything is stored locally in SQLite. No data leaves your machine.
+Vigil runs a local backend that monitors your machine at the OS level — independently of what the AI agent reports. File changes (created, changed, moved or deleted; reads are not recorded), process spawns with their command text (secrets are redacted on a best-effort basis), and changes to credential files are captured and attributed to the active agent session. Processes are checked about every 30 seconds, so a program that starts and finishes between checks is not recorded. Network monitoring is planned; it is off in this version. Everything is stored locally in SQLite. Vigil uploads no event data. There are two optional outbound paths, both off until you set them: the daily-digest webhook, and an external timestamp that sends only a 32-byte anchor hash.
 
 ## Red Lines
 

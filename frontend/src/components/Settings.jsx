@@ -184,7 +184,7 @@ function ExternalTimestampSection() {
         <input
           type="url"
           className="settings-input mono"
-          placeholder="Timestamp service address (https://...)"
+          placeholder="Timestamp service address (a full web address)"
           value={form.url}
           onChange={(e) => setForm({ ...form, url: e.target.value })}
         />

@@ -109,7 +109,7 @@ export default function Export() {
           <h3>Export evidence bundle</h3>
           <p>
             A signed zip of the day's events with their chain rows, the anchors and any timestamp tokens, which
-            verifier/vigil_verify.py can check offline. Days are UTC dates. It shows the bundle was not edited
+            verifier/vigil_verify.py can check offline. Days are UTC dates, and gap times in the bundle are UTC. It shows the bundle was not edited
             after export by anyone without the signing key (readable by this Windows user); it does not show who
             exported it or that the record is complete.
           </p>
