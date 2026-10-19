@@ -80,7 +80,7 @@ function WelcomeState() {
           <div>● Process spawns</div>
         </div>
         <div style={{ fontSize: 12, color: 'var(--color-navy-muted)', marginTop: 24 }}>
-          Zero data leaves this machine.
+          Vigil uploads no event data.
         </div>
       </div>
     </div>

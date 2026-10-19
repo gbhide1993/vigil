@@ -12,7 +12,7 @@ A bundle is a zip with exactly these members. Nothing else belongs in it.
 | `chain-proof.sig` | Base64 of a 64-byte Ed25519 signature over the exact bytes of `chain-proof.json`. |
 | `events.jsonl` | One JSON object per line: the events of the range with their chain rows. |
 | `coverage.json` | The "What this report covers" block that Vigil prints in its reports: `{"title", "lines"}`. |
-| `gaps.json` | The monitoring gaps that overlap the period: `[{"run_id", "gap_start", "gap_end", "reason"}]`. |
+| `gaps.json` | The monitoring gaps that overlap the period: `{"time_basis": "UTC", "gaps": [{"run_id", "gap_start", "gap_end", "reason"}]}`. The times are UTC, written `YYYY-MM-DD HH:MM:SS` with no zone suffix (Vigil stores them converted to UTC). A bare list, as an earlier build wrote, holds the same fields and is also UTC. |
 
 ## 1. The manifest (`chain-proof.json`)
 
@@ -81,6 +81,8 @@ and, in format 2 only, `key_fingerprint` (the fingerprint of the install's signi
 Checks: `anchor_hash` equals the hash of `anchor_json`; `anchor_seq` inside the JSON equals the entry's; `install_id` equals the manifest's;
 consecutive entries have consecutive `anchor_seq`, `prev_anchor_hash` equal to the previous `anchor_hash`, and a non-decreasing `event_count`.
 
+Which anchors a bundle holds. Anchors run in one contiguous sequence range: from the last anchor before the range (if any) to an end anchor. The end anchor starts as the first anchor whose `last_event_id` is at or beyond the last event of the range. Several anchors can record the same head, because an anchor is also made when only the table digest changed, and timestamping is queued per anchor, so the first of them can have no token while later ones do. The range is therefore extended to the **last anchor at that same head that holds a timestamp token** (every anchor between is at the same head, so the range stays contiguous and the sequence and previous-hash checks apply unchanged). With no stamped anchor at that head the range ends at the first one. A verifier needs no extra rule.
+
 Binding: for an anchor whose `last_event_id` lies inside the exported rows, `chain_head` must equal the `row_hash` of the exported row with that event id.
 At least one anchor must have `last_event_id` at or beyond `range_last_event_id` for the end of the range to be bound; if none does the check is **NOT CHECKED**, not passed.
 `tables_digest` is not checked (the tables it covers change legitimately; see `evidence-anchoring.md`).
@@ -102,7 +104,7 @@ An anchor may carry `tsa_token_b64`, the DER of an RFC 3161 token (a CMS SignedD
 messageImprint must be SHA-256 and equal the 32 bytes of the anchor's `anchor_hash`; its `genTime` is the time the service attests. The signature is **checked only
 against a certificate the verifier's user supplies** (`--tsa-ca`): the CMS signature must verify with a certificate carried in the token or supplied, that certificate must
 chain to a supplied one, be valid at `genTime` and (if it has the extension) allow timestamping. Without a supplied certificate the result is **NOT CHECKED**: the imprint and
-time are read, the signature is not checked (reported as "signature not authenticated"). A timestamp attests only to the time of a hash. It covers what existed when that anchor was made.
+time are read, the signature is not checked (reported as "signature not authenticated"). A timestamp attests only to the time of a hash. It covers what existed when that anchor was made. When several tokens are at the head the bundle ends on, the statement "not altered since <time>" uses the **earliest** checked token there; a later one says less.
 
 ## 6. Results
 

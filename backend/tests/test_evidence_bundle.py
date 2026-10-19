@@ -453,3 +453,124 @@ async def test_the_export_endpoint_returns_a_bundle_and_reports_an_empty_range(e
     empty = client.get("/export/bundle", params={"start": "2020-01-01", "end": "2020-01-02"})
     assert empty.status_code == 400 and "no sealed events" in empty.json()["detail"].lower()
     assert client.get("/export/bundle", params={"start": "nope", "end": DAY}).status_code == 400
+
+
+# ------------------------------------------------------------------ anchors that share a head, earliest timestamp, UTC gaps
+
+async def shared_head_bundle(env):
+    """Unstamped anchor 1, then stamped anchors 2 and 3 at the SAME chain head (only the table digest changed).
+    Anchor 2 gets a later service time than anchor 3, so the earliest checked time is anchor 3's. (Service times are
+    near the real clock because the fake certificate is valid around it.)"""
+    await add_anchor(env, events=4)                                    # anchor 1, never stamped
+    fake = FakeTSA()
+    configure(env, since=2)
+    stamps = {}
+    base = datetime.now(timezone.utc).replace(microsecond=0)
+    for seq, minutes_ago in ((2, 10), (3, 20)):
+        sql(env, "INSERT INTO alerts (agent_id, severity, title, description) VALUES (1, 'low', ?, 'd')", (f"alert {seq}",))
+        made = await anchors.create_anchor("export", db_path=env.db_path, key_directory=env.keys, now=T0 + timedelta(minutes=seq))
+        assert made["anchor_seq"] == seq
+        fake.gen_time = base - timedelta(minutes=minutes_ago)
+        await ts.run_queue(db_path=env.db_path, post=fake, now=T0 + timedelta(minutes=seq))
+        stamps[seq] = fake.gen_time
+    heads = {r[0] for r in sql(env, "SELECT chain_head FROM evidence_anchors")}
+    assert len(heads) == 1, "all three anchors pin one head"
+    assert [r[0] for r in sql(env, "SELECT status FROM evidence_anchors ORDER BY anchor_seq")] == ["local_only", "timestamped", "timestamped"]
+    data, summary = await evidence_bundle.build_bundle(DAY, DAY, db_path=env.db_path, key_directory=env.keys, now=T0 + timedelta(hours=5))
+    return data, summary, fake, stamps
+
+
+@pytest.mark.asyncio
+async def test_a_bundle_ending_at_a_shared_head_carries_the_stamped_anchors_that_follow_the_unstamped_first(env, tmp_path):
+    data, summary, fake, stamps = await shared_head_bundle(env)
+    proof = json.loads(unpack(data)["chain-proof.json"])
+    assert [a["anchor_seq"] for a in proof["anchors"]] == [1, 2, 3], "one contiguous sequence range"
+    assert [bool(a["tsa_token_b64"]) for a in proof["anchors"]] == [False, True, True]
+    assert summary["bound_by_anchor"] == 1 and summary["last_anchor_in_bundle"] == 3 and summary["tokens"] == 2
+
+    work = tmp_path / "shared"
+    work.mkdir()
+    shutil.copy(VERIFIER, work / "vigil_verify.py")
+    (work / "b.zip").write_bytes(data)
+    (work / "ca.pem").write_text(ca_pem(fake.ca))
+    result = subprocess.run([sys.executable, "-I", "vigil_verify.py", "b.zip", "--tsa-ca", "ca.pem"], cwd=work, capture_output=True, text=True, timeout=120)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert len(lines_with(out, "PASS", "timestamps")) == 2 and lines_with(out, "PASS", "anchors") and lines_with(out, "PASS", "anchor-binds")
+
+    # the statement uses the EARLIEST checked timestamp at the head, not the latest
+    earliest = stamps[3].strftime("%Y-%m-%d %H:%M:%SZ")
+    latest = stamps[2].strftime("%Y-%m-%d %H:%M:%SZ")
+    statement = [l for l in out.splitlines() if "not altered since that time" in l]
+    assert statement and earliest in " ".join(statement) and latest not in " ".join(statement), out
+    assert "the earliest checked timestamp at that head" in out
+
+
+@pytest.mark.asyncio
+async def test_a_bundle_with_no_stamped_anchors_still_verifies_but_is_inconclusive(env, tmp_path):
+    data, summary, fake = await make_bundle(env, stamp=False)
+    proof = json.loads(unpack(data)["chain-proof.json"])
+    assert [a["anchor_seq"] for a in proof["anchors"]] == [1] and not proof["anchors"][0]["tsa_token_b64"]
+    code, out = run_verifier(tmp_path, data)
+    assert code == 2, out
+    assert lines_with(out, "PASS", "chain") and lines_with(out, "PASS", "anchor-binds") and lines_with(out, "PASS", "files")
+    assert lines_with(out, "NOT CHECKED", "timestamps") and "RESULT: INCONCLUSIVE" in out
+    assert "not altered since" not in out
+
+
+@pytest.mark.asyncio
+async def test_tamper_checks_still_fail_on_a_shared_head_bundle(env, tmp_path):
+    data, summary, fake, stamps = await shared_head_bundle(env)
+    work = tmp_path / "t"
+    work.mkdir()
+    shutil.copy(VERIFIER, work / "vigil_verify.py")
+    (work / "ca.pem").write_text(ca_pem(fake.ca))
+
+    def verify(bundle):
+        (work / "b.zip").write_bytes(bundle)
+        r = subprocess.run([sys.executable, "-I", "vigil_verify.py", "b.zip", "--tsa-ca", "ca.pem"], cwd=work, capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout + r.stderr
+
+    def swap(manifest):
+        a, b = manifest["anchors"][1], manifest["anchors"][2]
+        a["tsa_token_b64"], b["tsa_token_b64"] = b["tsa_token_b64"], a["tsa_token_b64"]
+
+    code, out = verify(forge(env, data, proof=swap))
+    assert code == 1 and "the token's message imprint is not this anchor's hash" in out
+
+    def edit_anchor(manifest):
+        manifest["anchors"][2]["anchor_json"] = manifest["anchors"][2]["anchor_json"].replace('"event_count":4', '"event_count":5')
+
+    code, out = verify(forge(env, data, proof=edit_anchor))
+    assert code == 1 and "its stored hash differs from the hash of its own JSON" in out
+
+    code, out = verify(forge(env, data, proof=lambda m: m["anchors"].pop(1)))
+    assert code == 1 and "does not follow anchor 1" in out, "dropping a middle anchor breaks the sequence"
+
+    def edit_row(lines):
+        row = json.loads(lines[0])
+        row["event"]["path"] = "/tmp/x"
+        lines[0] = json.dumps(row, sort_keys=True, separators=(",", ":"))
+        return lines
+
+    code, out = verify(forge(env, data, events=edit_row))
+    assert code == 1 and "the event was edited" in out
+
+
+@pytest.mark.asyncio
+async def test_gap_times_are_utc_and_labelled_as_such(env, tmp_path):
+    from core import monitoring_coverage
+
+    plus_530 = timezone(timedelta(hours=5, minutes=30))
+    assert monitoring_coverage._fmt(datetime(2026, 10, 1, 12, 0, 0, tzinfo=plus_530)) == "2026-10-01 06:30:00", "stored values are converted to UTC"
+
+    sql(env, "INSERT INTO monitoring_gaps (run_id, gap_start, gap_end, reason) VALUES ('run-1', '2026-10-01 06:00:00', '2026-10-01 06:30:00', 'restart')")
+    data, summary, fake = await make_bundle(env)
+    gaps = json.loads(unpack(data)["gaps.json"])
+    assert gaps["time_basis"] == "UTC" and gaps["gaps"][0]["gap_start"] == "2026-10-01 06:00:00"
+    code, out = run_verifier(tmp_path, data)
+    assert "Monitoring gaps overlapping the period: 1 (times in UTC)" in out
+    assert "2026-10-01 06:00:00 UTC to 2026-10-01 06:30:00 UTC (restart)" in out
+    spec = (ROOT / "docs" / "design" / "evidence-bundle-spec.md").read_text(encoding="utf-8")
+    assert '"time_basis": "UTC"' in spec and "The times are UTC" in spec
+    assert "last anchor at that same head that holds a timestamp token" in spec

@@ -343,3 +343,23 @@ def test_the_docs_state_what_the_bundle_and_verifier_do_and_do_not_show():
     lowered = section.lower()
     for phrase in ("tamper", "authentic", "verified by authority", "cannot be altered"):
         assert phrase not in lowered.replace("signature not authenticated", ""), phrase
+
+
+# ------------------------------------------------------------------ "no data leaves" style claims
+
+OLD_CLAIMS = re.compile(r"(no|zero) data leaves|data never leaves|nothing leaves (your|this) machine|no data (is )?(sent|leaves)", re.IGNORECASE)
+
+
+def test_no_text_claims_that_no_data_leaves_the_machine():
+    """Vigil uploads no event data, but it has two optional outbound paths (the digest webhook and an external
+    timestamp of an anchor hash), so a flat claim that no data leaves the machine is wrong."""
+    paths = [ROOT / n for n in READMES + ["docs/COVERAGE.md"]]
+    paths += list((ROOT / "frontend" / "src").rglob("*.jsx")) + list((ROOT / "frontend" / "src").rglob("*.js"))
+    paths += [p for p in (ROOT / "installer").glob("*") if p.is_file() and p.suffix in (".iss", ".js", ".bat", ".ps1", ".md")]
+    paths += list((ROOT / "tray").glob("*.js"))
+    paths += [p for p in BACKEND.rglob("*.py") if ".venv" not in p.parts and "tests" not in p.parts]
+    paths += list((ROOT / "vigil-vscode" / "src").glob("*.ts")) + [ROOT / "vigil-vscode" / "package.json"]
+    offenders = [str(p.relative_to(ROOT)) for p in paths if p.is_file() and OLD_CLAIMS.search(p.read_text(encoding="utf-8", errors="ignore"))]
+    assert offenders == [], offenders
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "Vigil uploads no event data" in readme and "two optional outbound paths" in readme

@@ -94,6 +94,21 @@ async def build_bundle(start: str, end: str, *, db_path=None, key_directory: Pat
         # anchor's last event so the verifier can recompute the head the anchor recorded.
         cur = await conn.execute("SELECT * FROM evidence_anchors WHERE last_event_id >= ? ORDER BY anchor_seq LIMIT 1", (range_last_id,))
         end_anchor = await cur.fetchone()
+        end_seq = end_anchor["anchor_seq"] if end_anchor else None
+        if end_anchor is not None:
+            # Several anchors can pin the same chain head (an export or an hourly run that changed only the table
+            # digest). Timestamping is queued per anchor and may stamp only some of them, so the first anchor at
+            # that head can be unstamped while later ones carry tokens. Extend the end of the anchor range to the
+            # last anchor at the same head that holds a token. Anchor sequence numbers only grow with the chain, so
+            # every anchor in between is at the same head and the range stays contiguous: the verifier's sequence
+            # and previous-hash checks need no change.
+            cur = await conn.execute(
+                "SELECT MAX(anchor_seq) m FROM evidence_anchors WHERE chain_head = ? AND last_event_id = ? "
+                "AND tsa_token IS NOT NULL AND anchor_seq > ?",
+                (end_anchor["chain_head"], end_anchor["last_event_id"], end_seq))
+            stamped = (await cur.fetchone())["m"]
+            if stamped:
+                end_seq = stamped
         last_id = max(range_last_id, end_anchor["last_event_id"]) if end_anchor else range_last_id
         # The last anchor before the range starts the anchor chain.
         cur = await conn.execute("SELECT * FROM evidence_anchors WHERE last_event_id < ? ORDER BY anchor_seq DESC LIMIT 1", (first_id,))
@@ -117,7 +132,7 @@ async def build_bundle(start: str, end: str, *, db_path=None, key_directory: Pat
         if end_anchor is not None:
             low = start_anchor["anchor_seq"] if start_anchor else 1
             cur = await conn.execute("SELECT * FROM evidence_anchors WHERE anchor_seq BETWEEN ? AND ? ORDER BY anchor_seq",
-                                     (low, end_anchor["anchor_seq"]))
+                                     (low, end_seq))
             anchor_rows = await cur.fetchall()
 
         anchors = []
@@ -142,7 +157,8 @@ async def build_bundle(start: str, end: str, *, db_path=None, key_directory: Pat
     key = signing_key.ensure_key(directory, install_id)
 
     coverage_bytes = json.dumps(report_coverage.as_dict(), indent=2, sort_keys=True).encode("utf-8")
-    gaps_bytes = json.dumps(gaps, indent=2, sort_keys=True).encode("utf-8")
+    # monitoring_gaps stores UTC (core/monitoring_coverage.py _fmt converts to UTC), 'YYYY-MM-DD HH:MM:SS'.
+    gaps_bytes = json.dumps({"time_basis": "UTC", "gaps": gaps}, indent=2, sort_keys=True).encode("utf-8")
     files = {"events.jsonl": events_bytes, "coverage.json": coverage_bytes, "gaps.json": gaps_bytes}
     proof = {
         "v": 1,
@@ -178,6 +194,6 @@ async def build_bundle(start: str, end: str, *, db_path=None, key_directory: Pat
     summary = {
         "install_id": proof["install_id"], "fingerprint": key["fingerprint"], "period": proof["period"],
         "events": len(rows), "anchors": len(anchors), "tokens": sum(1 for a in anchors if a["tsa_token_b64"]),
-        "bound_by_anchor": end_anchor["anchor_seq"] if end_anchor else None,
+        "bound_by_anchor": end_anchor["anchor_seq"] if end_anchor else None, "last_anchor_in_bundle": end_seq,
     }
     return buffer.getvalue(), summary
