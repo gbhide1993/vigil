@@ -6,7 +6,7 @@ populate — no new data collection, no writes, nothing that touches network.
 import hashlib
 import json
 
-from core.sessions import has_activity_exists_sql, session_visible_sql
+from core.sessions import has_activity_exists_sql, is_idle, last_activity_by_open_session, session_visible_sql
 from db.database import get_db, get_read_db
 
 EVIDENCE_NOTE = (
@@ -87,6 +87,7 @@ async def _get_current_session(params: dict) -> dict:
             "friction_signals": 0,
             "resumed": False,
             "has_activity": False,
+            "last_activity_at": None,
             "status": "none",
         }
 
@@ -121,9 +122,18 @@ async def _get_current_session(params: dict) -> dict:
     else:
         duration_min = await _minutes_between(db, session["started_at"], None)
 
+    # The idle sweep is off, so an open session never closes by itself. Display rule only (nothing is written):
+    # no event for longer than the idle timeout means "idle", not "active".
+    last_activity_at = None
+    if status == "active":
+        last_activity_at = (await last_activity_by_open_session(db, session_id)).get(session_id) or session["started_at"]
+        if is_idle(last_activity_at):
+            status = "idle"
+
     return {
         "session_id": session_id,
         "start_time": session["started_at"],
+        "last_activity_at": last_activity_at,
         "duration_min": duration_min,
         "files_touched": len(distinct_paths),
         "agent": session["agent_name"],

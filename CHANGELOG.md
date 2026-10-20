@@ -5,6 +5,7 @@
 - A session opened only because Vigil found an agent process already running at startup, with no activity after it, is no longer shown as the current session, as a session in the lists, or counted in "recording since". The row is kept and its report still opens by id.
 - Session report: says when Vigil began watching while the agent was already running (start time and duration are from when watching began), counts only real spawns, shows "Already running when watching began: N" separately, lists up to 20 processes with their PIDs, and its footer now matches the report's coverage section.
 - Session lists and the current-session call now carry `has_activity`; the current-session call also carries `resumed`.
+- An open session with no event for more than 5 minutes is reported as idle (`status` "idle" and `last_activity_at` on the current-session call, `idle` and `last_activity_at` on session lists), and its report says "Idle since <time>" with the duration counted to that time. Display only: nothing is written and the idle sweep stays off.
 
 ### Known limits
 - The scheduled idle sweep is still off (disabled in e821731 pending an event-loop audit), so sessions still close lazily and durations and counts can be off.

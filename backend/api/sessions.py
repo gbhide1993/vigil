@@ -14,7 +14,7 @@ from core.digest import display_summary
 from core.file_changes import scope_label, session_changes
 from core.monitoring_status import network_monitoring
 from core.scope_store import get_scope_directories
-from core.sessions import has_activity_exists_sql, session_visible_sql
+from core.sessions import has_activity_exists_sql, is_idle, last_activity_by_open_session, session_visible_sql
 from core.verification import build_verification_report, touches_credential_path
 from db.database import get_read_db
 
@@ -76,9 +76,14 @@ async def get_sessions(status: str | None = Query(default=None)):
         )
         rows = await cur.fetchall()
         sessions = [dict(r) for r in rows]
+        # One query for all open sessions. Display only: the idle sweep is off, so an open session whose newest
+        # event is older than the idle timeout is flagged idle here; nothing is written.
+        last_activity = await last_activity_by_open_session(db)
         for s in sessions:
             s["summary"] = display_summary(s.get("summary"))
             s["has_activity"] = bool(s["has_activity"])
+            s["last_activity_at"] = last_activity.get(s["id"]) if s["ended_at"] is None else None
+            s["idle"] = bool(s["last_activity_at"]) and is_idle(s["last_activity_at"])
         return {"sessions": sessions}
     finally:
         await db.close()
@@ -231,9 +236,19 @@ async def _build_session_report_data(db, session_id: str) -> dict:
     started_at = session["started_at"]
     ended_at = session["ended_at"]
     duration_minutes = None
+    last_activity_at = None
+    idle = False
+    if ended_at is None:
+        last_activity_at = (await last_activity_by_open_session(db, session_id)).get(session_id) or started_at
+        idle = is_idle(last_activity_at)
     if started_at:
         start_dt = datetime.fromisoformat(started_at.replace(" ", "T"))
-        end_dt = datetime.fromisoformat(ended_at.replace(" ", "T")) if ended_at else datetime.utcnow()
+        if ended_at:
+            end_dt = datetime.fromisoformat(ended_at.replace(" ", "T"))
+        elif idle:
+            end_dt = datetime.fromisoformat(last_activity_at.replace(" ", "T"))  # not "now": the agent went quiet
+        else:
+            end_dt = datetime.utcnow()
         duration_minutes = round((end_dt - start_dt).total_seconds() / 60, 1)
 
     # Every recorded file change of the session (creates, writes, moves AND deletes),
@@ -308,6 +323,8 @@ async def _build_session_report_data(db, session_id: str) -> dict:
         "start_time": _format_local(started_at),
         "end_time": _format_local(ended_at),
         "duration_minutes": duration_minutes,
+        "idle": idle,
+        "last_activity_at": _format_local(last_activity_at) if idle else None,
         "generated_at": now_local.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "files_touched": files_touched,
         "files_touched_count": len(files_touched),
@@ -346,6 +363,8 @@ async def get_session_report_preview(session_id: str):
         "agent_name": report["agent_name"],
         "start_time": report["start_time"],
         "duration_minutes": report["duration_minutes"],
+        "idle": report["idle"],
+        "last_activity_at": report["last_activity_at"],
         "files_touched": report["files_touched_count"],
         "file_changes_total": report["file_changes_total"],
         "file_changes_not_shown": report["file_changes_not_shown"],
@@ -399,6 +418,9 @@ async def get_session_report_pdf(session_id: str):
     duration_str = f"{report['duration_minutes']} min" if report["duration_minutes"] is not None else "n/a"
     c.drawString(margin, y, f"Started: {report['start_time']}    Duration: {duration_str}")
     y -= 0.2 * inch
+    if report["idle"]:
+        c.drawString(margin, y, f"Idle since {report['last_activity_at']}")
+        y -= 0.2 * inch
     c.drawString(margin, y, f"Generated: {report['generated_at']}")
     y -= 0.2 * inch
     if report["resumed"]:

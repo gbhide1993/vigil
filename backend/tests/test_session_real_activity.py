@@ -61,11 +61,17 @@ async def resumed_session(db, agent_id, *, closed: bool, started="2026-10-19 17:
     return sid
 
 
-async def add_file_write(db, agent_id, sid, path="C:/proj/src/app.py"):
+def utc_ago(minutes: float) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def add_file_write(db, agent_id, sid, path="C:/proj/src/app.py", at="2026-10-19 17:10:00"):
     await db.execute(
         "INSERT INTO events (agent_id, session_id, event_type, path, file_count, severity, created_at) "
-        "VALUES (?, ?, 'file_write', ?, 1, 'low', '2026-10-19 17:10:00')",
-        (agent_id, sid, path),
+        "VALUES (?, ?, 'file_write', ?, 1, 'low', ?)",
+        (agent_id, sid, path, at),
     )
     await db.commit()
 
@@ -136,8 +142,8 @@ async def test_a_resumed_session_with_only_markers_is_not_the_current_session(db
 async def test_a_resumed_session_that_later_has_a_real_file_write_is_shown_with_it(db):
     agent = await make_agent(db)
     marker_only = await resumed_session(db, agent, closed=False, started="2026-10-19 17:00:00")
-    real = await resumed_session(db, agent, closed=False, started="2026-10-19 17:05:41")
-    await add_file_write(db, agent, real)
+    real = await resumed_session(db, agent, closed=False, started=utc_ago(3))
+    await add_file_write(db, agent, real, at=utc_ago(1))
 
     result = await mcp_service._get_current_session({})
     assert result["session_id"] == real and result["status"] == "active"
@@ -230,3 +236,84 @@ async def test_an_ordinary_session_has_no_resumed_note_and_the_process_list_is_c
     assert "Vigil began watching while this agent was already running." not in text
     assert "Already running when watching began" not in text
     assert "5 more not shown." in text
+
+
+# ------------------------------------------------------------------ idle: a display rule, nothing is written
+
+async def open_session(db, agent_id, *, started_min_ago, event_min_ago=None, resumed=False) -> str:
+    sid = str(uuid.uuid4())
+    await db.execute("INSERT INTO sessions (id, agent_id, started_at, resumed) VALUES (?, ?, ?, ?)",
+                     (sid, agent_id, utc_ago(started_min_ago), 1 if resumed else 0))
+    await db.commit()
+    if event_min_ago is not None:
+        await add_file_write(db, agent_id, sid, at=utc_ago(event_min_ago))
+    return sid
+
+
+async def snapshot(db):
+    cur = await db.execute("SELECT (SELECT COUNT(*) FROM sessions) s, (SELECT COUNT(*) FROM events) e, "
+                           "(SELECT COUNT(*) FROM sessions WHERE ended_at IS NOT NULL) closed")
+    return dict(await cur.fetchone())
+
+
+@pytest.mark.asyncio
+async def test_an_open_session_with_its_last_event_10_minutes_ago_is_idle_and_one_minute_ago_is_active(db):
+    agent = await make_agent(db)
+    quiet = await open_session(db, agent, started_min_ago=30, event_min_ago=10)
+    before = await snapshot(db)
+    result = await mcp_service._get_current_session({})
+    assert result["session_id"] == quiet and result["status"] == "idle"
+    assert result["last_activity_at"] == utc_ago(10) or result["last_activity_at"] <= utc_ago(9.9)
+    assert await snapshot(db) == before, "display only: nothing is written"
+
+    busy = await open_session(db, agent, started_min_ago=5, event_min_ago=1)
+    result = await mcp_service._get_current_session({})
+    assert result["session_id"] == busy and result["status"] == "active"
+    assert result["last_activity_at"] >= utc_ago(1.1)
+
+
+@pytest.mark.asyncio
+async def test_an_open_session_with_no_events_is_judged_by_its_start_time(db):
+    agent = await make_agent(db)
+    sid = await open_session(db, agent, started_min_ago=20)
+    result = await mcp_service._get_current_session({})
+    assert result["session_id"] == sid and result["status"] == "idle" and result["last_activity_at"] == utc_ago(20)
+
+
+@pytest.mark.asyncio
+async def test_a_marker_only_resumed_session_is_still_hidden_not_idle(db):
+    agent = await make_agent(db)
+    await resumed_session(db, agent, closed=False, started=utc_ago(30))
+    result = await mcp_service._get_current_session({})
+    assert result["status"] == "none" and result["session_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_list_carries_idle_and_last_activity_for_open_sessions_only(db):
+    agent = await make_agent(db)
+    quiet = await open_session(db, agent, started_min_ago=30, event_min_ago=10)
+    busy = await open_session(db, agent, started_min_ago=5, event_min_ago=1)
+    closed = str(uuid.uuid4())
+    await db.execute("INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, ?, ?)", (closed, agent, utc_ago(60), utc_ago(50)))
+    await db.commit()
+
+    rows = {s["id"]: s for s in client().get("/sessions").json()["sessions"]}
+    assert rows[quiet]["idle"] is True and rows[quiet]["last_activity_at"] <= utc_ago(9.9)
+    assert rows[busy]["idle"] is False and rows[busy]["last_activity_at"] >= utc_ago(1.1)
+    assert rows[closed]["idle"] is False and rows[closed]["last_activity_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_pdf_says_idle_since_and_counts_the_duration_to_the_last_activity(db):
+    agent = await make_agent(db)
+    sid = await open_session(db, agent, started_min_ago=30, event_min_ago=20)   # watched for 10 minutes, then quiet
+    c = client()
+    preview = c.get(f"/sessions/{sid}/report/preview").json()
+    assert preview["idle"] is True and preview["duration_minutes"] == 10.0
+    text = pdf_text(c, f"/sessions/{sid}/report")
+    assert "Idle since " in text and "Duration: 10.0 min" in text
+
+    active = await open_session(db, agent, started_min_ago=5, event_min_ago=1)
+    preview = c.get(f"/sessions/{active}/report/preview").json()
+    assert preview["idle"] is False and preview["last_activity_at"] is None
+    assert "Idle since" not in pdf_text(c, f"/sessions/{active}/report")
