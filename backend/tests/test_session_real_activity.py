@@ -1,0 +1,232 @@
+"""Sessions opened only because Vigil found an agent process already running at startup (resumed=1) and
+nothing else: they are not current sessions, their already_running spawn markers are not spawns, and the
+session report says so. Fixtures are shaped like sessions 495a25f5 (open) and cc131709 (start == end) from
+the field report: resumed, two already_running proc_spawn events (codex.exe and its conhost.exe), no file events."""
+
+import json
+import uuid
+from unittest.mock import patch
+
+import pytest
+import pytest_asyncio
+
+import api.sessions as sessions_module
+import db.database as database
+from core import mcp_service
+from core.sessions import has_activity_exists_sql, has_real_activity, session_visible_sql
+
+OLD_FOOTER = ("Independent OS-level observer", "Evidence is captured independently of agent self-reporting")
+
+
+@pytest_asyncio.fixture
+async def db(tmp_path, monkeypatch):
+    """A fresh database of its own, so "the current session" is exactly what the test created."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "vlaw.db")
+    monkeypatch.setattr("config.policy.POLICY_FILE", tmp_path / "no-such-policy.json")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    database._db = None
+    conn = await database.get_db()
+    yield conn
+    await database.close_db()
+
+
+async def make_agent(db) -> int:
+    cur = await db.execute("INSERT INTO agents (name, process_name, approved) VALUES (?, 'codex.exe', 1)", (f"codex_{uuid.uuid4().hex[:6]}",))
+    await db.commit()
+    return cur.lastrowid
+
+
+async def add_spawn(db, agent_id, sid, name, pid, parent, *, already_running, activity_spawn):
+    detail = {"pid": pid, "parent_pid": parent, "command": name, "args": [], "suspicious": False,
+              "process_started": 1792429524, "activity_spawn": activity_spawn}
+    if already_running:
+        detail["already_running"] = True
+    await db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path, detail, file_count, severity, pid, created_at) "
+        "VALUES (?, ?, 'proc_spawn', ?, ?, 1, 'low', ?, '2026-10-19 17:05:41')",
+        (agent_id, sid, name, json.dumps(detail), pid),
+    )
+
+
+async def resumed_session(db, agent_id, *, closed: bool, started="2026-10-19 17:05:41") -> str:
+    """495a25f5 (closed=False) or cc131709 (closed=True, ended_at == started_at): two already_running markers."""
+    sid = str(uuid.uuid4())
+    await db.execute(
+        "INSERT INTO sessions (id, agent_id, started_at, ended_at, resumed) VALUES (?, ?, ?, ?, 1)",
+        (sid, agent_id, started, started if closed else None),
+    )
+    await add_spawn(db, agent_id, sid, "codex.exe", 42468, 33624, already_running=True, activity_spawn=False)
+    await add_spawn(db, agent_id, sid, "conhost.exe", 51736, 42468, already_running=True, activity_spawn=True)
+    await db.commit()
+    return sid
+
+
+async def add_file_write(db, agent_id, sid, path="C:/proj/src/app.py"):
+    await db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path, file_count, severity, created_at) "
+        "VALUES (?, ?, 'file_write', ?, 1, 'low', '2026-10-19 17:10:00')",
+        (agent_id, sid, path),
+    )
+    await db.commit()
+
+
+def client():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+    app.include_router(sessions_module.router)
+    return TestClient(app)
+
+
+def pdf_text(c, path):
+    from reportlab.pdfgen import canvas
+
+    drawn = []
+    original = canvas.Canvas.drawString
+
+    def capture(self, x, y, text):
+        drawn.append(text)
+        return original(self, x, y, text)
+
+    with patch.object(canvas.Canvas, "drawString", capture):
+        response = c.get(path)
+    assert response.status_code == 200
+    return "\n".join(drawn)
+
+
+# ------------------------------------------------------------------ the one definition
+
+@pytest.mark.asyncio
+async def test_real_activity_is_a_file_event_or_a_spawn_that_is_not_an_already_running_marker(db):
+    agent = await make_agent(db)
+    open_resumed = await resumed_session(db, agent, closed=False)
+    closed_resumed = await resumed_session(db, agent, closed=True)
+    with_file = await resumed_session(db, agent, closed=False)
+    await add_file_write(db, agent, with_file)
+    with_spawn = await resumed_session(db, agent, closed=False)
+    await add_spawn(db, agent, with_spawn, "git.exe", 6001, 42468, already_running=False, activity_spawn=True)
+    await db.commit()
+
+    assert await has_real_activity(db, open_resumed) is False
+    assert await has_real_activity(db, closed_resumed) is False
+    assert await has_real_activity(db, with_file) is True
+    assert await has_real_activity(db, with_spawn) is True
+
+    cur = await db.execute(f"SELECT s.id FROM sessions s WHERE {session_visible_sql('s')} ORDER BY s.id")
+    visible = {r["id"] for r in await cur.fetchall()}
+    assert visible == {with_file, with_spawn}
+    cur = await db.execute(f"SELECT s.id FROM sessions s WHERE {has_activity_exists_sql('s')}")
+    assert {r["id"] for r in await cur.fetchall()} == {with_file, with_spawn}
+
+
+# ------------------------------------------------------------------ current session
+
+@pytest.mark.asyncio
+async def test_a_resumed_session_with_only_markers_is_not_the_current_session(db):
+    agent = await make_agent(db)
+    await resumed_session(db, agent, closed=False)   # like 495a25f5
+    await resumed_session(db, agent, closed=True)    # like cc131709
+    result = await mcp_service._get_current_session({})
+    assert result["status"] == "none" and result["session_id"] is None
+    assert result["resumed"] is False and result["has_activity"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_session_that_later_has_a_real_file_write_is_shown_with_it(db):
+    agent = await make_agent(db)
+    marker_only = await resumed_session(db, agent, closed=False, started="2026-10-19 17:00:00")
+    real = await resumed_session(db, agent, closed=False, started="2026-10-19 17:05:41")
+    await add_file_write(db, agent, real)
+
+    result = await mcp_service._get_current_session({})
+    assert result["session_id"] == real and result["status"] == "active"
+    assert result["resumed"] is True and result["has_activity"] is True
+    assert result["files_touched"] == 1
+    assert result["session_id"] != marker_only
+
+
+@pytest.mark.asyncio
+async def test_session_list_flags_activity_and_the_open_filter_leaves_out_marker_only_sessions(db):
+    agent = await make_agent(db)
+    marker_only = await resumed_session(db, agent, closed=False)
+    marker_closed = await resumed_session(db, agent, closed=True)
+    real = await resumed_session(db, agent, closed=False)
+    await add_file_write(db, agent, real)
+
+    c = client()
+    everything = {s["id"]: s for s in c.get("/sessions").json()["sessions"]}
+    assert set(everything) == {marker_only, marker_closed, real}, "the rows stay available"
+    assert everything[marker_only]["has_activity"] is False and everything[marker_closed]["has_activity"] is False
+    assert everything[real]["has_activity"] is True and everything[real]["resumed"] == 1
+    open_ids = {s["id"] for s in c.get("/sessions", params={"status": "open"}).json()["sessions"]}
+    assert open_ids == {real}
+
+    # the rows are still there for the reports by id
+    assert c.get(f"/sessions/{marker_only}/report/preview").status_code == 200
+
+
+# ------------------------------------------------------------------ the report
+
+@pytest.mark.asyncio
+async def test_report_for_a_marker_only_session_counts_no_spawns_says_so_and_lists_both_processes(db):
+    agent = await make_agent(db)
+    for closed in (False, True):  # 495a25f5 and cc131709
+        sid = await resumed_session(db, agent, closed=closed)
+        c = client()
+        preview = c.get(f"/sessions/{sid}/report/preview").json()
+        assert preview["process_spawns"] == 0
+        assert preview["already_running_count"] == 2
+        assert preview["resumed"] is True
+        assert preview["resumed_note"] == ("Vigil began watching while this agent was already running. "
+                                          "Start time and duration are from when watching began.")
+        rows = preview["processes"]
+        assert [(r["name"], r["pid"], r["parent_pid"], r["already_running"]) for r in rows] == [
+            ("codex.exe", 42468, 33624, True), ("conhost.exe", 51736, 42468, True)]
+
+        text = pdf_text(c, f"/sessions/{sid}/report")
+        flat = " ".join(text.split())  # the note wraps over two lines in the PDF
+        assert "Vigil began watching while this agent was already running. Start time and duration are from when watching began." in flat
+        assert "Already running when watching began: 2" in text
+        assert "Processes (2)" in text and "codex.exe" in text and "conhost.exe" in text
+        assert text.count("already running") >= 2
+        assert "Generated by Vigil from OS-level records." in text
+        assert "See 'What this report covers' above for what is not recorded." in text
+        for old in OLD_FOOTER:
+            assert old not in text
+
+
+@pytest.mark.asyncio
+async def test_report_for_a_resumed_session_with_real_activity_keeps_the_label_and_shows_the_activity(db):
+    agent = await make_agent(db)
+    sid = await resumed_session(db, agent, closed=False)
+    await add_file_write(db, agent, sid, "C:/proj/src/changed.py")
+    await add_spawn(db, agent, sid, "git.exe", 6001, 42468, already_running=False, activity_spawn=True)
+    await db.commit()
+
+    c = client()
+    preview = c.get(f"/sessions/{sid}/report/preview").json()
+    assert preview["process_spawns"] == 1, "only the git.exe spawn; the two markers are not spawns"
+    assert preview["already_running_count"] == 2 and preview["processes_total"] == 3
+    assert preview["files_touched"] == 1 and preview["resumed"] is True
+    text = pdf_text(c, f"/sessions/{sid}/report")
+    assert "changed.py" in text and "git.exe" in text and "Already running when watching began: 2" in text
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_session_has_no_resumed_note_and_the_process_list_is_capped_at_20(db):
+    agent = await make_agent(db)
+    sid = str(uuid.uuid4())
+    await db.execute("INSERT INTO sessions (id, agent_id, started_at, ended_at, resumed) VALUES (?, ?, '2026-10-19 09:00:00', '2026-10-19 09:10:00', 0)", (sid, agent))
+    for i in range(25):
+        await add_spawn(db, agent, sid, f"tool{i}.exe", 7000 + i, 42468, already_running=False, activity_spawn=True)
+    await db.commit()
+
+    c = client()
+    preview = c.get(f"/sessions/{sid}/report/preview").json()
+    assert preview["resumed"] is False and preview["resumed_note"] is None and preview["already_running_count"] == 0
+    assert preview["process_spawns"] == 25 and len(preview["processes"]) == 20 and preview["processes_total"] == 25
+    text = pdf_text(c, f"/sessions/{sid}/report")
+    assert "Vigil began watching while this agent was already running." not in text
+    assert "Already running when watching began" not in text
+    assert "5 more not shown." in text

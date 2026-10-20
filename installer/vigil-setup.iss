@@ -5,7 +5,7 @@
 ; build.bat runs check-version.js and stops if they differ.
 
 #define AppName "Vigil"
-#define AppVersion "0.9.0"
+#define AppVersion "0.9.1"
 #define AppPublisher "Vvault Technologies"
 #define AppURL "https://getvvault.com/vigil"
 #define AppExeName "Vigil.exe"

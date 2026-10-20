@@ -6,6 +6,7 @@ populate — no new data collection, no writes, nothing that touches network.
 import hashlib
 import json
 
+from core.sessions import has_activity_exists_sql, session_visible_sql
 from db.database import get_db, get_read_db
 
 EVIDENCE_NOTE = (
@@ -45,12 +46,15 @@ def _expand_file_paths(row) -> list[str]:
 async def _get_current_session(params: dict) -> dict:
     db = await get_db()
 
+    # A resumed session with no real activity (Vigil only found the agent already running at startup, and
+    # nothing happened after) is not a current session: it is skipped here, not reported as active.
+    # core.sessions.session_visible_sql is the one definition of that.
     cur = await db.execute(
-        """
-        SELECT s.*, a.name as agent_name
+        f"""
+        SELECT s.*, a.name as agent_name, {has_activity_exists_sql('s')} AS has_activity
         FROM sessions s
         LEFT JOIN agents a ON a.id = s.agent_id
-        WHERE s.ended_at IS NULL
+        WHERE s.ended_at IS NULL AND {session_visible_sql('s')}
         ORDER BY s.started_at DESC
         LIMIT 1
         """
@@ -60,10 +64,11 @@ async def _get_current_session(params: dict) -> dict:
 
     if session is None:
         cur = await db.execute(
-            """
-            SELECT s.*, a.name as agent_name
+            f"""
+            SELECT s.*, a.name as agent_name, {has_activity_exists_sql('s')} AS has_activity
             FROM sessions s
             LEFT JOIN agents a ON a.id = s.agent_id
+            WHERE {session_visible_sql('s')}
             ORDER BY s.started_at DESC
             LIMIT 1
             """
@@ -80,6 +85,8 @@ async def _get_current_session(params: dict) -> dict:
             "agent": None,
             "red_lines": 0,
             "friction_signals": 0,
+            "resumed": False,
+            "has_activity": False,
             "status": "none",
         }
 
@@ -122,6 +129,8 @@ async def _get_current_session(params: dict) -> dict:
         "agent": session["agent_name"],
         "red_lines": red_lines,
         "friction_signals": len(findings),
+        "resumed": bool(session["resumed"]),
+        "has_activity": bool(session["has_activity"]),
         "status": status,
     }
 

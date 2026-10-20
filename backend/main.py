@@ -119,7 +119,7 @@ LOG_PATH = os.environ.get("VLAW_LOG_FILE") or os.path.join(BASE_DIR, "vlaw-backe
 logger = configure_logging(LOG_PATH)
 logger.info("V-LAW backend starting. BASE_DIR=%s", BASE_DIR)
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 PORT = int(os.environ.get("VLAW_PORT", 7422))
 
 # Shared with the API routes through core/runtime_state.py (NOT through `import main`,

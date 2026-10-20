@@ -14,6 +14,7 @@ from core.digest import display_summary
 from core.file_changes import scope_label, session_changes
 from core.monitoring_status import network_monitoring
 from core.scope_store import get_scope_directories
+from core.sessions import has_activity_exists_sql, session_visible_sql
 from core.verification import build_verification_report, touches_credential_path
 from db.database import get_read_db
 
@@ -22,6 +23,13 @@ _alerter = Alerter()
 
 # Most file-change rows listed in one session report (the rest are counted).
 MAX_FILE_CHANGE_ROWS = 200
+# Most process rows listed in one session report.
+MAX_PROCESS_ROWS = 20
+
+RESUMED_NOTE = (
+    "Vigil began watching while this agent was already running. "
+    "Start time and duration are from when watching began."
+)
 
 ANOMALY_RULE_TYPES = ("volumetric_threshold", "time_anomaly", "ratio_anomaly", "unknown_destination", "rolling_anomaly")
 
@@ -45,10 +53,14 @@ async def get_sessions(status: str | None = Query(default=None)):
     query."""
     db = await get_read_db()
     try:
-        where = "WHERE s.ended_at IS NULL" if status == "open" else ""
+        # status=open is "current" sessions: a resumed session with no real activity (Vigil only found the agent
+        # already running) is not one. The row stays in the default listing, flagged has_activity=false, and
+        # is still available by id to the reports.
+        where = f"WHERE s.ended_at IS NULL AND {session_visible_sql('s')}" if status == "open" else ""
         cur = await db.execute(
             f"""
             SELECT s.*, a.name as agent_name,
+                {has_activity_exists_sql('s')} as has_activity,
                 COALESCE(nc.net_connect_count, 0) as net_connect_count
             FROM sessions s
             LEFT JOIN agents a ON a.id = s.agent_id
@@ -66,6 +78,7 @@ async def get_sessions(status: str | None = Query(default=None)):
         sessions = [dict(r) for r in rows]
         for s in sessions:
             s["summary"] = display_summary(s.get("summary"))
+            s["has_activity"] = bool(s["has_activity"])
         return {"sessions": sessions}
     finally:
         await db.close()
@@ -235,11 +248,27 @@ async def _build_session_report_data(db, session_id: str) -> dict:
     net_destinations = await _get_unique_network_destinations(db, session_id)
     approved_destinations = set(await _get_policy_list(db, "approved_network_destinations"))
 
+    # proc_spawn rows marked already_running are not spawns: they record an agent process Vigil found running
+    # when it began watching. They are counted on their own line and tagged in the process list.
     cur = await db.execute(
-        "SELECT COUNT(*) c FROM events WHERE session_id = ? AND event_type = 'proc_spawn'",
+        "SELECT path, pid, detail FROM events WHERE session_id = ? AND event_type = 'proc_spawn' ORDER BY id",
         (session_id,),
     )
-    process_spawns = (await cur.fetchone())["c"]
+    processes_all = []
+    for row in await cur.fetchall():
+        try:
+            detail = json.loads(row["detail"]) if row["detail"] else {}
+        except ValueError:
+            detail = {}
+        processes_all.append({
+            "name": row["path"],
+            "pid": row["pid"] if row["pid"] is not None else detail.get("pid"),
+            "parent_pid": detail.get("parent_pid"),
+            "already_running": bool(detail.get("already_running")),
+        })
+    already_running_count = sum(1 for p in processes_all if p["already_running"])
+    process_spawns = len(processes_all) - already_running_count
+    processes = processes_all[:MAX_PROCESS_ROWS]
 
     cur = await db.execute(
         """
@@ -293,6 +322,11 @@ async def _build_session_report_data(db, session_id: str) -> dict:
         # means "not measured", never "no connections".
         "network_monitoring": network_monitoring(),
         "process_spawns": process_spawns,
+        "already_running_count": already_running_count,
+        "processes": processes,
+        "processes_total": len(processes_all),
+        "resumed": bool(session["resumed"]),
+        "resumed_note": RESUMED_NOTE if session["resumed"] else None,
         "red_lines": alerts,
         "red_lines_count": len(alerts),
     }
@@ -320,6 +354,11 @@ async def get_session_report_preview(session_id: str):
         "network_connections": report["network_connections_count"],
         "network_monitoring": report["network_monitoring"],
         "process_spawns": report["process_spawns"],
+        "already_running_count": report["already_running_count"],
+        "processes": report["processes"],
+        "processes_total": report["processes_total"],
+        "resumed": report["resumed"],
+        "resumed_note": report["resumed_note"],
         "red_lines": report["red_lines_count"],
         "events": events,
         "alerts": report["red_lines"],
@@ -361,7 +400,14 @@ async def get_session_report_pdf(session_id: str):
     c.drawString(margin, y, f"Started: {report['start_time']}    Duration: {duration_str}")
     y -= 0.2 * inch
     c.drawString(margin, y, f"Generated: {report['generated_at']}")
-    y -= 0.35 * inch
+    y -= 0.2 * inch
+    if report["resumed"]:
+        c.setFont("Helvetica-Oblique", 9)
+        for part in _wrap_text(report["resumed_note"], 110):
+            c.drawString(margin, y, part)
+            y -= 0.16 * inch
+        c.setFont("Helvetica", 10)
+    y -= 0.15 * inch
 
     c.setStrokeColor(colors.HexColor("#cccccc"))
     c.line(margin, y, width - margin, y)
@@ -405,7 +451,12 @@ async def get_session_report_pdf(session_id: str):
         c.setFont("Helvetica", 8)
         c.drawCentredString(x + box_w / 2, y - box_h + 0.18 * inch, label)
         x += box_w + 0.15 * inch
-    y -= box_h + 0.35 * inch
+    y -= box_h + 0.25 * inch
+    if report["already_running_count"]:
+        c.setFont("Helvetica", 9)
+        c.drawString(margin, y, f"Already running when watching began: {report['already_running_count']}")
+        y -= 0.2 * inch
+    y -= 0.1 * inch
 
     # FILE CHANGES
     c.setFont("Helvetica-Bold", 12)
@@ -447,6 +498,39 @@ async def get_session_report_pdf(session_id: str):
     if report["file_changes_not_shown"]:
         c.drawString(margin, y, f"{report['file_changes_not_shown']} more not shown (the counts above include them).")
         y -= 0.2 * inch
+    y -= 0.2 * inch
+
+    # PROCESSES (up to MAX_PROCESS_ROWS, from the recorded process spawns)
+    if y < margin + 0.6 * inch:
+        y = new_page()
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(margin, y, f"Processes ({report['processes_total']})")
+    y -= 0.22 * inch
+    c.setFont("Helvetica", 9)
+    if not report["processes"]:
+        c.drawString(margin, y, "(none recorded)")
+        y -= 0.2 * inch
+    else:
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(margin, y, "Name")
+        c.drawString(margin + 2.6 * inch, y, "PID")
+        c.drawString(margin + 3.4 * inch, y, "Parent PID")
+        c.drawString(margin + 4.4 * inch, y, "Note")
+        y -= 0.16 * inch
+        c.setFont("Helvetica", 8)
+        for proc in report["processes"]:
+            if y < margin:
+                y = new_page()
+                c.setFont("Helvetica", 8)
+            c.drawString(margin, y, str(proc["name"] or "")[:44])
+            c.drawString(margin + 2.6 * inch, y, str(proc["pid"] if proc["pid"] is not None else ""))
+            c.drawString(margin + 3.4 * inch, y, str(proc["parent_pid"] if proc["parent_pid"] is not None else ""))
+            c.drawString(margin + 4.4 * inch, y, "already running" if proc["already_running"] else "")
+            y -= 0.15 * inch
+        if report["processes_total"] > len(report["processes"]):
+            c.setFont("Helvetica", 9)
+            c.drawString(margin, y, f"{report['processes_total'] - len(report['processes'])} more not shown.")
+            y -= 0.2 * inch
     y -= 0.2 * inch
 
     # NETWORK CONNECTIONS
@@ -543,8 +627,8 @@ async def get_session_report_pdf(session_id: str):
     # FOOTER
     c.setFont("Helvetica-Oblique", 8)
     c.setFillColor(colors.HexColor("#888888"))
-    c.drawString(margin, margin - 0.35 * inch, "Generated by Vigil — Independent OS-level observer")
-    c.drawString(margin, margin - 0.5 * inch, "Evidence is captured independently of agent self-reporting")
+    c.drawString(margin, margin - 0.35 * inch, "Generated by Vigil from OS-level records.")
+    c.drawString(margin, margin - 0.5 * inch, "See 'What this report covers' above for what is not recorded.")
 
     c.save()
     buffer.seek(0)

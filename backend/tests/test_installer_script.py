@@ -52,7 +52,7 @@ def _check(root, *extra):
 def test_the_three_versions_agree_in_the_repository():
     result = subprocess.run(["node", str(INSTALLER / "check-version.js"), "--print"], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "0.9.0"
+    assert result.stdout.strip() == "0.9.1"
 
 
 def test_version_check_passes_and_prints_the_agreed_version(tmp_path):
@@ -81,7 +81,7 @@ def test_backend_and_tray_report_the_same_version_as_the_installer():
     backend = re.search(r'^VERSION = "([^"]+)"', (ROOT / "backend" / "main.py").read_text(encoding="utf-8"), re.M).group(1)
     tray = json.loads((ROOT / "tray" / "package.json").read_text(encoding="utf-8"))["version"]
     installer = re.search(r'^#define AppVersion "([^"]+)"', ISS, re.M).group(1)
-    assert backend == tray == installer == "0.9.0"
+    assert backend == tray == installer == "0.9.1"
     tray_main = (ROOT / "tray" / "main.js").read_text(encoding="utf-8")
     assert "const APP_VERSION = app.getVersion()" in tray_main and "label: `Vigil v${APP_VERSION}`" in tray_main
     assert "0.2.0-beta" not in tray_main

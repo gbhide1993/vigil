@@ -8,7 +8,7 @@ import Alerts from './components/Alerts'
 import Export from './components/Export'
 import Settings from './components/Settings'
 import WelcomeScreen from './components/WelcomeScreen'
-import { api } from './api'
+import { api, realSessions } from './api'
 
 export default function App() {
   const [view, setView] = useState('status')
@@ -71,7 +71,7 @@ export default function App() {
       inFlight = true
       try {
         const data = await api.getSessions()
-        if (!cancelled) setHasSessions(data.sessions.length > 0)
+        if (!cancelled) setHasSessions(realSessions(data.sessions).length > 0)
       } catch {
         // ignore poll failures — keep showing whatever state we last knew
       } finally {

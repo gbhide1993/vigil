@@ -21,6 +21,35 @@ logger = logging.getLogger("vlaw")
 SESSION_IDLE_TIMEOUT_SECONDS = 300  # close a session after 5 minutes of no activity
 CLOSE_IDLE_SESSIONS_TIMEOUT_SECONDS = 8
 
+# "Real activity" of a session: at least one event of the session that is a file event, or a proc_spawn that
+# is not an already_running marker. A session opened only because Vigil found an agent process already
+# running at startup (resumed=1) has just those markers, so it has no real activity. This is the single
+# definition; every reader (current session, session list, reports) uses it through the helpers below.
+REAL_ACTIVITY_FILE_EVENT_TYPES = ("file_write", "file_delete", "file_read", "file_create", "cred_access")
+_FILE_TYPES_SQL = ", ".join(f"'{t}'" for t in REAL_ACTIVITY_FILE_EVENT_TYPES)
+
+
+def has_activity_exists_sql(session_alias: str = "s") -> str:
+    """An EXISTS(...) expression for use in a SELECT or WHERE: true when the session whose id is
+    {session_alias}.id has real activity."""
+    return (
+        f"EXISTS (SELECT 1 FROM events ra WHERE ra.session_id = {session_alias}.id AND ("
+        f"ra.event_type IN ({_FILE_TYPES_SQL}) "
+        "OR (ra.event_type = 'proc_spawn' AND COALESCE(json_extract(ra.detail, '$.already_running'), 0) = 0)))"
+    )
+
+
+def session_visible_sql(session_alias: str = "s") -> str:
+    """A session is shown unless it is a resumed one with no real activity. Only resumed sessions can lack
+    activity (any other session was opened by an event), so the events lookup runs for those alone."""
+    return f"(COALESCE({session_alias}.resumed, 0) = 0 OR {has_activity_exists_sql(session_alias)})"
+
+
+async def has_real_activity(db, session_id: str) -> bool:
+    cur = await db.execute(f"SELECT {has_activity_exists_sql('s')} AS a FROM sessions s WHERE s.id = ?", (session_id,))
+    row = await cur.fetchone()
+    return bool(row and row["a"])
+
 
 class SessionManager:
     def __init__(self):
