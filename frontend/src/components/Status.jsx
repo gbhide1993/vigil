@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { api } from '../api'
+import { api, realSessions } from '../api'
 import IncidentList from './IncidentList'
 
 const WINDOW_HOURS = 24
@@ -43,8 +43,9 @@ export default function Status({ onNavigate }) {
         setStats(statsData)
         setScope(scopeData)
         setAgents(agentsData.agents)
-        if (sessionsData.sessions.length > 0) {
-          const earliest = sessionsData.sessions.reduce((min, s) =>
+        const countedSessions = realSessions(sessionsData.sessions)
+        if (countedSessions.length > 0) {
+          const earliest = countedSessions.reduce((min, s) =>
             !min || (s.started_at && s.started_at < min) ? s.started_at : min, null)
           setRecordingSince(earliest)
         }

@@ -72,9 +72,11 @@ async def test_retry_loop_on_ordinary_project_path_is_still_flagged(test_db):
     agent_id = await _make_agent(test_db, _uniq("claude_code_realtest"))
     session_id = _uniq("sess")
 
+    # Six identical spawns of one real tool: twice the 3-spawn threshold, so "high". (This used to be five spawns of
+    # cmd.exe; cmd is a shell wrapper and is skipped now, see FRICTION_IGNORED_PROCESSES.)
     await _insert_retry_events(
         test_db, agent_id, session_id, "proc_spawn",
-        r"C:\Users\dev\myproject\node_modules\.bin\cmd.exe", 5,
+        r"C:\Users\dev\myproject\tools\build-step.exe", 6,
     )
 
     findings = await _derive_friction_findings(test_db, session_id=session_id)
@@ -82,3 +84,238 @@ async def test_retry_loop_on_ordinary_project_path_is_still_flagged(test_db):
     assert len(retry_findings) == 1
     assert retry_findings[0]["confidence"] == "high"
     assert retry_findings[0]["session_id"] == session_id
+
+
+# ------------------------------------------------------------------ retry_loop grouping, thresholds and exclusions
+# Fixtures are shaped like the real database: git.exe with conhost.exe, Claude file-history checkpoint writes,
+# project-file writes and a repeated command.
+
+import json
+
+import core.mcp_service as mcp_service
+
+
+async def _insert(db, agent_id, session_id, event_type, path, seconds, detail=None):
+    base = datetime.now(timezone.utc)
+    for offset in seconds:
+        ts = (base + timedelta(seconds=offset)).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "INSERT INTO events (agent_id, session_id, event_type, path, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (agent_id, session_id, event_type, path, json.dumps(detail) if detail is not None else None, ts),
+        )
+    await db.commit()
+
+
+async def _setup(db, label):
+    return await _make_agent(db, _uniq(label)), _uniq("sess")
+
+
+def _retry(findings):
+    return [f for f in findings if f["finding_type"] == "retry_loop"]
+
+
+@pytest.mark.asyncio
+async def test_git_and_conhost_three_times_each_produce_no_finding(test_db):
+    agent_id, sid = await _setup(test_db, "friction_git")
+    await _insert(test_db, agent_id, sid, "proc_spawn", "git.exe", [0, 1, 2], {"args": []})
+    await _insert(test_db, agent_id, sid, "proc_spawn", "conhost.exe", [0, 1, 2], {"args": []})
+    await _insert(test_db, agent_id, sid, "proc_spawn", r"\??\C:\Windows\system32\conhost.exe 0x4", [0, 1, 2, 3, 4, 5])
+    await _insert(test_db, agent_id, sid, "proc_spawn", r"C:\Windows\system32\cmd.exe /d /s /c npx foo", [0, 1, 2, 3])
+    assert _retry(await _derive_friction_findings(test_db, session_id=sid)) == []
+
+
+@pytest.mark.asyncio
+async def test_twenty_claude_file_history_writes_produce_no_finding(test_db):
+    agent_id, sid = await _setup(test_db, "friction_cache")
+    for i in range(20):
+        await _insert(test_db, agent_id, sid, "file_write", rf"C:\Users\dev/.claude/file-history/abc\{i:016x}@v1", [i])
+    await _insert(test_db, agent_id, sid, "file_write", r"C:\Users\dev\AppData\Local\Temp\claude-0056-cwd", [0, 1, 2, 3, 4, 5])
+    await _insert(test_db, agent_id, sid, "file_write", r"C:\Windows\System32\config\systemprofile\AppData\x.dat", [0, 1, 2, 3, 4, 5])
+    await _insert(test_db, agent_id, sid, "file_write", r"C:\Users\dev/.claude/shell-snapshots/snapshot-bash-1.sh", [0, 1, 2, 3, 4, 5])
+    assert _retry(await _derive_friction_findings(test_db, session_id=sid)) == []
+
+
+@pytest.mark.asyncio
+async def test_five_writes_to_one_project_file_in_ten_minutes_produce_one_medium_finding(test_db):
+    agent_id, sid = await _setup(test_db, "friction_file")
+    path = r"C:\work\proj\src\app.py"
+    await _insert(test_db, agent_id, sid, "file_write", path, [0, 60, 120, 180, 240])
+    found = _retry(await _derive_friction_findings(test_db, session_id=sid))
+    assert len(found) == 1
+    assert found[0]["confidence"] == "medium" and found[0]["filepath"] == path and found[0]["session_id"] == sid
+    assert found[0]["evidence"] == f"{path} file_write 5 times within 10 minutes"
+
+    four_agent, four_sid = await _setup(test_db, "friction_file4")
+    await _insert(test_db, four_agent, four_sid, "file_write", path, [0, 60, 120, 180])
+    assert _retry(await _derive_friction_findings(test_db, session_id=four_sid)) == [], "4 writes is below the threshold"
+
+    ten_agent, ten_sid = await _setup(test_db, "friction_file10")
+    await _insert(test_db, ten_agent, ten_sid, "file_write", path, [i * 30 for i in range(10)])
+    assert _retry(await _derive_friction_findings(test_db, session_id=ten_sid))[0]["confidence"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_three_different_project_files_produce_no_finding(test_db):
+    agent_id, sid = await _setup(test_db, "friction_diff")
+    for name in ("a.py", "b.py", "c.py"):
+        await _insert(test_db, agent_id, sid, "file_write", rf"C:\work\proj\src\{name}", [0, 60, 120])
+    assert _retry(await _derive_friction_findings(test_db, session_id=sid)) == []
+
+
+@pytest.mark.asyncio
+async def test_the_same_command_spawned_three_times_produces_one_finding_and_different_commands_do_not(test_db):
+    agent_id, sid = await _setup(test_db, "friction_cmd")
+    cmd = r"C:\Python313\python.exe -m pytest tests/test_a.py"
+    await _insert(test_db, agent_id, sid, "proc_spawn", cmd, [0, 30, 60], {"args": ["python.exe", "-m", "pytest", "tests/test_a.py"]})
+    found = _retry(await _derive_friction_findings(test_db, session_id=sid))
+    assert len(found) == 1 and found[0]["confidence"] == "medium"
+    assert found[0]["evidence"] == f"{cmd} proc_spawn 3 times within 10 minutes"
+
+    other_agent, other_sid = await _setup(test_db, "friction_cmd2")
+    await _insert(test_db, other_agent, other_sid, "proc_spawn", "python.exe", [0, 30], {"args": ["python.exe", "a.py"]})
+    await _insert(test_db, other_agent, other_sid, "proc_spawn", "python.exe", [40, 50], {"args": ["python.exe", "b.py"]})
+    assert _retry(await _derive_friction_findings(test_db, session_id=other_sid)) == [], "two commands, two spawns each"
+
+
+@pytest.mark.asyncio
+async def test_session_abandoned_is_not_emitted_for_a_forty_minute_session(test_db, monkeypatch):
+    agent_id, sid = await _setup(test_db, "friction_abandon")
+    started = (datetime.now(timezone.utc) - timedelta(minutes=40)).strftime("%Y-%m-%d %H:%M:%S")
+    await test_db.execute("INSERT INTO sessions (id, agent_id, started_at) VALUES (?, ?, ?)", (sid, agent_id, started))
+    await test_db.commit()
+    findings = await _derive_friction_findings(test_db, session_id=sid)
+    assert [f for f in findings if f["finding_type"] == "session_abandoned"] == []
+
+    # the code is kept behind the switch
+    assert mcp_service.EMIT_SESSION_ABANDONED is False
+    monkeypatch.setattr(mcp_service, "EMIT_SESSION_ABANDONED", True)
+    findings = await _derive_friction_findings(test_db, session_id=sid)
+    assert [f["finding_type"] for f in findings if f["finding_type"] == "session_abandoned"] == ["session_abandoned"]
+
+
+@pytest.mark.asyncio
+async def test_rapid_revert_is_unchanged(test_db):
+    agent_id, sid = await _setup(test_db, "friction_revert")
+    await _insert(test_db, agent_id, sid, "file_write", r"C:\work\proj\src\x.py", [0, 30])
+    found = [f for f in await _derive_friction_findings(test_db, session_id=sid) if f["finding_type"] == "rapid_revert"]
+    assert len(found) == 1 and found[0]["confidence"] == "medium"
+
+
+def test_the_thresholds_and_exclusion_lists_are_the_documented_ones():
+    assert mcp_service.RETRY_THRESHOLD_FILE_WRITE == 5 and mcp_service.RETRY_THRESHOLD_PROC_SPAWN == 3
+    assert mcp_service.RETRY_WINDOW_MINUTES == 10 and mcp_service.RETRY_HIGH_MULTIPLIER == 2
+    for name in ("conhost", "git", "cmd", "powershell", "pwsh", "bash", "sh"):
+        assert name in mcp_service.FRICTION_IGNORED_PROCESSES
+    assert "claude" not in mcp_service.FRICTION_IGNORED_PROCESSES and "codex" not in mcp_service.FRICTION_IGNORED_PROCESSES
+    for part in ("/.claude/file-history/", "shell-snapshots", "/systemprofile/"):
+        assert part in mcp_service.FRICTION_IGNORED_PATH_PARTS
+    assert mcp_service._is_ignored_friction_path(r"C:\x\claude-0056-cwd")
+    assert not mcp_service._is_ignored_friction_path(r"C:\work\proj\src\app.py")
+
+
+# ------------------------------------------------------------------ rapid_revert skips the same cache paths as retry_loop
+
+def _revert(findings):
+    return [f for f in findings if f["finding_type"] == "rapid_revert"]
+
+
+@pytest.mark.asyncio
+async def test_two_writes_to_a_claude_file_history_path_within_60_seconds_produce_no_rapid_revert(test_db):
+    agent_id, sid = await _setup(test_db, "revert_cache")
+    for path in (
+        r"C:\Users\dev/.claude/file-history/3f265984/c855fd1c9b67a3c2@v1",
+        r"C:\Users\dev\AppData\Local\Temp\claude-0056-cwd",
+        r"C:\Users\dev/.claude/shell-snapshots/snapshot-bash-1.sh",
+        r"C:\Windows\System32\config\systemprofile\AppData\x.dat",
+        r"C:\Users\dev\AppData\Local\Temp\scratch.tmp",
+    ):
+        await _insert(test_db, agent_id, sid, "file_write", path, [0, 30])
+    assert _revert(await _derive_friction_findings(test_db, session_id=sid)) == []
+
+
+@pytest.mark.asyncio
+async def test_two_writes_to_a_project_file_within_60_seconds_still_produce_one_rapid_revert(test_db):
+    agent_id, sid = await _setup(test_db, "revert_project")
+    path = r"C:\work\proj\src\app.py"
+    await _insert(test_db, agent_id, sid, "file_write", path, [0, 30])
+    found = _revert(await _derive_friction_findings(test_db, session_id=sid))
+    assert len(found) == 1 and found[0]["filepath"] == path and found[0]["confidence"] == "medium"
+    assert found[0]["evidence"].startswith("written again within 60 seconds (prev write at ")
+
+    # the rule is otherwise as before: 61 seconds apart is not a revert, and another session's write does not count
+    far_agent, far_sid = await _setup(test_db, "revert_far")
+    await _insert(test_db, far_agent, far_sid, "file_write", path, [0, 90])
+    assert _revert(await _derive_friction_findings(test_db, session_id=far_sid)) == []
+    mix_agent, mix_sid = await _setup(test_db, "revert_mixed")
+    other_sid = _uniq("sess")
+    await _insert(test_db, mix_agent, mix_sid, "file_write", path, [0])
+    await _insert(test_db, mix_agent, other_sid, "file_write", path, [10])
+    assert _revert(await _derive_friction_findings(test_db, session_id=mix_sid)) == []
+
+
+def test_retry_loop_and_rapid_revert_share_one_exclusion_list_and_one_sql_filter():
+    import inspect
+
+    source = inspect.getsource(mcp_service._derive_friction_findings)
+    assert source.count("_FRICTION_SQL_PATH_FILTER") == 2, "both queries use the shared SQL filter"
+    assert source.count("_is_ignored_friction_path") == 2, "both rules use the shared path check"
+    assert "file-history" not in source and "shell-snapshots" not in source, "the lists are not repeated in the rule"
+
+
+# ------------------------------------------------------------------ generated output and tool temp files, both rules
+
+GENERATED_AND_TEMP_PATHS = (
+    "tray/dist/win-unpacked/x.dll",
+    r"tray\dist\win-unpacked\resources.pak",
+    "frontend/vite.config.js.timestamp-1.mjs",
+    "tray/main.js.tmp.123",
+    "vigil-vscode/out/extension.js",
+    "src/.app.py.swp",
+    r"docs\~$notes.docx",
+    "web/node_modules/pkg/index.js",
+    "build/output.o",
+)
+
+
+@pytest.mark.asyncio
+async def test_generated_output_and_tool_temp_files_produce_no_rapid_revert_and_no_retry_loop(test_db):
+    agent_id, sid = await _setup(test_db, "generated_paths")
+    for path in GENERATED_AND_TEMP_PATHS:
+        await _insert(test_db, agent_id, sid, "file_write", path, [0, 30, 60, 90, 120, 150])   # twice within 60 s, and 6 in 10 min
+    findings = await _derive_friction_findings(test_db, session_id=sid)
+    assert _retry(findings) == [] and _revert(findings) == []
+    for path in GENERATED_AND_TEMP_PATHS:
+        assert mcp_service._is_ignored_friction_path(path), path
+
+
+@pytest.mark.asyncio
+async def test_a_normal_project_file_still_gives_one_rapid_revert_and_one_retry_loop(test_db):
+    agent_id, sid = await _setup(test_db, "normal_path")
+    await _insert(test_db, agent_id, sid, "file_write", "src/app.py", [0, 30])
+    findings = await _derive_friction_findings(test_db, session_id=sid)
+    assert len(_revert(findings)) == 1 and _retry(findings) == []
+
+    other_agent, other_sid = await _setup(test_db, "normal_path_retry")
+    await _insert(test_db, other_agent, other_sid, "file_write", "src/app.py", [0, 60, 120, 180, 240])
+    assert len(_retry(await _derive_friction_findings(test_db, session_id=other_sid))) == 1
+
+
+def test_names_that_only_look_like_temp_or_generated_are_not_ignored():
+    for path in ("src/outline.py", "src/layout.py", "docs/build-notes.md", "src/distance.py", "src/app.py", "tray/main.js"):
+        assert not mcp_service._is_ignored_friction_path(path), path
+
+
+def test_the_generated_check_is_the_shared_one_and_only_the_gaps_were_added():
+    import inspect
+
+    from core.activity_filter import is_generated_path
+
+    assert "is_generated_path" in inspect.getsource(mcp_service._is_ignored_friction_path)
+    # covered by the shared check, so not repeated in FRICTION_IGNORED_PATH_PARTS
+    for covered in ("/dist/", "/build/", "/node_modules/", "/.venv/"):
+        assert covered not in mcp_service.FRICTION_IGNORED_PATH_PARTS
+    assert is_generated_path("tray/dist/win-unpacked/x.dll") and is_generated_path("a/build/b")
+    # not covered by it, so listed
+    assert not is_generated_path("vigil-vscode/out/extension.js")
+    for gap in ("/out/", "/win-unpacked/", ".tmp.", ".timestamp-", "~$", ".swp"):
+        assert gap in mcp_service.FRICTION_IGNORED_PATH_PARTS

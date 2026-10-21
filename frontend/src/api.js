@@ -100,3 +100,10 @@ export const api = {
     }).catch(() => {})
   },
 }
+
+// Sessions that count as sessions: a resumed one with no real activity (Vigil only found the agent already
+// running when it started watching) comes back from /sessions with has_activity false and is left out of
+// "has sessions", "recording since" and the empty state. An older backend without the field shows everything.
+export function realSessions(sessions) {
+  return (sessions || []).filter((s) => s.has_activity !== false)
+}

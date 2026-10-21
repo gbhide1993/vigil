@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { api } from '../api'
+import { api, realSessions } from '../api'
 
 const DISMISSED_KEY = 'vlaw_insight_card_dismissed'
 
@@ -13,7 +13,7 @@ export default function SessionInsightCard() {
     async function load() {
       try {
         const sessionsData = await api.getSessions()
-        const sessions = sessionsData.sessions
+        const sessions = realSessions(sessionsData.sessions)
         if (sessions.length === 0) return
         // Sessions come back ordered most-recent-first; the first session is
         // the oldest one, which is what this card is meant to summarise.

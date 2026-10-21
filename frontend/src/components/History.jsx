@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api } from '../api'
+import { api, realSessions } from '../api'
 import { isIntentQuery, parseQuery } from '../queryParser'
 import CopyButton from './CopyButton'
 
@@ -175,7 +175,7 @@ export default function History() {
         if (cancelled) return
         setStats(statsData)
         setEvents(eventsData.events)
-        setSessions(sessionsData.sessions)
+        setSessions(realSessions(sessionsData.sessions))
         setNetworkMonitoring(healthData.network_monitoring ?? null)
         setError(null)
       } catch (err) {
