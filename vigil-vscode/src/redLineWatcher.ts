@@ -30,9 +30,9 @@ export class RedLineWatcher {
 
   private notify(event: RedLineEvent) {
     vscode.window
-      .showWarningMessage(`🔴 Vigil Red Line: ${event.description}`, 'View Evidence')
+      .showWarningMessage(`🔴 Vigil Red Line: ${event.description}`, 'Open Vigil')
       .then((selection) => {
-        if (selection === 'View Evidence') {
+        if (selection === 'Open Vigil') {
           vscode.env.openExternal(vscode.Uri.parse(`http://127.0.0.1:${this.port}`));
         }
       });

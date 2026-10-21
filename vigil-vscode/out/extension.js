@@ -49,14 +49,14 @@ async function activate(context) {
     console.log('[VIGIL TRACE][activate] entered activate()');
     const config = vscode.workspace.getConfiguration('vigil');
     const port = config.get('apiPort', 7422);
-    const pollIntervalSeconds = config.get('pollIntervalSeconds', 10);
+    const pollIntervalSeconds = config.get('pollIntervalSeconds', 30);
     const showFileDecorations = config.get('showFileDecorations', true);
     const redLineNotifications = config.get('redLineNotifications', true);
     const backendManager = new backendManager_1.BackendManager(context, port);
     const api = new api_1.VigilAPI(port);
     const statusBar = new statusBar_1.StatusBarManager(api, backendManager);
     context.subscriptions.push({ dispose: () => statusBar.dispose() });
-    const sessionProvider = new sidebarProvider_1.SessionTreeProvider(api);
+    const sessionProvider = new sidebarProvider_1.SessionTreeProvider(api, () => backendManager.backendMissing);
     const redLineProvider = new sidebarProvider_1.RedLineTreeProvider(api);
     const findingsProvider = new sidebarProvider_1.FindingsTreeProvider(api);
     context.subscriptions.push(vscode.window.registerTreeDataProvider('vigil.currentSession', sessionProvider));
@@ -71,7 +71,7 @@ async function activate(context) {
     if (redLineNotifications) {
         redLineWatcher = new redLineWatcher_1.RedLineWatcher(api, port);
     }
-    const refreshAll = async () => {
+    const refreshAllOnce = async () => {
         await Promise.all([
             statusBar.refresh(),
             (async () => {
@@ -101,6 +101,20 @@ async function activate(context) {
         }
         if (redLineWatcher) {
             await redLineWatcher.poll();
+        }
+    };
+    // One refresh at a time: if the backend is slow or down, cycles must not pile up.
+    let refreshing = false;
+    const refreshAll = async () => {
+        if (refreshing) {
+            return;
+        }
+        refreshing = true;
+        try {
+            await refreshAllOnce();
+        }
+        finally {
+            refreshing = false;
         }
     };
     context.subscriptions.push(vscode.commands.registerCommand('vigil.openDashboard', () => {
@@ -142,11 +156,11 @@ async function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand('vigil.copyEvidenceHash', async () => {
         const summary = await api.getEvidenceSummary();
         if (!summary || !summary.evidence_hash) {
-            vscode.window.showErrorMessage('Vigil: no evidence hash available.');
+            vscode.window.showErrorMessage('Vigil: no session summary hash available.');
             return;
         }
         await vscode.env.clipboard.writeText(summary.evidence_hash);
-        vscode.window.showInformationMessage('Evidence hash copied');
+        vscode.window.showInformationMessage('Session summary hash copied');
     }));
     console.log('[VIGIL TRACE][activate] before await backendManager.ensureVigilRunning()');
     const running = await backendManager.ensureVigilRunning();

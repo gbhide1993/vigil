@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.27] - 2026-10-19
+### Fixed
+- Starting an installed Vigil from VS Code now works. VS Code runs extensions with `ELECTRON_RUN_AS_NODE=1`, which the Vigil tray app (also Electron) inherited, so it started as plain Node and exited at once. The extension now removes that variable before launching Vigil and starts it in its own folder
+
+## [0.2.26] - 2026-10-19
+### Fixed
+- "Files touched" now shows the real count (the backend returns a number, the extension was reading it as an empty list)
+- The extension no longer force-kills `vigil-backend.exe`. If the backend process is running but not answering, it shows a message and leaves the process alone
+- Fewer health checks: one shared check per refresh (3 second timeout, reused for 2 seconds), and refreshes no longer overlap when the backend is slow or down
+- The installer now runs without freezing VS Code (5 minute limit, exit code checked and reported)
+- "Vigil: Install Backend" is now listed in the Command Palette (it was registered but not declared)
+- Poll interval default is 30 seconds in code, matching the setting
+
+### Changed
+- No download prompt at startup. If Vigil is not installed, the Vigil sidebar shows an install panel with "Install Vigil backend" and "Download installer only". The consent dialog appears only after you click Install
+- Status bar shows "Vigil: Not installed" with a click-to-install action when no backend is found
+- Wording: "View Evidence" is now "Open Vigil", the report tooltip no longer says "evidence report", and the copy command says "Session summary hash copied"
+
 ## [0.2.25] - 2026-10-14
 ### Changed
 - README rewritten to match Vigil 0.9.0: network and MCP monitoring moved to "Not in this version",

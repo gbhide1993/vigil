@@ -75,10 +75,20 @@ class BaseTreeProvider {
     }
 }
 class SessionTreeProvider extends BaseTreeProvider {
+    constructor(api, isBackendMissing = () => false) {
+        super(api);
+        this.isBackendMissing = isBackendMissing;
+    }
     async refresh() {
         const online = await this.api.isOnline();
         if (!online) {
             console.log('[VIGIL DEBUG][SessionTreeProvider.refresh] branch=offline');
+            if (this.isBackendMissing()) {
+                // An empty tree lets the install panel (viewsWelcome) show.
+                this.rootItems = [];
+                this.fireChange();
+                return;
+            }
             this.rootItems = [
                 new VigilTreeItem('Vigil is not running', vscode.TreeItemCollapsibleState.None, {
                     iconPath: new vscode.ThemeIcon('eye-closed')
@@ -111,6 +121,7 @@ class SessionTreeProvider extends BaseTreeProvider {
     }
     buildSessionItems(session) {
         const fileChildren = session.files_touched.map((f) => new VigilTreeItem(f, vscode.TreeItemCollapsibleState.None, { iconPath: new vscode.ThemeIcon('file') }));
+        const filesCount = session.files_touched.length > 0 ? session.files_touched.length : session.files_touched_count;
         const items = [
             new VigilTreeItem('Agent', vscode.TreeItemCollapsibleState.None, {
                 description: session.agent ?? 'Unknown',
@@ -124,7 +135,7 @@ class SessionTreeProvider extends BaseTreeProvider {
                 description: session.status,
                 iconPath: new vscode.ThemeIcon('pulse')
             }),
-            new VigilTreeItem(`Files touched (${session.files_touched.length})`, session.files_touched.length > 0
+            new VigilTreeItem(`Files touched (${filesCount})`, session.files_touched.length > 0
                 ? vscode.TreeItemCollapsibleState.Collapsed
                 : vscode.TreeItemCollapsibleState.None, { iconPath: new vscode.ThemeIcon('files'), children: fileChildren }),
             new VigilTreeItem('Friction Signals', vscode.TreeItemCollapsibleState.None, {
@@ -140,7 +151,7 @@ class SessionTreeProvider extends BaseTreeProvider {
         // briefly precede attribution assigning it one.
         if (session.session_id) {
             items.push(new VigilTreeItem('Download Session Report (PDF)', vscode.TreeItemCollapsibleState.None, {
-                tooltip: 'Download a PDF evidence report for this session',
+                tooltip: 'Download a PDF report of this session',
                 iconPath: new vscode.ThemeIcon('cloud-download'),
                 command: {
                     command: 'vigil.downloadSessionReport',
