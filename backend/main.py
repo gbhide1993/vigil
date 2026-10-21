@@ -105,7 +105,8 @@ from core.insights import get_insights
 from core.instance_lock import InstanceAlreadyRunning, acquire_instance_lock, release_instance_lock
 from core.log_setup import configure_logging
 from core.scope_store import get_scope_directories
-from core.monitoring_status import mcp_monitoring, network_monitoring
+from core import watch_stats
+from core.monitoring_status import file_watcher_tier, mcp_monitoring, network_monitoring
 from core.red_lines import SESSION_LAUNCH_DIR
 from db.database import DB_PATH, close_db, get_db, get_read_db, init_db
 from license.license_service import LicenseService
@@ -119,7 +120,7 @@ LOG_PATH = os.environ.get("VLAW_LOG_FILE") or os.path.join(BASE_DIR, "vlaw-backe
 logger = configure_logging(LOG_PATH)
 logger.info("V-LAW backend starting. BASE_DIR=%s", BASE_DIR)
 
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 PORT = int(os.environ.get("VLAW_PORT", 7422))
 
 # Shared with the API routes through core/runtime_state.py (NOT through `import main`,
@@ -320,6 +321,10 @@ async def lifespan(app: FastAPI):
     # one a user set earlier, is always kept.
     policy = {**policy, "scope_directories": await get_scope_directories(await get_db())}
     watch_paths, red_line_non_recursive_dirs = build_watch_paths(policy)
+    # What the ETW tier is allowed to record (core/scope_filter.py): the same folders the other tiers watch, plus the
+    # never-scope folders (a change there is a critical alert, so it must get through).
+    from core.scope_filter import etw_scope
+    etw_scope.set_roots(list(watch_paths) + list(red_line_non_recursive_dirs) + list(policy.get("never_scope_directories", [])))
     observer, file_handler = start_file_watcher(
         attributor, aggregator, watch_paths, red_line_non_recursive_dirs,
         process_watcher=process_watcher, network_watcher=network_watcher,
@@ -857,6 +862,11 @@ async def health():
         "baseline_active": baseline_active,
         "agents_watching": agents_watching,
         "file_watcher_alive": observer.is_alive() if observer else False,
+        # Which tier is running ("etw" or "folders") and what it saw but did not record, since start. An evidence
+        # tool says when it dropped events: dropped_total is changes lost because too many arrived at once;
+        # outside_scope_not_recorded is ETW events outside the watched folders (counted, never recorded).
+        "file_watcher_tier": file_watcher_tier(),
+        "file_events_not_recorded": watch_stats.summary(),
         # Read from the scheduler's real state ("off" while the watcher's
         # job is not registered), never a constant.
         "network_monitoring": network_monitoring(),

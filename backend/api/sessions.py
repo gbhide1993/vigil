@@ -448,6 +448,13 @@ async def get_session_report_pdf(session_id: str):
                 c.setFont("Helvetica", 8.5)
             c.drawString(margin, y, part)
             y -= 0.15 * inch
+    for line in report_coverage.not_recorded_lines():
+        for part in _wrap_text(line, 105):
+            if y < margin:
+                y = new_page()
+                c.setFont("Helvetica", 8.5)
+            c.drawString(margin, y, part)
+            y -= 0.15 * inch
     y -= 0.2 * inch
 
     # While network monitoring is off a count of 0 means "not measured".

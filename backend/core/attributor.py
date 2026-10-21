@@ -1,6 +1,7 @@
 """Maps OS-level signals (PID, network destination) to the agent that
 caused them. This is the core of V-LAW's per-agent attribution."""
 
+import asyncio
 import json
 import sqlite3
 import time
@@ -141,11 +142,19 @@ def _purge_stale_attribution_cache() -> None:
             _agent_attribution_cache.pop(pid, None)
 
 
+# How often an agent's last_seen and pid are written. Every file event of a recognised agent calls
+# get_or_create_agent; one SELECT, UPDATE and commit per event was most of the cost of a busy agent. The agent id
+# itself never changes, so it is remembered; last_seen and pid can be up to this many seconds old.
+AGENT_LAST_SEEN_WRITE_SECONDS = 60.0
+
+
 class Attributor:
     def __init__(self):
         self.alerter = Alerter()
         self.sessions = SessionManager()
         self.behaviour_detector = BehaviourDetector()
+        self._agent_cache: dict = {"db": None, "ids": {}}
+        self._agent_locks: dict[str, asyncio.Lock] = {}
 
     def get_agent_for_pid(self, pid: int, pid_snapshot: dict[int, dict] | None = None) -> str | None:
         """Match a PID to a known agent by process name, walking up the
@@ -361,6 +370,35 @@ class Attributor:
         Ignored for every other agent name."""
         db = await get_db()
 
+        # The hot path (every file event of a recognised agent) must not touch the database: the agent's id is
+        # remembered, and last_seen / pid are written at most once per AGENT_LAST_SEEN_WRITE_SECONDS.
+        cached = self._cached_agent(db, name)
+        if cached is not None and time.monotonic() - cached[1] < AGENT_LAST_SEEN_WRITE_SECONDS:
+            return cached[0]
+
+        # Everything below is one agent's slow path. Under a burst, many first events for the same agent arrive
+        # together; without this lock each would find no row and insert its own (duplicate agents, and a session
+        # for each). The first one does the work, the others find the cache filled.
+        async with self._agent_lock(name):
+            return await self._get_or_create_agent_locked(db, name, pid, confidence)
+
+    def _agent_lock(self, name: str) -> asyncio.Lock:
+        return self._agent_locks.setdefault(name, asyncio.Lock())
+
+    async def _get_or_create_agent_locked(self, db, name: str, pid: int | None, confidence: float | None) -> int:
+        cached = self._cached_agent(db, name)
+        if cached is not None:
+            agent_id, written_at = cached
+            if time.monotonic() - written_at < AGENT_LAST_SEEN_WRITE_SECONDS:
+                return agent_id
+            await db.execute(
+                "UPDATE agents SET last_seen = CURRENT_TIMESTAMP, pid = ? WHERE id = ?",
+                (pid, agent_id),
+            )
+            await db.commit()
+            self._remember_agent(db, name, agent_id)
+            return agent_id
+
         cur = await db.execute("SELECT id FROM agents WHERE name = ?", (name,))
         row = await cur.fetchone()
 
@@ -370,6 +408,7 @@ class Attributor:
                 (pid, row["id"]),
             )
             await db.commit()
+            self._remember_agent(db, name, row["id"])
             return row["id"]
 
         is_approved = await self._is_approved_agent(db, name)
@@ -383,29 +422,51 @@ class Attributor:
         )
         await db.commit()
         agent_id = cur.lastrowid
+        self._remember_agent(db, name, agent_id)
 
         if not is_approved:
             await self._fire_unapproved_agent_alert(db, agent_id, name, pid, confidence)
 
         return agent_id
 
+    def _cached_agent(self, db, name: str) -> tuple[int, float] | None:
+        """(agent id, monotonic time of the last last_seen write) if this agent name is already known on THIS
+        connection. The cache belongs to one database connection: a different one (a replaced connection, another
+        test database) starts empty, so an id is never carried over to a database that did not issue it."""
+        if self._agent_cache.get("db") is not db:
+            self._agent_cache = {"db": db, "ids": {}}
+        return self._agent_cache["ids"].get(name)
+
+    def _remember_agent(self, db, name: str, agent_id: int) -> None:
+        self._cached_agent(db, name)
+        self._agent_cache["ids"][name] = (agent_id, time.monotonic())
+
     async def get_or_create_unattributed_agent(self) -> int:
         """The agent row that holds writes nobody could be blamed for (two or more agents running, nothing to tell
         them apart). It is a label for "cannot tell", not a program: created approved and with no pid, so it raises
         no unapproved-agent alert."""
         db = await get_db()
-        cur = await db.execute("SELECT id FROM agents WHERE name = ?", (UNATTRIBUTED_AGENT,))
-        row = await cur.fetchone()
-        if row is not None:
-            await db.execute("UPDATE agents SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", (row["id"],))
+        cached = self._cached_agent(db, UNATTRIBUTED_AGENT)
+        if cached is not None and time.monotonic() - cached[1] < AGENT_LAST_SEEN_WRITE_SECONDS:
+            return cached[0]
+        async with self._agent_lock(UNATTRIBUTED_AGENT):
+            cached = self._cached_agent(db, UNATTRIBUTED_AGENT)
+            if cached is not None and time.monotonic() - cached[1] < AGENT_LAST_SEEN_WRITE_SECONDS:
+                return cached[0]
+            cur = await db.execute("SELECT id FROM agents WHERE name = ?", (UNATTRIBUTED_AGENT,))
+            row = await cur.fetchone()
+            if row is not None:
+                await db.execute("UPDATE agents SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", (row["id"],))
+                await db.commit()
+                self._remember_agent(db, UNATTRIBUTED_AGENT, row["id"])
+                return row["id"]
+            cur = await db.execute(
+                "INSERT INTO agents (name, process_name, pid, approved) VALUES (?, ?, NULL, 1)",
+                (UNATTRIBUTED_AGENT, UNATTRIBUTED_AGENT),
+            )
             await db.commit()
-            return row["id"]
-        cur = await db.execute(
-            "INSERT INTO agents (name, process_name, pid, approved) VALUES (?, ?, NULL, 1)",
-            (UNATTRIBUTED_AGENT, UNATTRIBUTED_AGENT),
-        )
-        await db.commit()
-        return cur.lastrowid
+            self._remember_agent(db, UNATTRIBUTED_AGENT, cur.lastrowid)
+            return cur.lastrowid
 
     async def _is_approved_agent(self, db, name: str) -> bool:
         cur = await db.execute(

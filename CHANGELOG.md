@@ -1,7 +1,30 @@
 # Changelog
 
 Product versions follow the installer (Vigil-Setup.exe). The VS Code extension has its own changelog in vigil-vscode/CHANGELOG.md.
-## 0.9.2 (unreleased)
+## 0.9.3 (unreleased)
+
+### Fixed
+- ETW tier: events outside the watched folders, the credential paths and the agents' own folders (`~/.claude`, `~/.codex`) are now decided from memory, before the agent lookup and before anything reaches the database, and are only counted. A recognised agent's desktop app writing its own cache, crash-report and log files produced thousands of events a second, each costing a SELECT, an UPDATE and a commit, and delayed the aggregator's writes (a batch of 19 events took 168 s on one machine). `GET /health` returns `file_watcher_tier` and `file_events_not_recorded` (dropped by reason, and outside-scope counts, since start), and the per-session PDF prints them when they are not zero.
+- An agent's database id is remembered, and its `last_seen` and `pid` are written at most once a minute instead of on every file event. Many first events for a new agent arriving together no longer create duplicate agent rows.
+- ETW device paths (`\Device\HarddiskVolume3\...`) are converted to drive-letter paths before scope checks and storage.
+- The activity check for ignored helper processes is cheap again: a session made of conhost and Vigil spawns no longer takes seconds to check. The current-session call runs on a read-only connection instead of the writer's.
+- The ETW filter also lets through persistence locations, so a write that makes code run later is still recorded wherever it happens: the user's Startup folder, PowerShell profiles (`profile.ps1`, `Microsoft.PowerShell_profile.ps1`, `Microsoft.VSCode_profile.ps1` under `WindowsPowerShell` or `PowerShell`), the shell profiles in the home folder (`.bashrc`, `.bash_profile`, `.bash_login`, `.profile`, `.zshrc`, `.zprofile`, `.zshenv`) and `~/.gitconfig`. A write there outside a watched folder raises the usual out-of-scope alert.
+- The post-install launch of Vigil runs as the user who started Setup (`runasoriginaluser`), not elevated.
+
+### Added
+- `VLAW_FILE_WATCHER` (`auto`, `etw`, `native`, `polling`) forces the file-watching tier, for comparing them on one machine.
+
+### Changed
+- The ETW tier no longer records every change a recognised agent makes anywhere on the computer; the report note and `docs/COVERAGE.md` say what it records now. Changes outside the watched places are counted, not stored, so an out-of-scope alert is no longer raised for them.
+
+### Known limits
+- Still not recorded by the ETW tier outside the watched places: a change to a project's own `.vscode/settings.json`, `.cursor/config` or `.mcp.json` in a folder that is not watched. Red Line 7b (a config write followed by an execution within 2 seconds) can then only start from the watched places and `~/.claude`, and a file write elsewhere no longer counts as its trigger (a process spawn still does). Red Line 8 (`.mcp.json`) also needs the MCP watcher, which is off in this version.
+- The never-scope and credential folders the ETW filter lets through are read at start; a change to them in the policy file needs a restart (watched folders added or removed in Settings apply at once).
+- Events already stored with the raw device path are not rewritten (stored events are part of the hash chain).
+- The counts of dropped and outside-scope changes are for the whole backend run, not per session, and reset when it restarts.
+- The 168 s batch time seen on one machine was not reproduced in a test; the load test shows the flood no longer reaches the database or drops real events, but another cause of slow writes on that machine is not ruled out.
+
+## 0.9.2 (not released; superseded by 0.9.3)
 
 ### Fixed
 - File writes that two or more agents could have made, and that nothing narrows down (not in `~/.claude` or `~/.codex`, and the open-handle check does not name one process), are no longer given to whichever agent came first. They are recorded under the agent `unattributed` with confidence low, and shown as "<n> agents active, cannot tell which wrote this" in the dashboard, and the session and daily reports. With one agent running, nothing changes.

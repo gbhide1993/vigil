@@ -27,5 +27,24 @@ LINES = [
 ]
 
 
+def not_recorded_lines() -> list[str]:
+    """What Vigil saw since it started and did not record, for the per-session PDF. Empty when nothing was lost, so
+    a clean report has no extra line. The counts are for the whole backend run, not for one session."""
+    from core import watch_stats
+    from core.monitoring_status import file_watcher_tier
+
+    since = watch_stats.since_iso()
+    lines = []
+    dropped = watch_stats.dropped_total()
+    if dropped:
+        lines.append(f"Since {since} UTC, {dropped} file changes were not recorded because too many arrived at once "
+                     "(counted for the whole run, not only this session).")
+    outside = watch_stats.out_of_scope_total()
+    if outside and file_watcher_tier() == "etw":
+        lines.append(f"Since {since} UTC, {outside} file events outside the watched folders were seen and not recorded "
+                     "(counted only).")
+    return lines
+
+
 def as_dict() -> dict:
     return {"title": TITLE, "lines": list(LINES)}
