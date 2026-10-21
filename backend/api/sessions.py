@@ -14,7 +14,7 @@ from core.digest import display_summary
 from core.file_changes import scope_label, session_changes
 from core.monitoring_status import network_monitoring
 from core.scope_store import get_scope_directories
-from core.sessions import has_activity_exists_sql, is_idle, last_activity_by_open_session, session_visible_sql
+from core.sessions import is_idle, last_activity_by_open_session, session_event_aggregates
 from core.verification import build_verification_report, touches_credential_path
 from db.database import get_read_db
 
@@ -56,34 +56,35 @@ async def get_sessions(status: str | None = Query(default=None)):
         # status=open is "current" sessions: a resumed session with no real activity (Vigil only found the agent
         # already running) is not one. The row stays in the default listing, flagged has_activity=false, and
         # is still available by id to the reports.
-        where = f"WHERE s.ended_at IS NULL AND {session_visible_sql('s')}" if status == "open" else ""
+        where = "WHERE s.ended_at IS NULL" if status == "open" else ""
+        # Per session: the net_connect count, whether it has real activity (core.sessions.activity_event_sql, the
+        # single definition) and its newest event. They come from core.sessions.session_event_aggregates, which keeps
+        # them in memory and folds in only the events added since the last poll, so this endpoint (polled every
+        # 3 seconds) no longer scans the events table each time.
+        aggregates = await session_event_aggregates(db)
         cur = await db.execute(
             f"""
-            SELECT s.*, a.name as agent_name,
-                {has_activity_exists_sql('s')} as has_activity,
-                COALESCE(nc.net_connect_count, 0) as net_connect_count
+            SELECT s.*, a.name as agent_name
             FROM sessions s
             LEFT JOIN agents a ON a.id = s.agent_id
-            LEFT JOIN (
-                SELECT session_id, COUNT(*) as net_connect_count
-                FROM events
-                WHERE event_type = 'net_connect'
-                GROUP BY session_id
-            ) nc ON nc.session_id = s.id
             {where}
             ORDER BY s.started_at DESC
             """
         )
-        rows = await cur.fetchall()
-        sessions = [dict(r) for r in rows]
-        # One query for all open sessions. Display only: the idle sweep is off, so an open session whose newest
-        # event is older than the idle timeout is flagged idle here; nothing is written.
-        last_activity = await last_activity_by_open_session(db)
-        for s in sessions:
+        sessions = []
+        for r in await cur.fetchall():
+            s = dict(r)
+            agg = aggregates.get(s["id"])
+            s["has_activity"] = bool(agg and agg["has_activity"])
+            if status == "open" and not s["has_activity"]:
+                continue   # only a session with real activity is a current one
+            s["net_connect_count"] = agg["net_connect_count"] if agg else 0
             s["summary"] = display_summary(s.get("summary"))
-            s["has_activity"] = bool(s["has_activity"])
-            s["last_activity_at"] = last_activity.get(s["id"]) if s["ended_at"] is None else None
+            # Display only: the idle sweep is off, so an open session whose newest event is older than the idle
+            # timeout is flagged idle here; nothing is written.
+            s["last_activity_at"] = (agg["last_event_at"] if agg else s["started_at"]) if s["ended_at"] is None else None
             s["idle"] = bool(s["last_activity_at"]) and is_idle(s["last_activity_at"])
+            sessions.append(s)
         return {"sessions": sessions}
     finally:
         await db.close()
