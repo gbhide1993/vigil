@@ -11,7 +11,11 @@ Product versions follow the installer (Vigil-Setup.exe). The VS Code extension h
 - The ETW filter also lets through persistence locations, so a write that makes code run later is still recorded wherever it happens: the user's Startup folder, PowerShell profiles (`profile.ps1`, `Microsoft.PowerShell_profile.ps1`, `Microsoft.VSCode_profile.ps1` under `WindowsPowerShell` or `PowerShell`), the shell profiles in the home folder (`.bashrc`, `.bash_profile`, `.bash_login`, `.profile`, `.zshrc`, `.zprofile`, `.zshenv`) and `~/.gitconfig`. A write there outside a watched folder raises the usual out-of-scope alert.
 - The post-install launch of Vigil runs as the user who started Setup (`runasoriginaluser`), not elevated.
 
+### Limits
+- Normal installs run the folder watcher; ETW needs an elevated backend and is not verified end to end.
+
 ### Added
+- `GET /health` reports `etw_available` and `etw_unavailable_reason` (for example "kernel tracing needs administrator"); the tray tooltip shows the reason while ETW is not running. `file_watcher_tier` is now `etw`, `native` or `polling` instead of `folders` for both fallbacks.
 - `VLAW_FILE_WATCHER` (`auto`, `etw`, `native`, `polling`) forces the file-watching tier, for comparing them on one machine.
 
 ### Changed

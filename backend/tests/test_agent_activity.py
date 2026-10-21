@@ -303,6 +303,20 @@ def test_tray_tooltip_wording():
     assert out["review"].endswith("2 alerts need review.") and out["review1"].endswith("1 alert needs review.")
 
 
+def test_tray_tooltip_says_why_kernel_tracing_is_off():
+    out = _node("""
+    import { createRequire } from 'node:module'
+    const { trayStatusText } = createRequire(import.meta.url)('./tray/status-text.js')
+    console.log(JSON.stringify({
+      off: trayStatusText({ agents: [], etwUnavailableReason: 'kernel tracing needs administrator' }),
+      on: trayStatusText({ agents: [], etwUnavailableReason: null }),
+      long: trayStatusText({ agents: [], etwUnavailableReason: 'x'.repeat(300) }).length,
+    }))
+    """)
+    assert out["off"] == "Vigil: watching (kernel tracing needs administrator)"
+    assert out["on"] == "Vigil: watching" and out["long"] <= 127
+
+
 def test_tray_and_sidebar_use_the_backend_definition():
     tray = (ROOT / "tray" / "main.js").read_text(encoding="utf-8")
     assert "trayStatusText" in tray and "session in progress" not in tray and "Live:" not in tray

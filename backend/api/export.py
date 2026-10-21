@@ -197,7 +197,7 @@ FILE_SCOPE_NOTE_ETW = (
 
 NO_WATCHED_FOLDERS_TEXT = "No project folders are watched yet. Add one in Settings."
 ATTRIBUTION_NOTE = (
-    "Without ETW, file changes are attributed to the agent running at the time. "
+    "Kernel file tracing is not running, so file changes are attributed to the agent running at the time. "
     "A change made by you may be shown under an agent."
 )
 
@@ -1132,7 +1132,7 @@ async def export_pdf(date: str = Query(default="today")):
     if summary.get("watched_folders") is not None:
         folders = summary["watched_folders"]
         if summary.get("file_watcher_tier") == "etw":
-            y = draw(y, "File tracing: kernel (all recognised agent file changes)", "Helvetica", 9, 0.2 * inch)
+            y = draw(y, "File tracing: kernel (recognised agent changes in the watched set; other changes counted, not recorded)", "Helvetica", 9, 0.2 * inch)
         if folders:
             y = draw(y, f"Watched folders ({len(folders)}):", "Helvetica", 9, 0.2 * inch)
             for folder in folders:

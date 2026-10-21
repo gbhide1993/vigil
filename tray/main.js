@@ -438,9 +438,10 @@ async function updateTrayTooltip() {
   try {
     // The alert count comes from /api/stats's needs_review (open, severity high or critical),
     // the same definition the Status page and the Incidents sidebar badge use.
-    const [agentsRes, statsRes] = await Promise.all([
+    const [agentsRes, statsRes, healthRes] = await Promise.all([
       httpRequest('GET', '/api/agents'),
       httpRequest('GET', '/api/stats'),
+      httpRequest('GET', '/api/health').catch(() => ({})),
     ])
 
     // What the words mean is decided by the backend (core/agent_activity.py): "active" is real
@@ -449,6 +450,8 @@ async function updateTrayTooltip() {
     tray.setToolTip(trayStatusText({
       agents: (agentsRes.body && agentsRes.body.agents) || [],
       needsReview: (statsRes.body && statsRes.body.needs_review) || 0,
+      // /api/health: why kernel tracing is not running (a normal, non-elevated install), shown after the status.
+      etwUnavailableReason: (healthRes.body && healthRes.body.etw_available === false && healthRes.body.etw_unavailable_reason) || null,
     }))
   } catch (err) {
     // non-fatal — tooltip just keeps its last known text until this succeeds again

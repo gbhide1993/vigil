@@ -14,7 +14,7 @@ LINES = [
     "File writes and deletes and process spawns are recorded.",
     "File reads are not recorded.",
     "Network and MCP calls are not monitored in this version.",
-    "Attribution to an agent is a best guess without the ETW tier.",
+    "Attribution to an agent is a best guess, based on file location and which agents are running.",
     "Generated folders (node_modules, .venv, dist, build) are ignored.",
     "Records stay on this machine.",
     "A change to a credential file is flagged, but reading one is not detected, so the Red Lines that "

@@ -10,7 +10,20 @@ function names(agents) {
   return agents.map((a) => a.name || 'agent').join(', ')
 }
 
-function trayStatusText({ agents = [], needsReview = 0 } = {}) {
+// Windows cuts a tray tooltip at 127 characters.
+const MAX_TOOLTIP = 127
+
+function withEtwNote(text, etwUnavailableReason) {
+  if (!etwUnavailableReason) return text
+  const full = `${text} (${etwUnavailableReason})`
+  return full.length <= MAX_TOOLTIP ? full : `${full.slice(0, MAX_TOOLTIP - 1)}…`
+}
+
+function trayStatusText({ agents = [], needsReview = 0, etwUnavailableReason = null } = {}) {
+  return withEtwNote(baseStatusText({ agents, needsReview }), etwUnavailableReason)
+}
+
+function baseStatusText({ agents = [], needsReview = 0 } = {}) {
   if (needsReview > 0) {
     return `Vigil — ${needsReview} alert${needsReview !== 1 ? 's' : ''} need${needsReview !== 1 ? '' : 's'} review.`
   }

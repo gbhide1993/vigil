@@ -175,11 +175,11 @@ def _scope_roundtrip(tmp_path, launch, expect_tier):
         tier = before["file_watcher_tier"]
         print(f"[scope-test] watcher tier: {tier}; backend answered /api/health {time.monotonic() - launched:.1f}s after launch")
         assert status == 200
-        if tier != expect_tier:
+        if tier != expect_tier and not (expect_tier == "folders" and tier in ("native", "polling")):
             if expect_tier == "etw":
                 pytest.skip(f"ETW tier did not start (tier is {tier!r}); see the log lines printed above")
             pytest.fail(f"expected the {expect_tier!r} tier, got {tier!r}")
-        folder_tier = tier == "folders"
+        folder_tier = tier in ("native", "polling")
         stored = Path(project).resolve().as_posix()
         assert stored.lower() not in _norm(before["observed_paths"])
 
@@ -225,7 +225,7 @@ def test_scope_add_and_remove_reach_the_observer_when_main_runs_as___main__(tmp_
     """main running as __main__ (as in the PyInstaller exe), on the folder tier on every machine: adding
     and removing a folder through the API changes what the live observer watches, with no restart."""
     tier = _scope_roundtrip(tmp_path, [sys.executable, "-c", FOLDER_TIER_LAUNCH], expect_tier="folders")
-    assert tier == "folders"
+    assert tier in ("native", "polling")
 
 
 def _is_elevated() -> bool:

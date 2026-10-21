@@ -396,7 +396,7 @@ function WatchedFoldersSection() {
         record files being read. Changes in other folders are not recorded.
       </p>
       {tier === 'etw' && (
-        <p className="settings-desc">Kernel file tracing is active, so changes made by recognised agents are recorded anywhere on this computer.</p>
+        <p className="settings-desc">Kernel file tracing is active: changes made by recognised agents are recorded in the watched folders and credential locations. Changes elsewhere are counted, not recorded.</p>
       )}
       {folders.length === 0 && (
         <div className="empty-state">No project folders are watched yet. Add one below.</div>
