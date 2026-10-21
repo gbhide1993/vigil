@@ -260,3 +260,62 @@ def test_retry_loop_and_rapid_revert_share_one_exclusion_list_and_one_sql_filter
     assert source.count("_FRICTION_SQL_PATH_FILTER") == 2, "both queries use the shared SQL filter"
     assert source.count("_is_ignored_friction_path") == 2, "both rules use the shared path check"
     assert "file-history" not in source and "shell-snapshots" not in source, "the lists are not repeated in the rule"
+
+
+# ------------------------------------------------------------------ generated output and tool temp files, both rules
+
+GENERATED_AND_TEMP_PATHS = (
+    "tray/dist/win-unpacked/x.dll",
+    r"tray\dist\win-unpacked\resources.pak",
+    "frontend/vite.config.js.timestamp-1.mjs",
+    "tray/main.js.tmp.123",
+    "vigil-vscode/out/extension.js",
+    "src/.app.py.swp",
+    r"docs\~$notes.docx",
+    "web/node_modules/pkg/index.js",
+    "build/output.o",
+)
+
+
+@pytest.mark.asyncio
+async def test_generated_output_and_tool_temp_files_produce_no_rapid_revert_and_no_retry_loop(test_db):
+    agent_id, sid = await _setup(test_db, "generated_paths")
+    for path in GENERATED_AND_TEMP_PATHS:
+        await _insert(test_db, agent_id, sid, "file_write", path, [0, 30, 60, 90, 120, 150])   # twice within 60 s, and 6 in 10 min
+    findings = await _derive_friction_findings(test_db, session_id=sid)
+    assert _retry(findings) == [] and _revert(findings) == []
+    for path in GENERATED_AND_TEMP_PATHS:
+        assert mcp_service._is_ignored_friction_path(path), path
+
+
+@pytest.mark.asyncio
+async def test_a_normal_project_file_still_gives_one_rapid_revert_and_one_retry_loop(test_db):
+    agent_id, sid = await _setup(test_db, "normal_path")
+    await _insert(test_db, agent_id, sid, "file_write", "src/app.py", [0, 30])
+    findings = await _derive_friction_findings(test_db, session_id=sid)
+    assert len(_revert(findings)) == 1 and _retry(findings) == []
+
+    other_agent, other_sid = await _setup(test_db, "normal_path_retry")
+    await _insert(test_db, other_agent, other_sid, "file_write", "src/app.py", [0, 60, 120, 180, 240])
+    assert len(_retry(await _derive_friction_findings(test_db, session_id=other_sid))) == 1
+
+
+def test_names_that_only_look_like_temp_or_generated_are_not_ignored():
+    for path in ("src/outline.py", "src/layout.py", "docs/build-notes.md", "src/distance.py", "src/app.py", "tray/main.js"):
+        assert not mcp_service._is_ignored_friction_path(path), path
+
+
+def test_the_generated_check_is_the_shared_one_and_only_the_gaps_were_added():
+    import inspect
+
+    from core.activity_filter import is_generated_path
+
+    assert "is_generated_path" in inspect.getsource(mcp_service._is_ignored_friction_path)
+    # covered by the shared check, so not repeated in FRICTION_IGNORED_PATH_PARTS
+    for covered in ("/dist/", "/build/", "/node_modules/", "/.venv/"):
+        assert covered not in mcp_service.FRICTION_IGNORED_PATH_PARTS
+    assert is_generated_path("tray/dist/win-unpacked/x.dll") and is_generated_path("a/build/b")
+    # not covered by it, so listed
+    assert not is_generated_path("vigil-vscode/out/extension.js")
+    for gap in ("/out/", "/win-unpacked/", ".tmp.", ".timestamp-", "~$", ".swp"):
+        assert gap in mcp_service.FRICTION_IGNORED_PATH_PARTS

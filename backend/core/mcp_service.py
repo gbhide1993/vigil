@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 
+from core.activity_filter import is_generated_path
 from core.sessions import has_activity_exists_sql, is_idle, last_activity_by_open_session, session_visible_sql
 from db.database import get_db, get_read_db
 
@@ -339,6 +340,15 @@ FRICTION_IGNORED_PATH_PARTS = (
     "/appdata/local/temp/",        # temp files of any tool
     "/windows/temp/",
     "/systemprofile/",             # the SYSTEM account's profile: services writing their own state
+    # Build output the shared generated-path check (core/activity_filter.is_generated_path, used below) does not know:
+    # it covers dist, build, node_modules, .venv, caches and .git, but not these.
+    "/out/",                       # compiler output folders (for example vigil-vscode/out)
+    "/win-unpacked/",              # electron-builder output; also under dist/, listed for other output folders
+    # Editor and tool temp names:
+    ".tmp.",                       # atomic-save temp files such as main.js.tmp.20932.2518734f0f79
+    ".timestamp-",                 # Vite's temporary config copies, vite.config.js.timestamp-<n>-<hash>.mjs
+    "~$",                          # Microsoft Office lock files, ~$document.docx
+    ".swp",                        # vim swap files
 )
 _CLAUDE_CWD_MARKER = re.compile(r"claude-[0-9a-f]+-cwd")   # Claude Code's working-directory marker files
 
@@ -367,8 +377,14 @@ def _norm_path(path: str | None) -> str:
 
 
 def _is_ignored_friction_path(path: str | None) -> bool:
+    """Not work on the user's files: an agent tool's bookkeeping, a temp file, or generated output. Generated
+    folders come from core.activity_filter.is_generated_path (not repeated here)."""
     low = _norm_path(path)
-    return any(part in low for part in FRICTION_IGNORED_PATH_PARTS) or bool(_CLAUDE_CWD_MARKER.search(low))
+    return (
+        any(part in low for part in FRICTION_IGNORED_PATH_PARTS)
+        or bool(_CLAUDE_CWD_MARKER.search(low))
+        or is_generated_path(path)
+    )
 
 
 def _executable_stem(path: str | None) -> str:
