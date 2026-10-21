@@ -40,6 +40,8 @@ ACTIVITY_IGNORED_CHILD_PROCESSES = frozenset({
     "conhost",    # the Windows console host: started for every console program, including an idle agent's own
     "wslhost",    # WSL's console/host helper
     "werfault",   # Windows Error Reporting, started when something crashes
+    "vigil",          # Vigil's own tray app: its processes are not the agent's activity
+    "vigil-backend",  # Vigil's own backend
 })
 _IGNORED_CHILDREN_SQL = ", ".join(
     f"'{name}', '{name}.exe'" for name in sorted(ACTIVITY_IGNORED_CHILD_PROCESSES)
