@@ -100,7 +100,9 @@ async def add_scope(body: ScopeRequest, request: Request):
     observer, handler = _live()
     applied_live, message = False, RESTART_TO_WATCH
     if _is_etw(observer):
-        applied_live, message = True, None       # kernel tracing already sees every recognised agent's changes
+        from core.scope_filter import etw_scope
+        etw_scope.add_root(stored)               # the ETW tier records only what is inside the watched roots
+        applied_live, message = True, None
     elif observer is not None and handler is not None:
         try:
             applied_live = bool(watch_folder(observer, handler, stored))
@@ -138,6 +140,8 @@ async def remove_scope(body: ScopeRequest, request: Request):
     observer, _handler = _live()
     applied_live, message = False, RESTART_TO_STOP
     if _is_etw(observer):
+        from core.scope_filter import etw_scope
+        etw_scope.remove_root(stored)
         applied_live, message = True, None
     elif observer is not None:
         try:

@@ -73,13 +73,19 @@ def _is_ignored_child_sql(expr: str) -> str:
     """SQL true when the command line in `expr` (already lower-case) is one of ACTIVITY_IGNORED_CHILD_PROCESSES by
     executable base name: the bare name, or a path (either slash, optionally quoted or with the \\??\\ prefix) ending
     in name.exe, with or without arguments after it. Names are plain (letters and hyphens), so LIKE needs no escaping."""
-    tests = []
+    bare = ", ".join(f"'{name}', '{name}.exe'" for name in sorted(ACTIVITY_IGNORED_CHILD_PROCESSES))
+    like_tests = []
     for name in sorted(ACTIVITY_IGNORED_CHILD_PROCESSES):
-        tests.append(f"{expr} IN ('{name}', '{name}.exe')")
-        tests.append(f"{expr} LIKE '{name}.exe %' OR {expr} LIKE '{name} %' OR {expr} LIKE '\"{name}.exe\"%'")
+        like_tests.append(f"{expr} LIKE '{name}.exe %' OR {expr} LIKE '{name} %' OR {expr} LIKE '\"{name}.exe\"%'")
         for sep in ("\\", "/"):
-            tests.append(f"{expr} LIKE '%{sep}{name}.exe' OR {expr} LIKE '%{sep}{name}.exe %' OR {expr} LIKE '%{sep}{name}.exe\"%'")
-    return "(" + " OR ".join(tests) + ")"
+            like_tests.append(f"{expr} LIKE '%{sep}{name}.exe' OR {expr} LIKE '%{sep}{name}.exe %' OR {expr} LIKE '%{sep}{name}.exe\"%'")
+    # The recorder stores the bare executable name, so nearly every row is decided by the first, cheap test (an IN
+    # list) or by the GLOB: only a command that has a folder, a space or a quote in it (a whole command line) goes
+    # on to the ~50 LIKE tests. Without that, a session made of ignored spawns cost a full scan per check.
+    return (
+        f"({expr} IN ({bare}) OR "
+        f"({expr} GLOB '*[\\/ \"]*' AND ({' OR '.join(like_tests)})))"
+    )
 
 
 def activity_event_sql(event_alias: str = "ra") -> str:

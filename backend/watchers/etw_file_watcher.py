@@ -38,7 +38,9 @@ import time
 
 from core.attributor import Attributor
 from core import watch_stats
+from core.device_paths import normalise_device_path
 from core.ignore_rules import ignore_and_count
+from core.scope_filter import etw_scope
 
 logger = logging.getLogger("vlaw")
 
@@ -126,8 +128,10 @@ class ETWFileWatcher:
     after start() returns True -- from that point on, any problem is
     logged and this watcher simply stops producing events."""
 
-    def __init__(self, attributor: Attributor):
+    def __init__(self, attributor: Attributor, scope=None):
         self.attributor = attributor
+        # Decides, from memory only, whether an event is worth an agent lookup and a database write at all.
+        self._scope = scope if scope is not None else etw_scope
         self._callback = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -253,7 +257,7 @@ class ETWFileWatcher:
             file_object = event.get_u64(FILEOBJECT_PROPERTY)
 
             if event_id in CACHE_SEED_EVENT_IDS:
-                path = self._extract_path(event)
+                path = normalise_device_path(self._extract_path(event))
                 if path and file_object is not None:
                     self._cache_file_object(file_object, path)
 
@@ -261,7 +265,9 @@ class ETWFileWatcher:
             if event_type is None:
                 return  # a cache-seed-only event (e.g. plain Create/open), not itself reportable
 
-            path = self._extract_path(event)
+            # ETW names files by NT device path (\\Device\\HarddiskVolume3\\...); everything after this point,
+            # and everything stored, uses the drive-letter form (core/device_paths.py).
+            path = normalise_device_path(self._extract_path(event))
             if path is None and file_object is not None:
                 path = self._file_object_cache.get(file_object)
             if not path:
@@ -270,6 +276,14 @@ class ETWFileWatcher:
             # Generated / dependency folders are dropped here, before the
             # attribution lookup and any dispatch (core/ignore_rules.py).
             if ignore_and_count(path):
+                return
+
+            # Outside the watched folders, the credential paths and the agents' own state folders: counted in
+            # memory and dropped here, before the agent lookup and before anything is scheduled onto the event
+            # loop (core/scope_filter.py). A recognised agent's app writing its own cache and crash-report files
+            # produced thousands of these a second.
+            if not self._scope.allows(path):
+                watch_stats.add_out_of_scope()
                 return
 
             pid = event.process_id

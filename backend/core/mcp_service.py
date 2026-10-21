@@ -53,7 +53,16 @@ def _expand_file_paths(row) -> list[str]:
 
 
 async def _get_current_session(params: dict) -> dict:
-    db = await get_db()
+    # A read-only connection of its own, not the shared writer connection: this is polled by the editor extension, and
+    # every query run on the shared connection waits behind (and delays) the aggregator's writes.
+    db = await get_read_db()
+    try:
+        return await _get_current_session_on(db, params)
+    finally:
+        await db.close()
+
+
+async def _get_current_session_on(db, params: dict) -> dict:
 
     # A resumed session with no real activity (Vigil only found the agent already running at startup, and
     # nothing happened after) is not a current session: it is skipped here, not reported as active.

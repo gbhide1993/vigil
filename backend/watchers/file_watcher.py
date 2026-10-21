@@ -808,6 +808,21 @@ def _schedule_paths(observer, handler: VlawFileHandler, watch_paths: list[str], 
             observer.schedule(handler, expanded, recursive=False)
 
 
+# Forces which file-watching tier to use, for comparing them on one machine. "auto" (the default) is the order in the
+# module docstring: ETW, then the native observer, then polling. "native" skips ETW; "polling" skips ETW and the native
+# observer; "etw" is the same as auto (ETW is already tried first, and a tier that cannot start still falls back).
+FILE_WATCHER_ENV = "VLAW_FILE_WATCHER"
+FILE_WATCHER_CHOICES = ("auto", "etw", "native", "polling")
+
+
+def requested_file_watcher_tier() -> str:
+    value = (os.environ.get(FILE_WATCHER_ENV) or "auto").strip().lower()
+    if value not in FILE_WATCHER_CHOICES:
+        logger.warning("file watcher: %s=%r is not one of %s; using auto", FILE_WATCHER_ENV, value, ", ".join(FILE_WATCHER_CHOICES))
+        return "auto"
+    return value
+
+
 def start_file_watcher(
     attributor: Attributor, aggregator, watch_paths: list[str], non_recursive_paths: list[str] | None = None,
     process_watcher=None, network_watcher=None,
@@ -826,15 +841,19 @@ def start_file_watcher(
     (see VlawFileHandler.check_burst) purely so it can read their
     get_snapshot()/get_recent_events() — nothing here calls into them."""
     loop = asyncio.get_event_loop()
+    requested = requested_file_watcher_tier()
+    if requested != "auto":
+        logger.info("file watcher: %s=%s", FILE_WATCHER_ENV, requested)
 
-    etw_watcher = ETWFileWatcher(attributor)
-    etw_handler = VlawFileHandler(
-        attributor, aggregator, loop, pid_cache=None,
-        process_watcher=process_watcher, network_watcher=network_watcher,
-    )
-    etw_watcher.set_callback(etw_handler.handle_etw_event)
-    if etw_watcher.start():
-        return etw_watcher, etw_handler
+    if requested in ("auto", "etw"):
+        etw_watcher = ETWFileWatcher(attributor)
+        etw_handler = VlawFileHandler(
+            attributor, aggregator, loop, pid_cache=None,
+            process_watcher=process_watcher, network_watcher=network_watcher,
+        )
+        etw_watcher.set_callback(etw_handler.handle_etw_event)
+        if etw_watcher.start():
+            return etw_watcher, etw_handler
 
     # Only built for tiers 2/3 (ETW never guesses a pid, so never needs
     # this) -- starts its own background refresh thread, see _AgentPidCache.
@@ -847,7 +866,7 @@ def start_file_watcher(
     # original, still-valid reason this file used PollingObserver
     # exclusively before ETW/native support existed), so Docker keeps using
     # polling unconditionally rather than attempting tier 2 first.
-    use_native = not os.environ.get("VLAW_HOST_ROOT")
+    use_native = not os.environ.get("VLAW_HOST_ROOT") and requested != "polling"
 
     if use_native:
         try:

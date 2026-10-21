@@ -5,7 +5,7 @@
 ; build.bat runs check-version.js and stops if they differ.
 
 #define AppName "Vigil"
-#define AppVersion "0.9.2"
+#define AppVersion "0.9.3"
 #define AppPublisher "Vvault Technologies"
 #define AppURL "https://getvvault.com/vigil"
 #define AppExeName "Vigil.exe"
@@ -83,8 +83,9 @@ Root: HKA; Subkey: "Software\Vigil"; ValueType: string; ValueName: "InstallPath"
 Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "Vigil"; Flags: deletevalue
 
 [Run]
-; Launch Vigil after install
-Filename: "{app}\tray\{#AppExeName}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+; Launch Vigil after install. Setup runs elevated; without runasoriginaluser the tray (and the backend it starts)
+; would run elevated too, and could not be stopped from a normal shell.
+Filename: "{app}\tray\{#AppExeName}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [Code]
 const

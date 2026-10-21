@@ -191,8 +191,8 @@ FILE_SCOPE_NOTE = (
     "Changes elsewhere are not recorded."
 )
 FILE_SCOPE_NOTE_ETW = (
-    "Kernel file tracing is active: file changes made by recognised agents are recorded wherever they happen "
-    "on this computer, not only in watched folders."
+    "Kernel file tracing is active: file changes made by recognised agents are recorded in watched folders, in "
+    "credential locations and in the agents' own folders (~/.claude, ~/.codex). Changes elsewhere are counted, not recorded."
 )
 
 NO_WATCHED_FOLDERS_TEXT = "No project folders are watched yet. Add one in Settings."
@@ -230,6 +230,10 @@ def dropped_changes_note(count: int) -> str:
     return f"{count} file changes were not recorded because too many arrived at once."
 
 
+def outside_scope_note(count: int) -> str:
+    return f"{count} file events outside the watched folders were seen and not recorded (counted only)."
+
+
 def current_report_notes() -> list[str]:
     notes = list(REPORT_NOTES)
     if network_monitoring() == "off":
@@ -246,6 +250,9 @@ def current_report_notes() -> list[str]:
     dropped = watch_stats.dropped_total()
     if dropped > 0:
         notes.append(dropped_changes_note(dropped))
+    outside = watch_stats.out_of_scope_total()
+    if outside > 0 and file_watcher_tier() == "etw":
+        notes.append(outside_scope_note(outside))
     return notes
 
 # Alerts whose description ends in the spawned command line (see
@@ -650,6 +657,7 @@ async def _build_summary(date: str, tz=None) -> dict:
     coverage["ignored_generated_changes"] = watch_stats.ignored_total() if ignore_rules.is_enabled() else 0
     coverage["ignored_by_folder"] = watch_stats.ignored_by_folder() if ignore_rules.is_enabled() else {}
     coverage["dropped_file_changes"] = watch_stats.dropped_total()
+    coverage["outside_scope_not_recorded"] = watch_stats.out_of_scope_total()
     coverage["ignore_counts_since"] = watch_stats.since_iso()
 
     return {
