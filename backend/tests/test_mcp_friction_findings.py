@@ -211,3 +211,52 @@ def test_the_thresholds_and_exclusion_lists_are_the_documented_ones():
         assert part in mcp_service.FRICTION_IGNORED_PATH_PARTS
     assert mcp_service._is_ignored_friction_path(r"C:\x\claude-0056-cwd")
     assert not mcp_service._is_ignored_friction_path(r"C:\work\proj\src\app.py")
+
+
+# ------------------------------------------------------------------ rapid_revert skips the same cache paths as retry_loop
+
+def _revert(findings):
+    return [f for f in findings if f["finding_type"] == "rapid_revert"]
+
+
+@pytest.mark.asyncio
+async def test_two_writes_to_a_claude_file_history_path_within_60_seconds_produce_no_rapid_revert(test_db):
+    agent_id, sid = await _setup(test_db, "revert_cache")
+    for path in (
+        r"C:\Users\dev/.claude/file-history/3f265984/c855fd1c9b67a3c2@v1",
+        r"C:\Users\dev\AppData\Local\Temp\claude-0056-cwd",
+        r"C:\Users\dev/.claude/shell-snapshots/snapshot-bash-1.sh",
+        r"C:\Windows\System32\config\systemprofile\AppData\x.dat",
+        r"C:\Users\dev\AppData\Local\Temp\scratch.tmp",
+    ):
+        await _insert(test_db, agent_id, sid, "file_write", path, [0, 30])
+    assert _revert(await _derive_friction_findings(test_db, session_id=sid)) == []
+
+
+@pytest.mark.asyncio
+async def test_two_writes_to_a_project_file_within_60_seconds_still_produce_one_rapid_revert(test_db):
+    agent_id, sid = await _setup(test_db, "revert_project")
+    path = r"C:\work\proj\src\app.py"
+    await _insert(test_db, agent_id, sid, "file_write", path, [0, 30])
+    found = _revert(await _derive_friction_findings(test_db, session_id=sid))
+    assert len(found) == 1 and found[0]["filepath"] == path and found[0]["confidence"] == "medium"
+    assert found[0]["evidence"].startswith("written again within 60 seconds (prev write at ")
+
+    # the rule is otherwise as before: 61 seconds apart is not a revert, and another session's write does not count
+    far_agent, far_sid = await _setup(test_db, "revert_far")
+    await _insert(test_db, far_agent, far_sid, "file_write", path, [0, 90])
+    assert _revert(await _derive_friction_findings(test_db, session_id=far_sid)) == []
+    mix_agent, mix_sid = await _setup(test_db, "revert_mixed")
+    other_sid = _uniq("sess")
+    await _insert(test_db, mix_agent, mix_sid, "file_write", path, [0])
+    await _insert(test_db, mix_agent, other_sid, "file_write", path, [10])
+    assert _revert(await _derive_friction_findings(test_db, session_id=mix_sid)) == []
+
+
+def test_retry_loop_and_rapid_revert_share_one_exclusion_list_and_one_sql_filter():
+    import inspect
+
+    source = inspect.getsource(mcp_service._derive_friction_findings)
+    assert source.count("_FRICTION_SQL_PATH_FILTER") == 2, "both queries use the shared SQL filter"
+    assert source.count("_is_ignored_friction_path") == 2, "both rules use the shared path check"
+    assert "file-history" not in source and "shell-snapshots" not in source, "the lists are not repeated in the rule"

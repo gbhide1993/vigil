@@ -348,6 +348,20 @@ _CLAUDE_CWD_MARKER = re.compile(r"claude-[0-9a-f]+-cwd")   # Claude Code's worki
 EMIT_SESSION_ABANDONED = False
 
 
+# The SQL side of the same exclusions, shared by retry_loop and rapid_revert: Vigil's own footprint, and the cache
+# and snapshot paths (so they cannot crowd real events out of the row cap). The Python side is
+# FRICTION_IGNORED_PATH_PARTS / _is_ignored_friction_path above.
+_FRICTION_SQL_PATH_FILTER = """(path IS NULL OR (
+                    path NOT LIKE '%vigil-backend.exe%'
+                    AND path NOT LIKE '%\\Vigil\\tray\\Vigil.exe%'
+                    AND path NOT LIKE '%\\Vigil\\backend\\%'
+                    AND path NOT LIKE '%\\Vigil\\tray\\%'
+                    AND path NOT LIKE '%\\V-LAW\\%'
+                    AND path NOT LIKE '%file-history%'
+                    AND path NOT LIKE '%shell-snapshots%'
+              ))"""
+
+
 def _norm_path(path: str | None) -> str:
     return (path or "").replace("\\", "/").lower()
 
@@ -403,15 +417,7 @@ async def _derive_friction_findings(db, session_id: str | None = None) -> list[d
             FROM events
             WHERE session_id IS NOT NULL {session_clause}
               AND event_type IN ('file_write', 'proc_spawn')
-              AND (path IS NULL OR (
-                    path NOT LIKE '%vigil-backend.exe%'
-                    AND path NOT LIKE '%\\Vigil\\tray\\Vigil.exe%'
-                    AND path NOT LIKE '%\\Vigil\\backend\\%'
-                    AND path NOT LIKE '%\\Vigil\\tray\\%'
-                    AND path NOT LIKE '%\\V-LAW\\%'
-                    AND path NOT LIKE '%file-history%'
-                    AND path NOT LIKE '%shell-snapshots%'
-              ))
+              AND {_FRICTION_SQL_PATH_FILTER}
             ORDER BY created_at DESC
             LIMIT {row_limit}
         )
@@ -457,7 +463,9 @@ async def _derive_friction_findings(db, session_id: str | None = None) -> list[d
             else:
                 i += 1
 
-    # rapid_revert: same file written twice within 60 seconds by same session.
+    # rapid_revert: same file written twice within 60 seconds by same session. The rule is unchanged except that
+    # the cache, temp, shell-snapshot and claude-*-cwd paths are skipped (the same exclusions as retry_loop): Claude
+    # Code writes every checkpoint file twice in quick succession, which is not a revert.
     # Same row cap rationale as the retry_loop query above.
     cur = await db.execute(
         f"""
@@ -465,6 +473,7 @@ async def _derive_friction_findings(db, session_id: str | None = None) -> list[d
             SELECT session_id, event_type, created_at, path, detail
             FROM events
             WHERE event_type = 'file_write' AND session_id IS NOT NULL {session_clause}
+              AND {_FRICTION_SQL_PATH_FILTER}
             ORDER BY created_at DESC
             LIMIT {row_limit}
         )
@@ -482,6 +491,8 @@ async def _derive_friction_findings(db, session_id: str | None = None) -> list[d
         path_history: dict[str, str] = {}
         for row in writes:
             for path in _expand_file_paths(row):
+                if _is_ignored_friction_path(path):
+                    continue
                 prev_ts = path_history.get(path)
                 if prev_ts and _within_seconds(prev_ts, row["created_at"], 60):
                     findings.append({
