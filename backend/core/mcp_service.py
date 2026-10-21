@@ -5,6 +5,7 @@ populate — no new data collection, no writes, nothing that touches network.
 
 import hashlib
 import json
+import re
 
 from core.sessions import has_activity_exists_sql, is_idle, last_activity_by_open_session, session_visible_sql
 from db.database import get_db, get_read_db
@@ -304,37 +305,112 @@ async def _get_red_line_events(params: dict) -> list[dict]:
     ]
 
 
+# ---------------------------------------------------------------- friction findings: retry_loop settings
+# retry_loop means "the same thing, repeated, in a short time". The thresholds are judgment calls, not measured
+# values: they are set so ordinary work (one save and its formatter, one git command and its console host)
+# does not reach them, and they can be changed here without touching anything else.
+RETRY_WINDOW_MINUTES = 10
+RETRY_THRESHOLD_FILE_WRITE = 5      # the same file written 5+ times in the window
+RETRY_THRESHOLD_PROC_SPAWN = 3      # the same executable with the same command line spawned 3+ times in the window
+RETRY_THRESHOLDS = {"file_write": RETRY_THRESHOLD_FILE_WRITE, "proc_spawn": RETRY_THRESHOLD_PROC_SPAWN}
+# "high" at twice the threshold, otherwise "medium".
+RETRY_HIGH_MULTIPLIER = 2
+
+# Processes that are plumbing, not something the agent chose to run again. Skipped by retry_loop. Found by
+# listing the executables in the recorded proc_spawn events. Not HELPER_PROCESS_NAMES (core/activity_filter.py):
+# that set also holds agent names (claude, codex), and the same agent command repeated is still worth reporting.
+FRICTION_IGNORED_PROCESSES = frozenset({
+    "conhost",       # console host: Windows starts one for every console program, so it appears next to every command
+    "git",           # git runs several child git.exe per command, and editors poll it (git status) on a timer
+    "cmd", "powershell", "pwsh", "bash", "sh",   # shells that wrap every command an agent runs
+    "wsl", "wslhost",                            # WSL launchers
+    "werfault",                                  # Windows error reporting
+    "tasklist", "taskkill", "reg", "chcp", "where",   # one-shot Windows helpers called by tools and scripts
+    "codex-windows-sandbox-service",             # the Codex sandbox helper
+    "onedrive.sync.service",                     # OneDrive
+    "vigil-backend", "vlaw-backend", "vigil",    # Vigil's own processes
+})
+
+# Paths that are an agent tool's own bookkeeping, not work on the user's files. Compared lower-case with forward
+# slashes. Skipped by retry_loop.
+FRICTION_IGNORED_PATH_PARTS = (
+    "/.claude/file-history/",      # Claude Code checkpoint copies: one new file per edit, written in bursts of 100+
+    "shell-snapshots",             # Claude Code shell snapshot scripts
+    "/appdata/local/temp/",        # temp files of any tool
+    "/windows/temp/",
+    "/systemprofile/",             # the SYSTEM account's profile: services writing their own state
+)
+_CLAUDE_CWD_MARKER = re.compile(r"claude-[0-9a-f]+-cwd")   # Claude Code's working-directory marker files
+
+# session_abandoned ("older than 30 minutes with no commit event") is switched off: Vigil does not record commit
+# events, so the rule fired for almost every session (1,087 of 1,190 findings in one real database). The code stays
+# so it can come back when commits are recorded.
+EMIT_SESSION_ABANDONED = False
+
+
+def _norm_path(path: str | None) -> str:
+    return (path or "").replace("\\", "/").lower()
+
+
+def _is_ignored_friction_path(path: str | None) -> bool:
+    low = _norm_path(path)
+    return any(part in low for part in FRICTION_IGNORED_PATH_PARTS) or bool(_CLAUDE_CWD_MARKER.search(low))
+
+
+def _executable_stem(path: str | None) -> str:
+    """"C:\\Windows\\system32\\cmd.exe /d /s /c npx" -> "cmd"; "git.exe" -> "git"."""
+    match = re.search(r"([A-Za-z0-9_.\-]+)\.exe", path or "", re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+    first = (path or "").strip().split(" ")[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return re.sub(r"\.(exe|com|bin)$", "", first)
+
+
+def _command_key(row) -> str:
+    """The thing that repeated: for a process, the executable and its command line (the path column holds the
+    full command line when one was captured; the stored args are added when they are not already in it)."""
+    path = row["path"] or ""
+    try:
+        args = json.loads(row["detail"] or "{}").get("args") or []
+    except ValueError:
+        args = []
+    extra = " ".join(str(a) for a in args)
+    return path if not extra or extra in path else f"{path} {extra}"
+
+
 async def _derive_friction_findings(db, session_id: str | None = None) -> list[dict]:
     findings: list[dict] = []
 
     session_clause = "AND session_id = ?" if session_id else ""
     session_params = (session_id,) if session_id else ()
 
-    # retry_loop: same event_type called 3+ times in the same session within
-    # a 10-minute window. Capped to the most recent 100 events per session
-    # (unbounded scan of the whole events table was the dominant cost in
-    # get_friction_findings/get_evidence_summary timing out under load).
+    # retry_loop: the same file written, or the same command spawned, again and again in a short window, in one
+    # session. Grouped by (session, event type, path) and for processes by executable plus command line, so three
+    # different files or three different commands are not a loop. Only file_write and proc_spawn are considered
+    # (a repeated connection to one destination is normal keep-alive traffic and the network and MCP watchers are
+    # off). Thresholds and exclusions are the constants above. Capped to the most recent events (an unbounded scan of
+    # the whole events table was the dominant cost in get_friction_findings/get_evidence_summary timing out under
+    # load); the cache paths are left out in SQL as well so they cannot crowd the real events out of the cap.
     #
-    # Vigil's own footprint is excluded here so installing, debugging, or
-    # rebuilding Vigil itself doesn't get flagged as agent friction: our
-    # own backend repeatedly spawning (vigil-backend.exe) and our own tray
-    # repeatedly touching its own Electron install tree are not an agent
-    # retry loop. This is a path/process match only, not a blanket
-    # cmd.exe/conhost.exe exclusion -- a real agent legitimately spawning
-    # those is still exactly the kind of thing this finding should catch.
+    # Vigil's own footprint is excluded so installing, debugging, or rebuilding Vigil itself doesn't get flagged
+    # as agent friction: our own backend repeatedly spawning (vigil-backend.exe) and our own tray repeatedly
+    # touching its own Electron install tree are not an agent retry loop.
     row_limit = "100" if session_id else "2000"
     cur = await db.execute(
         f"""
-        SELECT session_id, event_type, created_at, path FROM (
-            SELECT session_id, event_type, created_at, path
+        SELECT session_id, event_type, created_at, path, detail FROM (
+            SELECT session_id, event_type, created_at, path, detail
             FROM events
             WHERE session_id IS NOT NULL {session_clause}
+              AND event_type IN ('file_write', 'proc_spawn')
               AND (path IS NULL OR (
                     path NOT LIKE '%vigil-backend.exe%'
                     AND path NOT LIKE '%\\Vigil\\tray\\Vigil.exe%'
                     AND path NOT LIKE '%\\Vigil\\backend\\%'
                     AND path NOT LIKE '%\\Vigil\\tray\\%'
                     AND path NOT LIKE '%\\V-LAW\\%'
+                    AND path NOT LIKE '%file-history%'
+                    AND path NOT LIKE '%shell-snapshots%'
               ))
             ORDER BY created_at DESC
             LIMIT {row_limit}
@@ -347,23 +423,34 @@ async def _derive_friction_findings(db, session_id: str | None = None) -> list[d
 
     buckets: dict[tuple, list] = {}
     for row in rows:
-        key = (row["session_id"], row["event_type"])
-        buckets.setdefault(key, []).append(row)
+        if not row["path"]:
+            continue
+        if row["event_type"] == "proc_spawn":
+            if _executable_stem(row["path"]) in FRICTION_IGNORED_PROCESSES:
+                continue
+            what = _command_key(row)
+        else:
+            if _is_ignored_friction_path(row["path"]):
+                continue
+            what = row["path"]
+        buckets.setdefault((row["session_id"], row["event_type"], what), []).append(row)
 
-    for (sid, event_type), evs in buckets.items():
+    for (sid, event_type, what), evs in buckets.items():
+        threshold = RETRY_THRESHOLDS[event_type]
         i = 0
         while i < len(evs):
             window_start = evs[i]["created_at"]
             j = i
-            while j < len(evs) and _within_minutes(window_start, evs[j]["created_at"], 10):
+            while j < len(evs) and _within_minutes(window_start, evs[j]["created_at"], RETRY_WINDOW_MINUTES):
                 j += 1
             count = j - i
-            if count >= 3:
+            if count >= threshold:
+                shown = what if len(what) <= 120 else what[:117] + "..."
                 findings.append({
                     "finding_type": "retry_loop",
-                    "confidence": "high" if count >= 5 else "medium",
+                    "confidence": "high" if count >= RETRY_HIGH_MULTIPLIER * threshold else "medium",
                     "filepath": evs[i]["path"],
-                    "evidence": f"{event_type} called {count} times within 10 minutes",
+                    "evidence": f"{shown} {event_type} {count} times within {RETRY_WINDOW_MINUTES} minutes",
                     "session_id": sid,
                 })
                 i = j
@@ -406,29 +493,31 @@ async def _derive_friction_findings(db, session_id: str | None = None) -> list[d
                     })
                 path_history[path] = row["created_at"]
 
-    # session_abandoned: session older than 30 minutes with no commit event.
-    cur = await db.execute(
-        f"""
-        SELECT id, started_at, ended_at FROM sessions
-        WHERE julianday('now') - julianday(started_at) > 0.02083 {("AND id = ?" if session_id else "")}
-        """,
-        session_params,
-    )
-    old_sessions = await cur.fetchall()
-    if old_sessions:
+    # session_abandoned: session older than 30 minutes with no commit event. Switched off (EMIT_SESSION_ABANDONED):
+    # Vigil does not record commit events, so every old session matched.
+    if EMIT_SESSION_ABANDONED:
         cur = await db.execute(
-            "SELECT DISTINCT session_id FROM events WHERE (event_type = 'commit' OR detail LIKE '%\"commit\"%') AND session_id IS NOT NULL"
+            f"""
+            SELECT id, started_at, ended_at FROM sessions
+            WHERE julianday('now') - julianday(started_at) > 0.02083 {("AND id = ?" if session_id else "")}
+            """,
+            session_params,
         )
-        sessions_with_commits = {row["session_id"] for row in await cur.fetchall()}
-        for s in old_sessions:
-            if s["id"] not in sessions_with_commits:
-                findings.append({
-                    "finding_type": "session_abandoned",
-                    "confidence": "low",
-                    "filepath": None,
-                    "evidence": "session older than 30 minutes with no commit event observed",
-                    "session_id": s["id"],
-                })
+        old_sessions = await cur.fetchall()
+        if old_sessions:
+            cur = await db.execute(
+                "SELECT DISTINCT session_id FROM events WHERE (event_type = 'commit' OR detail LIKE '%\"commit\"%') AND session_id IS NOT NULL"
+            )
+            sessions_with_commits = {row["session_id"] for row in await cur.fetchall()}
+            for s in old_sessions:
+                if s["id"] not in sessions_with_commits:
+                    findings.append({
+                        "finding_type": "session_abandoned",
+                        "confidence": "low",
+                        "filepath": None,
+                        "evidence": "session older than 30 minutes with no commit event observed",
+                        "session_id": s["id"],
+                    })
 
     return findings
 

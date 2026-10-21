@@ -7,6 +7,8 @@
 - Session lists and the current-session call now carry `has_activity`; the current-session call also carries `resumed`.
 - An open session with no event for more than 5 minutes is reported as idle (`status` "idle" and `last_activity_at` on the current-session call, `idle` and `last_activity_at` on session lists), and its report says "Idle since <time>" with the duration counted to that time. Display only: nothing is written and the idle sweep stays off.
 
+- Friction findings: `retry_loop` now means the same file written 5 or more times, or the same command spawned 3 or more times, within 10 minutes (it used to count any 3 events of one type). Console hosts, git, shells and Claude cache and temp files are skipped, the finding text says what repeated, and the `session_abandoned` finding is no longer produced because Vigil does not record commits.
+
 ### Known limits
 - The scheduled idle sweep is still off (disabled in e821731 pending an event-loop audit), so sessions still close lazily and durations and counts can be off.
 
