@@ -62,6 +62,9 @@ class _Attributor:
         self.created.append((name, pid))
         return len(self.created)
 
+    async def get_or_create_unattributed_agent(self):
+        return 99
+
 
 def _handler(names):
     attributor = _Attributor(names)
@@ -95,12 +98,20 @@ def test_a_write_under_dot_codex_goes_to_codex(no_open_handle_refinement):
     assert attributor.created == [("codex", 10)] and event["event_source"] == "path"
 
 
-def test_a_normal_project_path_keeps_the_heuristic(no_open_handle_refinement):
+def test_a_normal_project_path_gets_no_location_rule(no_open_handle_refinement):
+    # one agent running: the heuristic, as before
+    handler, attributor, recorder = _handler({10: "codex"})
+    asyncio.run(handler._handle_polled_event(r"C:\work\proj\src\app.py", "file_write", "write"))
+    (event,) = recorder.calls
+    assert event["event_source"] == "realtime_heuristic" and event["attribution_confidence"] == "medium"
+    assert attributor.created == [("codex", 10)]
+
+    # two agents running: no location rule applies, so it is not credited to either (tests/test_unattributed_writes.py)
     handler, attributor, recorder = _handler({10: "codex", 20: "claude_code"})
     asyncio.run(handler._handle_polled_event(r"C:\work\proj\src\app.py", "file_write", "write"))
     (event,) = recorder.calls
     assert event["event_source"] == "realtime_heuristic" and event["attribution_confidence"] == "low"
-    assert attributor.created == [("codex", 10)], "the first agent it finds, as before"
+    assert attributor.created == [] and event["agents_active"] == 2
 
 
 def test_an_agent_folder_whose_agent_is_not_running_keeps_the_heuristic(no_open_handle_refinement):

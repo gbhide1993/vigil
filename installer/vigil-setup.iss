@@ -5,7 +5,7 @@
 ; build.bat runs check-version.js and stops if they differ.
 
 #define AppName "Vigil"
-#define AppVersion "0.9.1"
+#define AppVersion "0.9.2"
 #define AppPublisher "Vvault Technologies"
 #define AppURL "https://getvvault.com/vigil"
 #define AppExeName "Vigil.exe"
@@ -127,6 +127,43 @@ begin
     Log('Could not change the per-user autostart entry');
 end;
 
+// Uninstaller only. Plain Exec, never ExecAsOriginalUser: that call belongs to Setup, and the per-user cleanup
+// must not depend on it. Every result is ignored on purpose, so a value or folder that is already gone (an earlier
+// uninstall that stopped half way) does not stop the steps after it, and running the uninstaller again is safe.
+procedure UninstallRemoveUserAutostart;
+var
+  ResultCode: Integer;
+begin
+  // The entry Setup writes, and the one Electron's setLoginItemSettings wrote in earlier versions: the same name.
+  Exec(ExpandConstant('{sys}\reg.exe'), 'delete "HKCU\' + RunKey + '" /v {#AutostartValue} /f', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure UninstallStopVigil;
+var
+  Script: String;
+begin
+  Script := ExpandConstant('{app}\tools\stop-vigil.ps1');
+  if FileExists(Script) then
+    RunStopScript(Script, '-AppDir "' + ExpandConstant('{app}') + '" -TimeoutSeconds 15')
+  else
+    Log('stop-vigil.ps1 is not there (an earlier uninstall removed it); nothing to stop by path');
+end;
+
+procedure UninstallRemoveUserData;
+var
+  ResultCode: Integer;
+begin
+  // %LOCALAPPDATA% and %APPDATA% are those of the account running the uninstaller.
+  // The evidence anchor counter and install id live in %LOCALAPPDATA%\V-LAW\keys (backend VLAW_KEY_DIR,
+  // the folder next to "data"). It is deleted here together with the database, on purpose: a database
+  // without its key folder is a clean start, a key folder without its database is reported as a
+  // restarted series. The keys folder is named explicitly so this stays true if the folder delete is
+  // ever narrowed. rmdir on a folder that is not there is harmless.
+  Exec(ExpandConstant('{cmd}'),
+    '/C rmdir /S /Q "%LOCALAPPDATA%\V-LAW\keys" & rmdir /S /Q "%LOCALAPPDATA%\V-LAW" & rmdir /S /Q "%APPDATA%\vigil-tray" & rmdir /S /Q "%APPDATA%\vlaw-tray"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 function InitializeSetup(): Boolean;
 begin
   Result := True;
@@ -175,14 +212,13 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  ResultCode: Integer;
   Question: String;
 begin
   if CurUninstallStep = usUninstall then
   begin
-    // Files are still in place here. Stop Vigil by path, then remove this user's autostart entry.
-    RunStopScript(ExpandConstant('{app}\tools\stop-vigil.ps1'), '-AppDir "' + ExpandConstant('{app}') + '" -TimeoutSeconds 15');
-    SetUserAutostart(False);
+    // Files are still in place here. Stop Vigil by path, then remove the autostart entry.
+    UninstallStopVigil;
+    UninstallRemoveUserAutostart;
   end;
 
   if CurUninstallStep = usPostUninstall then
@@ -195,15 +231,7 @@ begin
       'No: keeps all of it, the keys folder included. Reinstalling Vigil later picks it up again.';
     if MsgBox(Question, mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
     begin
-      // As the original user, so %LOCALAPPDATA% and %APPDATA% are that user's, not the elevated account's.
-      // The evidence anchor counter and install id live in %LOCALAPPDATA%\V-LAW\keys (backend VLAW_KEY_DIR,
-      // the folder next to "data"). It is deleted here together with the database, on purpose: a database
-      // without its key folder is a clean start, a key folder without its database is reported as a
-      // restarted series. The keys folder is named explicitly so this stays true if the folder delete is
-      // ever narrowed.
-      ExecAsOriginalUser(ExpandConstant('{cmd}'),
-        '/C rmdir /S /Q "%LOCALAPPDATA%\V-LAW\keys" & rmdir /S /Q "%LOCALAPPDATA%\V-LAW" & rmdir /S /Q "%APPDATA%\vigil-tray" & rmdir /S /Q "%APPDATA%\vlaw-tray"',
-        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      UninstallRemoveUserData;
     end
     else
       MsgBox('Your Vigil data was kept:' + #13#10 +

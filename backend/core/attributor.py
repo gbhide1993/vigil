@@ -8,6 +8,7 @@ import time
 import psutil
 
 from core.alerter import Alerter
+from core.attribution import UNATTRIBUTED_AGENT
 from core.behaviour_detector import AGENT_LIKE_THRESHOLD, BehaviourDetector
 from core.sessions import SessionManager
 from db.database import DB_PATH, get_db
@@ -387,6 +388,24 @@ class Attributor:
             await self._fire_unapproved_agent_alert(db, agent_id, name, pid, confidence)
 
         return agent_id
+
+    async def get_or_create_unattributed_agent(self) -> int:
+        """The agent row that holds writes nobody could be blamed for (two or more agents running, nothing to tell
+        them apart). It is a label for "cannot tell", not a program: created approved and with no pid, so it raises
+        no unapproved-agent alert."""
+        db = await get_db()
+        cur = await db.execute("SELECT id FROM agents WHERE name = ?", (UNATTRIBUTED_AGENT,))
+        row = await cur.fetchone()
+        if row is not None:
+            await db.execute("UPDATE agents SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", (row["id"],))
+            await db.commit()
+            return row["id"]
+        cur = await db.execute(
+            "INSERT INTO agents (name, process_name, pid, approved) VALUES (?, ?, NULL, 1)",
+            (UNATTRIBUTED_AGENT, UNATTRIBUTED_AGENT),
+        )
+        await db.commit()
+        return cur.lastrowid
 
     async def _is_approved_agent(self, db, name: str) -> bool:
         cur = await db.execute(

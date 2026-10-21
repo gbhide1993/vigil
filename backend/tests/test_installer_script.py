@@ -52,7 +52,7 @@ def _check(root, *extra):
 def test_the_three_versions_agree_in_the_repository():
     result = subprocess.run(["node", str(INSTALLER / "check-version.js"), "--print"], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "0.9.1"
+    assert result.stdout.strip() == "0.9.2"
 
 
 def test_version_check_passes_and_prints_the_agreed_version(tmp_path):
@@ -81,7 +81,7 @@ def test_backend_and_tray_report_the_same_version_as_the_installer():
     backend = re.search(r'^VERSION = "([^"]+)"', (ROOT / "backend" / "main.py").read_text(encoding="utf-8"), re.M).group(1)
     tray = json.loads((ROOT / "tray" / "package.json").read_text(encoding="utf-8"))["version"]
     installer = re.search(r'^#define AppVersion "([^"]+)"', ISS, re.M).group(1)
-    assert backend == tray == installer == "0.9.1"
+    assert backend == tray == installer == "0.9.2"
     tray_main = (ROOT / "tray" / "main.js").read_text(encoding="utf-8")
     assert "const APP_VERSION = app.getVersion()" in tray_main and "label: `Vigil v${APP_VERSION}`" in tray_main
     assert "0.2.0-beta" not in tray_main
@@ -100,11 +100,55 @@ def test_autostart_is_one_optional_per_user_entry():
     assert "ValueData" not in run_lines[0]
     assert 'AutostartValue "electron.app.Vigil"' in ISS
     assert "SetUserAutostart(WizardIsTaskSelected('autostart'))" in ISS
-    assert "SetUserAutostart(False)" in ISS, "the uninstaller removes the per-user entry"
+    assert "UninstallRemoveUserAutostart" in ISS, "the uninstaller removes the per-user entry"
     code = _section("Code")
     assert "ExecAsOriginalUser(ExpandConstant('{sys}\\reg.exe')" in code, "per-user changes run as the account that started Setup"
     tray = (ROOT / "tray" / "main.js").read_text(encoding="utf-8")
     assert "setLoginItemSettings({ openAtLogin: true" not in tray, "the tray must not re-create the entry on every start"
+
+
+def _routines() -> dict[str, str]:
+    """Every procedure and function of the [Code] section by name, with its text."""
+    code = _section("Code").replace("\r\n", "\n")
+    return {m.group(2): m.group(0) for m in re.finditer(r"^(procedure|function) (\w+).*?^end;", code, re.S | re.M)}
+
+
+def _uninstall_code() -> str:
+    """The text that can run in the uninstaller: CurUninstallStepChanged and every routine it calls, directly or not."""
+    routines = _routines()
+    pending, seen = ["CurUninstallStepChanged"], {}
+    while pending:
+        name = pending.pop()
+        if name in seen or name not in routines:
+            continue
+        seen[name] = routines[name]
+        pending += [other for other in routines if other != name and re.search(rf"\b{other}\b", routines[name])]
+    assert "CurUninstallStepChanged" in seen
+    return "\n".join(seen.values())
+
+
+def test_the_uninstaller_never_uses_ExecAsOriginalUser():
+    """ExecAsOriginalUser is for Setup. In the uninstaller it is not the account that started it, and the per-user
+    cleanup must not depend on it, so everything the uninstaller can run uses Exec."""
+    uninstall = _uninstall_code()
+    assert "ExecAsOriginalUser" not in uninstall
+    assert re.search(r"\bExec\(", uninstall)
+    assert "ExecAsOriginalUser" in _routines()["SetUserAutostart"], "Setup still writes the entry as the account that started it"
+    assert "SetUserAutostart" not in uninstall
+
+
+def test_the_uninstaller_removes_the_startup_entry_and_can_be_run_again_after_a_partial_failure():
+    uninstall = _uninstall_code()
+    assert "reg.exe" in uninstall and "delete" in uninstall and "{#AutostartValue}" in uninstall
+    assert "electron.app.Vigil" in ISS and "HKCU" in uninstall
+    # a step that fails (value already gone, folder already removed, helper script missing) must not stop the next one
+    assert not re.search(r"\b(Abort|RaiseException|Exit\(False\))", uninstall)
+    assert "FileExists" in uninstall, "the stop script is only run when it is still there"
+    # the delete commands are the kind that succeed or report nothing to do when the thing is already gone
+    assert "rmdir /S /Q" in uninstall and "/f" in uninstall
+    # every step that can fail is called without its result deciding anything
+    for call in re.findall(r"^\s*(?:if not )?(Exec\([^;]*)", uninstall, re.M):
+        assert "Result :=" not in call
 
 
 def test_upgrade_stops_vigil_by_path_and_no_longer_says_uninstall_first():
@@ -222,8 +266,10 @@ def test_uninstall_yes_deletes_the_evidence_key_folder_and_no_keeps_it():
     has not been run (see the manual checks in the report)."""
     code = _section("Code")
     yes_branch = code[code.index("if MsgBox(Question"):code.index("else\n      MsgBox('Your Vigil data was kept")]
-    assert 'rmdir /S /Q "%LOCALAPPDATA%\\V-LAW\\keys"' in yes_branch
-    assert 'rmdir /S /Q "%LOCALAPPDATA%\\V-LAW"' in yes_branch
+    assert "UninstallRemoveUserData" in yes_branch
+    removal = _routines()["UninstallRemoveUserData"]
+    assert 'rmdir /S /Q "%LOCALAPPDATA%\\V-LAW\\keys"' in removal
+    assert 'rmdir /S /Q "%LOCALAPPDATA%\\V-LAW"' in removal
     assert "MB_YESNO or MB_DEFBUTTON2" in code, "No stays the default"
     assert "the keys folder that holds the evidence anchor records" in code
     assert "including its keys folder" in code[code.index("Your Vigil data was kept"):]

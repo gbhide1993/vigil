@@ -15,12 +15,19 @@ One exception, by file location: a change under the user's ~/.claude folder is C
 whatever else is running, and is labelled "attributed to <agent> by file location" (event_source "path",
 confidence "medium"). The location says whose folder it is; it does not name the process that wrote the file, so it
 is not shown as exact.
+
+Another exception, the other way: when two or more agents were running and nothing narrows it down (no file-location
+rule, no open handle naming one process), the write is not given to whichever agent came first. It is recorded under
+the agent "unattributed" with confidence "low" and labelled "<n> agents active, cannot tell which wrote this".
 """
 
 import json
 import os
 
 FILE_EVENT_TYPES = ("file_write", "file_delete", "file_read", "file_create", "cred_access")
+
+# The name under which a write is recorded when it cannot be told which of several running agents made it.
+UNATTRIBUTED_AGENT = "unattributed"
 
 # Folders under the user's home that belong to one agent: (folder name, agent key as in core.attributor.KNOWN_AGENTS).
 PATH_AGENT_FOLDERS = ((".claude", "claude_code"), (".codex", "codex"))
@@ -42,7 +49,15 @@ def agent_for_path(path: str | None, home: str | None = None) -> str | None:
     return None
 
 
-def attribution_for(agent_name: str | None, event_source: str | None, confidence: str | None) -> dict:
+def attribution_for(agent_name: str | None, event_source: str | None, confidence: str | None,
+                    agents_active: int | None = None) -> dict:
+    if agent_name == UNATTRIBUTED_AGENT:
+        # Two or more agents were running; an older row without a count is still "two or more".
+        return {
+            "attribution": "unattributed",
+            "attribution_confidence": confidence,
+            "attribution_label": f"{max(2, agents_active or 2)} agents active, cannot tell which wrote this",
+        }
     agent = agent_name or "unknown agent"
     exact = event_source == "etw"
     by_path = event_source == "path"
@@ -75,6 +90,7 @@ def event_attribution(row: dict) -> dict:
     if row.get("event_type") not in FILE_EVENT_TYPES:
         return {}
     detail = parse_detail(row.get("detail"))
-    fields = attribution_for(row.get("agent_name"), row.get("event_source"), detail.get("attribution_confidence"))
+    fields = attribution_for(row.get("agent_name"), row.get("event_source"), detail.get("attribution_confidence"),
+                             detail.get("agents_active"))
     fields["change"] = detail.get("change")
     return fields

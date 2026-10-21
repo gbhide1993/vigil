@@ -8,7 +8,14 @@ import json
 import re
 
 from core.activity_filter import is_generated_path
-from core.sessions import has_activity_exists_sql, is_idle, last_activity_by_open_session, session_visible_sql
+from core.sessions import (
+    executable_base_name,
+    executable_of,
+    has_activity_exists_sql,
+    is_idle,
+    last_activity_by_open_session,
+    session_visible_sql,
+)
 from db.database import get_db, get_read_db
 
 EVIDENCE_NOTE = (
@@ -405,6 +412,18 @@ def _executable_stem(path: str | None) -> str:
     return re.sub(r"\.(exe|com|bin)$", "", first)
 
 
+_PING_COUNT = re.compile(r"(?:^|\s)[-/]n\s+\d+\b", re.IGNORECASE)
+_LOCAL_TARGET = re.compile(r"(?:^|\s)(?:127\.0\.0\.1|localhost|::1)(?:\s|$|>)", re.IGNORECASE)
+
+
+def _is_ping_sleep(command: str | None) -> bool:
+    """`ping -n N 127.0.0.1` (or localhost): the batch-file idiom for "wait N seconds", not a command being retried.
+    Pinging anything else, or without a count, is not matched."""
+    if executable_base_name(command) != "ping":
+        return False
+    return bool(_PING_COUNT.search(command or "")) and bool(_LOCAL_TARGET.search(command or ""))
+
+
 def _command_key(row) -> str:
     """The thing that repeated: for a process, the executable and its command line (the path column holds the
     full command line when one was captured; the stored args are added when they are not already in it)."""
@@ -457,7 +476,7 @@ async def _derive_friction_findings(db, session_id: str | None = None) -> list[d
         if not row["path"]:
             continue
         if row["event_type"] == "proc_spawn":
-            if _executable_stem(row["path"]) in FRICTION_IGNORED_PROCESSES:
+            if _executable_stem(row["path"]) in FRICTION_IGNORED_PROCESSES or _is_ping_sleep(row["path"]):
                 continue
             what = _command_key(row)
         else:
@@ -477,10 +496,19 @@ async def _derive_friction_findings(db, session_id: str | None = None) -> list[d
             count = j - i
             if count >= threshold:
                 shown = what if len(what) <= 120 else what[:117] + "..."
+                # A file loop is labelled by the file. A process loop is labelled by the program, never by the
+                # command line: clients show the last segment of "filepath", which for a whole command line is
+                # a trailing argument such as -q. The full command line stays in the evidence text.
+                if event_type == "proc_spawn":
+                    filepath = executable_of(evs[i]["path"])
+                    command_name = filepath.replace("\\", "/").rsplit("/", 1)[-1]
+                else:
+                    filepath, command_name = evs[i]["path"], None
                 findings.append({
                     "finding_type": "retry_loop",
                     "confidence": "high" if count >= RETRY_HIGH_MULTIPLIER * threshold else "medium",
-                    "filepath": evs[i]["path"],
+                    "filepath": filepath,
+                    "command_name": command_name,
                     "evidence": f"{shown} {event_type} {count} times within {RETRY_WINDOW_MINUTES} minutes",
                     "session_id": sid,
                 })

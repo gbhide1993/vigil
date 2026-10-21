@@ -1,7 +1,23 @@
 # Changelog
 
 Product versions follow the installer (Vigil-Setup.exe). The VS Code extension has its own changelog in vigil-vscode/CHANGELOG.md.
-## 0.9.1 (unreleased)
+## 0.9.2 (unreleased)
+
+### Fixed
+- File writes that two or more agents could have made, and that nothing narrows down (not in `~/.claude` or `~/.codex`, and the open-handle check does not name one process), are no longer given to whichever agent came first. They are recorded under the agent `unattributed` with confidence low, and shown as "<n> agents active, cannot tell which wrote this" in the dashboard, and the session and daily reports. With one agent running, nothing changes.
+- The Activity rule compares the ignored helper processes (conhost, wslhost, werfault, Vigil's own) by executable base name, so a recorded command line such as `\??\C:\Windows\system32\conhost.exe 0x4` is ignored like `conhost`.
+- The dangerous-command Red Line no longer fires on Claude Code's own shell wrapper (`bash.exe -c source <home>\.claude\shell-snapshots\...`) when the home folder has a space in it or the snapshot path is quoted. Real dangerous commands, inside or outside that wrapper, are still flagged.
+- Friction findings: `ping -n N 127.0.0.1` (or `localhost`) is treated as a sleep, not a retried command. A `retry_loop` on a process is labelled by the program (`filepath` is the executable, and `command_name` is added), never by a trailing argument such as `-q`; the full command line stays in the evidence text.
+- Uninstaller: every step it runs now uses `Exec` (no `ExecAsOriginalUser`), it removes the `electron.app.Vigil` startup entry, and a step that has nothing to do (value or folder already gone, helper script missing after a partial uninstall) no longer stops the steps after it, so it can be run again.
+
+### Known limits
+- Unattributed writes show up as their own agent in the agent and session lists, so per-agent counts are lower than before wherever two agents ran at once. Which agent wrote a change is still not known; this stops guessing, it does not find out.
+- With one agent running, a change you make yourself is still shown under that agent, and with ETW off every attribution other than the `~/.claude` and `~/.codex` location rule and a single open-handle match remains a best guess.
+- The wrapper rule only recognises Claude Code's `shell-snapshots\snapshot-*.sh` form. Other wrappers are still judged as one command line.
+- The ping rule only covers `ping -n N` to `127.0.0.1`, `localhost` or `::1`.
+- The uninstaller runs as the account that runs it. If that is an administrator other than the person who uses Vigil, that person's startup entry and `%LOCALAPPDATA%\V-LAW` folder belong to another account and are not removed. The installer script was checked by tests that read it; the uninstaller itself has not been run.
+
+## 0.9.1 (released 2026-10-21)
 
 ### Fixed
 - A session opened only because Vigil found an agent process already running at startup, with no activity after it, is no longer shown as the current session, as a session in the lists, or counted in "recording since". The row is kept and its report still opens by id.
@@ -15,6 +31,9 @@ Product versions follow the installer (Vigil-Setup.exe). The VS Code extension h
 - Friction findings: `retry_loop` now means the same file written 5 or more times, or the same command spawned 3 or more times, within 10 minutes. It used to count any 3 events of one type. The finding text now says what repeated.
 - Console hosts, git, shells and Claude cache and temp files are skipped by `retry_loop` and `rapid_revert`, as are generated and build-output folders (dist, build, out, win-unpacked, node_modules) and editor and tool temp files (`.tmp.`, Vite `.timestamp-`, Office `~$`, vim `.swp`).
 - The `session_abandoned` finding is no longer produced, because Vigil does not record commits.
+
+### Known issues
+- Uninstall shows a runtime error (ExecAsOriginalUser); fixed in 0.9.2.
 
 ### Known limits
 - The scheduled idle sweep is still off (disabled in e821731 pending an event-loop audit), so sessions still close lazily and durations and counts can be off.

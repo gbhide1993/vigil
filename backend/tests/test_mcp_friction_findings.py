@@ -319,3 +319,71 @@ def test_the_generated_check_is_the_shared_one_and_only_the_gaps_were_added():
     assert not is_generated_path("vigil-vscode/out/extension.js")
     for gap in ("/out/", "/win-unpacked/", ".tmp.", ".timestamp-", "~$", ".swp"):
         assert gap in mcp_service.FRICTION_IGNORED_PATH_PARTS
+
+
+# ------------------------------------------------------------------ ping as a sleep; a loop is labelled by its command
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", [
+    "ping -n 5 127.0.0.1",
+    "ping -n 1 localhost",
+    r"C:\Windows\System32\PING.EXE -n 3 127.0.0.1",
+    "ping -n 2 127.0.0.1 >nul",
+    "ping -n 10 ::1",
+])
+async def test_ping_to_localhost_used_as_a_sleep_is_not_a_retry_loop(test_db, command):
+    agent_id, sid = await _setup(test_db, "friction_ping")
+    await _insert(test_db, agent_id, sid, "proc_spawn", command, [0, 1, 2, 3, 4, 5, 6])
+    assert _retry(await _derive_friction_findings(test_db, session_id=sid)) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", [
+    "ping -n 5 example.com",
+    "ping -n 5 10.0.0.7",
+    "ping 127.0.0.1",                     # no -n N: not the sleep idiom, left as it was
+])
+async def test_ping_to_anything_else_is_still_a_retry_loop(test_db, command):
+    agent_id, sid = await _setup(test_db, "friction_ping_real")
+    await _insert(test_db, agent_id, sid, "proc_spawn", command, [0, 1, 2, 3])
+    assert len(_retry(await _derive_friction_findings(test_db, session_id=sid))) == 1
+
+
+def _label(filepath):
+    """What the sidebar shows: the last path segment (vigil-vscode/src/sidebarProvider.ts)."""
+    import re as _re
+    return _re.split(r"[\\/]", filepath)[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command, executable, name", [
+    (r"C:\tools\build-step.exe --fast -q", r"C:\tools\build-step.exe", "build-step.exe"),
+    (r"C:\tools\build-step.exe /c foo/bar -q", r"C:\tools\build-step.exe", "build-step.exe"),
+    (r'"C:\Program Files\Tool\runner.exe" run ./src -q', r"C:\Program Files\Tool\runner.exe", "runner.exe"),
+    (r"C:\Program Files\Tool\runner.exe run ./src -q", r"C:\Program Files\Tool\runner.exe", "runner.exe"),
+    (r"C:\tools\build-step.exe -q", r"C:\tools\build-step.exe", "build-step.exe"),
+])
+async def test_a_process_retry_loop_is_labelled_by_its_command_never_by_a_trailing_argument(test_db, command, executable, name):
+    agent_id, sid = await _setup(test_db, "friction_label")
+    await _insert(test_db, agent_id, sid, "proc_spawn", command, [0, 1, 2, 3])
+    (finding,) = _retry(await _derive_friction_findings(test_db, session_id=sid))
+    assert finding["filepath"] == executable
+    assert finding["command_name"] == name
+    assert _label(finding["filepath"]) == name != "-q"
+    assert command in finding["evidence"], "the whole command line is still in the evidence"
+
+
+@pytest.mark.asyncio
+async def test_a_stored_argument_list_is_not_taken_for_the_command(test_db):
+    agent_id, sid = await _setup(test_db, "friction_label_args")
+    await _insert(test_db, agent_id, sid, "proc_spawn", r"C:\tools\build-step.exe", [0, 1, 2, 3], {"args": ["-q"]})
+    (finding,) = _retry(await _derive_friction_findings(test_db, session_id=sid))
+    assert finding["filepath"] == r"C:\tools\build-step.exe" and finding["command_name"] == "build-step.exe"
+
+
+@pytest.mark.asyncio
+async def test_a_file_retry_loop_keeps_the_file_as_its_filepath(test_db):
+    agent_id, sid = await _setup(test_db, "friction_label_file")
+    await _insert(test_db, agent_id, sid, "file_write", r"C:\work\proj\src\app.py", [0, 1, 2, 3, 4, 5])
+    (finding,) = _retry(await _derive_friction_findings(test_db, session_id=sid))
+    assert finding["filepath"] == r"C:\work\proj\src\app.py" and finding["command_name"] is None

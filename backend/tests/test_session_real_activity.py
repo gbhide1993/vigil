@@ -453,3 +453,81 @@ async def test_vigils_own_processes_are_not_agent_activity(db):
         await add_spawn(db, agent, sid, own, 7200, 9180, already_running=False, activity_spawn=True)
     await db.commit()
     assert await has_real_activity(db, sid) is False
+
+
+# ------------------------------------------------------------------ ignored processes are compared by executable base name
+
+RAW_COMMANDS_THAT_ARE_PLUMBING = [
+    r"\??\C:\Windows\system32\conhost.exe 0x4",          # the line seen in the field report
+    r"C:\Windows\System32\conhost.exe 0xffffffff -ForceV1",
+    r'"C:\Windows\System32\conhost.exe" 0x4',
+    r"conhost.exe",
+    r"CONHOST.EXE 0x4",
+    r"conhost",
+    r"\??\C:\Windows\System32\wslhost.exe --distro Ubuntu",
+    r"C:\Windows\System32\WerFault.exe -u -p 1234",
+    r'"C:\Program Files\Vigil\tray\Vigil.exe" --autostart',
+    r"C:\Program Files\Vigil\backend\vigil-backend.exe",
+    r"C:/Program Files/Vigil/backend/vigil-backend.exe --port 7842",
+]
+RAW_COMMANDS_THAT_ARE_REAL = [
+    r"C:\Program Files\Git\cmd\git.exe status",
+    r"C:\conhost\git.exe status",                         # a folder called conhost is not the conhost process
+    r"C:\tools\conhost-helper.exe run",                   # only the exact base name is ignored
+    r"C:\tools\myconhost.exe",
+    r"C:\Windows\System32\cmd.exe /c dir",
+    r"bash.exe -c ls",
+    r"node.exe server.js",
+]
+
+
+def test_executable_base_name_strips_the_prefix_the_folders_the_arguments_and_the_extension():
+    from core.sessions import executable_base_name
+
+    assert executable_base_name(r"\??\C:\Windows\system32\conhost.exe 0x4") == "conhost"
+    assert executable_base_name(r'"C:\Program Files\Vigil\tray\Vigil.exe" --autostart') == "vigil"
+    assert executable_base_name(r"C:\Program Files\Vigil\backend\vigil-backend.exe --port 1") == "vigil-backend"
+    assert executable_base_name("C:/x/y/Git.EXE status") == "git"
+    assert executable_base_name("conhost") == "conhost"
+    assert executable_base_name("") == "" and executable_base_name(None) == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", RAW_COMMANDS_THAT_ARE_PLUMBING)
+async def test_a_raw_command_line_of_an_ignored_process_is_not_real_activity(db, raw):
+    agent = await make_agent(db)
+    sid = await started_only_session(db, agent)
+    await add_raw_spawn(db, agent, sid, raw)
+    assert await has_real_activity(db, sid) is False, raw
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", RAW_COMMANDS_THAT_ARE_REAL)
+async def test_a_raw_command_line_of_a_real_tool_is_real_activity(db, raw):
+    agent = await make_agent(db)
+    sid = await started_only_session(db, agent)
+    await add_raw_spawn(db, agent, sid, raw)
+    assert await has_real_activity(db, sid) is True, raw
+
+
+@pytest.mark.asyncio
+async def test_the_session_list_applies_the_same_rule_to_a_raw_command_line(db):
+    agent = await make_agent(db)
+    quiet = await started_only_session(db, agent)
+    await add_raw_spawn(db, agent, quiet, r"\??\C:\Windows\system32\conhost.exe 0x4")
+    busy = await started_only_session(db, agent)
+    await add_raw_spawn(db, agent, busy, r"C:\Program Files\Git\cmd\git.exe status")
+    rows = {r["id"]: r for r in client().get("/sessions").json()["sessions"]}
+    assert rows[quiet]["has_activity"] is False and rows[busy]["has_activity"] is True
+
+
+async def add_raw_spawn(db, agent_id, sid, command):
+    """A proc_spawn whose detail.command is the whole command line, not the bare executable name."""
+    detail = {"pid": 7300, "parent_pid": 9180, "command": command, "args": [], "suspicious": False,
+              "process_started": 1792429524, "activity_spawn": True}
+    await db.execute(
+        "INSERT INTO events (agent_id, session_id, event_type, path, detail, file_count, severity, pid, created_at) "
+        "VALUES (?, ?, 'proc_spawn', ?, ?, 1, 'low', 7300, '2026-10-19 17:05:41')",
+        (agent_id, sid, command, json.dumps(detail)),
+    )
+    await db.commit()

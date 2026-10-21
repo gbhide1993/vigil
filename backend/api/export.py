@@ -595,8 +595,11 @@ async def _build_summary(date: str, tz=None) -> dict:
             db, session["id"], session.get("agent_name"), since=start_sql, until=end_sql,
         )
         files_changed = {**summarise(changes, scope_dirs=scope_dirs), "recorded_rows": rows_total}
+        unattributed_label = files_changed.pop("unattributed_label")
         if files_changed.pop("best_guess_attribution"):
             files_changed["attribution_note"] = f"attributed to {session.get('agent_name') or 'unidentified_agent'} (best guess)"
+        elif unattributed_label:
+            files_changed["attribution_note"] = unattributed_label
         session["files_changed"] = files_changed
         session["unwatched_session"] = no_folder_watched and await _ran_processes_without_file_events(db, session["id"])
         # A session whose started_at/ended_at are identical and which
