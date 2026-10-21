@@ -66,7 +66,7 @@ The session PDF includes:
 | Red Lines | Policy violations with full details |
 | Legend | Label definitions |
 
-> **"Evidence is captured independently of agent self-reporting"** — the Vigil backend uses OS-level file system events (ReadDirectoryChangesW / ETW), not agent logs.
+> **"Evidence is captured independently of agent self-reporting"** — the Vigil backend uses OS-level file system events (ReadDirectoryChangesW; optional ETW kernel tracing, which needs Administrator and is not verified end to end), not agent logs.
 
 ## Policy configuration
 

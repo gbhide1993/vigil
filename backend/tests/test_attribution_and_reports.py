@@ -227,7 +227,7 @@ async def test_events_api_labels_file_events_but_not_other_events(db):
 @pytest.mark.asyncio
 async def test_attribution_note_in_reports_only_without_etw(db):
     assert export_module.ATTRIBUTION_NOTE == (
-        "Without ETW, file changes are attributed to the agent running at the time. "
+        "Kernel file tracing is not running, so file changes are attributed to the agent running at the time. "
         "A change made by you may be shown under an agent."
     )
     assert export_module.ATTRIBUTION_NOTE in export_module.current_report_notes()
@@ -240,7 +240,7 @@ async def test_attribution_note_in_reports_only_without_etw(db):
 
 def test_docs_and_ui_state_the_attribution_limits():
     doc = (ROOT / "docs" / "COVERAGE.md").read_text(encoding="utf-8")
-    assert "Without ETW, file changes are attributed to the agent running at the time. A change made by you may be shown under an agent." in doc
+    assert "Kernel file tracing is not running, so file changes are attributed to the agent running at the time. A change made by you may be shown under an agent." in doc
     assert "If no agent process is running when a file changes, the change is not recorded" in doc
     for name in ("LiveFeed.jsx", "History.jsx"):
         text = (ROOT / "frontend" / "src" / "components" / name).read_text(encoding="utf-8")

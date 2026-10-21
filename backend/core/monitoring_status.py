@@ -43,17 +43,47 @@ def mcp_monitoring() -> str:
     return "on" if _job_running(MCP_WATCHER_JOB_ID) else "off"
 
 
-# Which file-watching tier came up: "etw" (kernel tracing, every change made
-# by a recognised agent anywhere) or "folders" (native / polling observer,
-# only the watched folders). Set by main.py from what start_file_watcher
-# actually returned; "folders" is the safe default.
-_file_tier = "folders"
+# Which file-watching tier came up: "etw" (kernel tracing, every change made by a recognised agent anywhere),
+# "native" (real-time folder observer, only the watched folders) or "polling" (folder polling, only the watched
+# folders). Set from what start_file_watcher actually returned; "polling" is the safe default.
+FILE_WATCHER_TIERS = ("etw", "native", "polling")
+_file_tier = "polling"
+_etw_reason: str | None = "kernel tracing has not been started"
 
 
 def set_file_watcher_tier(tier: str) -> None:
+    """Anything that is not "etw" or "native" (including the old "folders") reads as "polling"."""
     global _file_tier
-    _file_tier = "etw" if tier == "etw" else "folders"
+    _file_tier = tier if tier in FILE_WATCHER_TIERS else "polling"
+    if _file_tier == "etw":
+        set_etw_unavailable_reason(None)
 
 
 def file_watcher_tier() -> str:
     return _file_tier
+
+
+def set_etw_unavailable_reason(reason: str | None) -> None:
+    """None means ETW is running; otherwise the plain-English reason it is not."""
+    global _etw_reason
+    _etw_reason = reason
+
+
+def etw_available() -> bool:
+    return _file_tier == "etw"
+
+
+def etw_unavailable_reason() -> str | None:
+    """Why kernel tracing is not running, or None when it is."""
+    return None if etw_available() else (_etw_reason or "kernel tracing did not start")
+
+
+def describe_etw_failure(error: str | None) -> str:
+    """Turns an ETW start error into a short sentence for /health and the tray tooltip."""
+    text = (error or "").strip()
+    low = text.lower()
+    if "access is denied" in low or "administrator" in low or "privilege" in low or "elevat" in low:
+        return "kernel tracing needs administrator"
+    if not text:
+        return "kernel tracing did not start"
+    return f"kernel tracing could not start ({text[:80]})"

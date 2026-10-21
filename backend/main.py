@@ -106,7 +106,7 @@ from core.instance_lock import InstanceAlreadyRunning, acquire_instance_lock, re
 from core.log_setup import configure_logging
 from core.scope_store import get_scope_directories
 from core import watch_stats
-from core.monitoring_status import file_watcher_tier, mcp_monitoring, network_monitoring
+from core.monitoring_status import etw_available, etw_unavailable_reason, file_watcher_tier, mcp_monitoring, network_monitoring
 from core.red_lines import SESSION_LAUNCH_DIR
 from db.database import DB_PATH, close_db, get_db, get_read_db, init_db
 from license.license_service import LicenseService
@@ -331,9 +331,7 @@ async def lifespan(app: FastAPI):
     )
     _state["observer"] = observer
     _state["file_handler"] = file_handler
-    from core.monitoring_status import set_file_watcher_tier
-    from watchers.etw_file_watcher import ETWFileWatcher
-    set_file_watcher_tier("etw" if isinstance(observer, ETWFileWatcher) else "folders")
+    # start_file_watcher records the tier that actually came up (etw / native / polling) and why ETW is not running.
     logger.info("file watcher started, watching %d paths", len(watch_paths) + len(red_line_non_recursive_dirs))
 
     # 5. APScheduler jobs
@@ -862,10 +860,13 @@ async def health():
         "baseline_active": baseline_active,
         "agents_watching": agents_watching,
         "file_watcher_alive": observer.is_alive() if observer else False,
-        # Which tier is running ("etw" or "folders") and what it saw but did not record, since start. An evidence
+        # Which tier is running ("etw", "native" or "polling") and what it saw but did not record, since start. An evidence
         # tool says when it dropped events: dropped_total is changes lost because too many arrived at once;
         # outside_scope_not_recorded is ETW events outside the watched folders (counted, never recorded).
         "file_watcher_tier": file_watcher_tier(),
+        # Kernel tracing needs an elevated backend; a normal install runs false with the reason (null when running).
+        "etw_available": etw_available(),
+        "etw_unavailable_reason": etw_unavailable_reason(),
         "file_events_not_recorded": watch_stats.summary(),
         # Read from the scheduler's real state ("off" while the watcher's
         # job is not registered), never a constant.

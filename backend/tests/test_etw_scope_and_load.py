@@ -24,7 +24,7 @@ from core import mcp_service, report_coverage, watch_stats
 from core.aggregator import Aggregator
 from core.attributor import AGENT_LAST_SEEN_WRITE_SECONDS, Attributor
 from core.device_paths import normalise_device_path
-from core.monitoring_status import set_file_watcher_tier
+from core.monitoring_status import etw_available, etw_unavailable_reason, file_watcher_tier, set_file_watcher_tier
 from core.scope_filter import ScopeFilter
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -407,6 +407,7 @@ async def test_health_reports_what_was_dropped_and_what_was_outside_scope(db):
     assert not_recorded["dropped_total"] == 3 and not_recorded["dropped_by_kind"] == {"overload": 2, "buffer_full": 1}
     assert not_recorded["outside_scope_not_recorded"] == 1 and not_recorded["since"]
     assert health["file_watcher_tier"] == "etw"
+    assert health["etw_available"] is True and health["etw_unavailable_reason"] is None
 
 
 def test_reports_say_what_was_dropped_and_what_was_counted_only():
@@ -498,7 +499,68 @@ async def test_native_forces_the_native_observer_without_trying_etw(monkeypatch)
 
     assert await start(None) == ("FakeETW", {"etw": 1, "native": 0, "polling": 0}), "auto: ETW first"
     assert await start("native") == ("FakeObserver", {"etw": 0, "native": 1, "polling": 0}), "native: ETW is never tried"
+    assert file_watcher_tier() == "native" and not etw_available() and "switched off" in etw_unavailable_reason()
     assert await start("polling") == ("FakePolling", {"etw": 0, "native": 0, "polling": 1})
+    assert file_watcher_tier() == "polling" and not etw_available() and "switched off" in etw_unavailable_reason()
+    assert await start(None) == ("FakeETW", {"etw": 1, "native": 0, "polling": 0})
+    assert file_watcher_tier() == "etw" and etw_available() and etw_unavailable_reason() is None
+
+
+@pytest.mark.asyncio
+async def test_health_says_etw_is_unavailable_and_why_when_the_kernel_session_is_denied(db, monkeypatch):
+    """A normal (non-elevated) install: pyetwkit is there but starting the session raises 'Access is denied'."""
+    import main as main_module
+
+    class DeniedListener:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self):
+            raise RuntimeError("Access is denied")
+
+    class FakeProvider:
+        @staticmethod
+        def kernel():
+            return object()
+
+    class FakePyetwkit:
+        FileProvider = FakeProvider
+        EtwListener = DeniedListener
+
+    class FakeObserver:
+        def __init__(self, *a, **kw):
+            pass
+
+        def schedule(self, *a, **kw):
+            return object()
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return True
+
+    class FakeCache:
+        def __init__(self, attributor):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(etw, "PYETWKIT_AVAILABLE", True)
+    monkeypatch.setattr(etw, "pyetwkit", FakePyetwkit, raising=False)
+    monkeypatch.setattr(file_watcher, "Observer", FakeObserver)
+    monkeypatch.setattr(file_watcher, "_AgentPidCache", FakeCache)
+    monkeypatch.delenv(file_watcher.FILE_WATCHER_ENV, raising=False)
+    monkeypatch.delenv("VLAW_HOST_ROOT", raising=False)
+
+    watcher, _handler = file_watcher.start_file_watcher(None, None, [])
+    assert isinstance(watcher, FakeObserver), "ETW failed, so the folder observer took over"
+    monkeypatch.setitem(main_module._state, "observer", watcher)
+    health = await main_module.health()
+    assert health["etw_available"] is False
+    assert health["etw_unavailable_reason"] == "kernel tracing needs administrator"
+    assert health["file_watcher_tier"] == "native"
 
 
 # ------------------------------------------------------------------ installer

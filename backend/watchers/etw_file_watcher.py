@@ -139,6 +139,8 @@ class ETWFileWatcher:
         self._stop_event = threading.Event()
         self._started_event = threading.Event()
         self._start_error: str | None = None
+        # Plain-English reason start() returned False (None until then); read by file_watcher for /health.
+        self.unavailable_reason: str | None = None
         self._inflight = threading.Semaphore(MAX_INFLIGHT_EVENTS)
         self._dropped_count = 0
         self._file_object_cache: dict[int, str] = {}
@@ -157,15 +159,18 @@ class ETWFileWatcher:
         never to treat it as fatal."""
         if not PYETWKIT_AVAILABLE:
             logger.info("ETW file watcher unavailable: pyetwkit is not installed")
+            self.unavailable_reason = "kernel tracing is not installed (pyetwkit missing)"
             return False
         if self._callback is None:
             logger.error("ETW file watcher started without a callback registered")
+            self.unavailable_reason = "kernel tracing did not start"
             return False
 
         try:
             self._loop = asyncio.get_event_loop()
         except RuntimeError:
             logger.error("ETW file watcher must be started from a thread with a running asyncio loop")
+            self.unavailable_reason = "kernel tracing did not start"
             return False
 
         self._stop_event.clear()
@@ -180,10 +185,13 @@ class ETWFileWatcher:
         # the caller a synchronous yes/no to decide fallback on.
         if not self._started_event.wait(timeout=10):
             logger.error("ETW file watcher timed out starting")
+            self.unavailable_reason = "kernel tracing timed out starting"
             return False
 
         if self._start_error is not None:
             logger.info("ETW file watcher could not start (%s) — falling back", self._start_error)
+            from core.monitoring_status import describe_etw_failure
+            self.unavailable_reason = describe_etw_failure(self._start_error)
             return False
 
         logger.info("ETW file watcher started (Microsoft-Windows-Kernel-File)")

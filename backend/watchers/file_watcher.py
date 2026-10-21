@@ -50,6 +50,7 @@ from core.ignore_rules import ignore_and_count
 from core.own_paths import is_own_path
 from core.red_lines import RedLines, is_agent_config_path, is_mcp_config_path, register_agent_workspace
 from db.database import get_db
+from core.monitoring_status import set_etw_unavailable_reason, set_file_watcher_tier
 from watchers.etw_file_watcher import ETWFileWatcher
 
 _CONFIDENCE_BY_NAME = {
@@ -845,6 +846,9 @@ def start_file_watcher(
     if requested != "auto":
         logger.info("file watcher: %s=%s", FILE_WATCHER_ENV, requested)
 
+    if requested in ("native", "polling"):
+        set_etw_unavailable_reason(f"kernel tracing is switched off ({FILE_WATCHER_ENV}={requested})")
+
     if requested in ("auto", "etw"):
         etw_watcher = ETWFileWatcher(attributor)
         etw_handler = VlawFileHandler(
@@ -853,7 +857,9 @@ def start_file_watcher(
         )
         etw_watcher.set_callback(etw_handler.handle_etw_event)
         if etw_watcher.start():
+            set_file_watcher_tier("etw")
             return etw_watcher, etw_handler
+        set_etw_unavailable_reason(getattr(etw_watcher, "unavailable_reason", None) or "kernel tracing did not start")
 
     # Only built for tiers 2/3 (ETW never guesses a pid, so never needs
     # this) -- starts its own background refresh thread, see _AgentPidCache.
@@ -878,6 +884,7 @@ def start_file_watcher(
             _schedule_paths(candidate, handler, watch_paths, non_recursive_paths)
             candidate.start()
             logger.info("file watcher: using native real-time observer (ReadDirectoryChangesW)")
+            set_file_watcher_tier("native")
             return candidate, handler
         except Exception:
             logger.exception("file watcher: native observer failed to start, falling back to polling")
@@ -890,4 +897,5 @@ def start_file_watcher(
     _schedule_paths(observer, handler, watch_paths, non_recursive_paths)
     observer.start()
     logger.info("file watcher: using polling observer")
+    set_file_watcher_tier("polling")
     return observer, handler
