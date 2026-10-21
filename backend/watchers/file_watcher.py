@@ -38,6 +38,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 
+from core.attribution import agent_for_path
 from core.attributor import Attributor
 from core.burst_detector import BurstDetector
 from core.correlation_engine import CorrelationEngine
@@ -511,6 +512,16 @@ class VlawFileHandler(FileSystemEventHandler):
         # open-handle refinement -- see _refine_pid_by_open_handle and
         # _OPEN_HANDLE_WORKER_PATH's comment for why that runs in a
         # disposable subprocess rather than on any same-process thread.
+        # A change in an agent's own folder (~/.claude, ~/.codex) is given to that agent when it is running, before
+        # the guess below: the guess picks the first agent it finds, which is how Claude Code's checkpoint files ended
+        # up under Codex. Marked event_source "path" (core/attribution.py); anything else keeps the guess.
+        path_agent = agent_for_path(path)
+        if path_agent and self.pid_cache is not None:
+            owner_pid = next((p for p, name in self.pid_cache.snapshot().items() if name == path_agent), None)
+            if owner_pid is not None:
+                await self.handle_file_event(path, event_type, "path", owner_pid, "medium", time.time(), change=change)
+                return
+
         guess_path = path if self.use_pid_heuristic else None
         pid, confidence = await _find_owning_agent_pid(self.pid_cache, guess_path)
         event_source = "realtime_heuristic" if self.use_pid_heuristic else "poll"

@@ -443,3 +443,13 @@ async def test_the_aggregates_are_per_database_file(db, tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DB_PATH", tmp_path / "another.db")   # pretend a different database file
     await sessions_core.session_event_aggregates(db)
     assert sessions_core._aggregates["key"] != key_before, "a different database is not served from the old aggregates"
+
+
+@pytest.mark.asyncio
+async def test_vigils_own_processes_are_not_agent_activity(db):
+    agent = await make_agent(db)
+    sid = await started_only_session(db, agent)
+    for own in ("vigil.exe", "vigil-backend.exe", "Vigil.exe"):
+        await add_spawn(db, agent, sid, own, 7200, 9180, already_running=False, activity_spawn=True)
+    await db.commit()
+    assert await has_real_activity(db, sid) is False
