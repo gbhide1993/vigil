@@ -37,7 +37,11 @@ async def make_agent(db) -> int:
 
 
 async def add_spawn(db, agent_id, sid, name, pid, parent, *, already_running, activity_spawn):
-    detail = {"pid": pid, "parent_pid": parent, "command": name, "args": [], "suspicious": False,
+    # the recorder stores the bare executable name in detail.command, while the path column may hold a whole command line
+    import re
+
+    found = re.search(r"([A-Za-z0-9_.\-]+\.exe)", name, re.I)
+    detail = {"pid": pid, "parent_pid": parent, "command": found.group(1) if found else name, "args": [], "suspicious": False,
               "process_started": 1792429524, "activity_spawn": activity_spawn}
     if already_running:
         detail["already_running"] = True
@@ -273,11 +277,12 @@ async def test_an_open_session_with_its_last_event_10_minutes_ago_is_idle_and_on
 
 
 @pytest.mark.asyncio
-async def test_an_open_session_with_no_events_is_judged_by_its_start_time(db):
+async def test_an_open_session_with_no_events_at_all_is_not_a_current_session(db):
+    """Since the real-activity rule covers every session (not only resumed ones), a session with no events is hidden."""
     agent = await make_agent(db)
-    sid = await open_session(db, agent, started_min_ago=20)
+    await open_session(db, agent, started_min_ago=20)
     result = await mcp_service._get_current_session({})
-    assert result["session_id"] == sid and result["status"] == "idle" and result["last_activity_at"] == utc_ago(20)
+    assert result["status"] == "none" and result["session_id"] is None
 
 
 @pytest.mark.asyncio
@@ -317,3 +322,124 @@ async def test_the_pdf_says_idle_since_and_counts_the_duration_to_the_last_activ
     preview = c.get(f"/sessions/{active}/report/preview").json()
     assert preview["idle"] is False and preview["last_activity_at"] is None
     assert "Idle since" not in pdf_text(c, f"/sessions/{active}/report")
+
+
+# ------------------------------------------------------------------ an agent that only started: dd20c0e9
+# The Codex VS Code extension starts codex.exe when VS Code opens. That is not "already running" when Vigil sees
+# it, and its console host (conhost.exe) is a child of it. Neither is real activity.
+
+async def started_only_session(db, agent_id, *, started_min_ago=2) -> str:
+    sid = str(uuid.uuid4())
+    await db.execute("INSERT INTO sessions (id, agent_id, started_at, resumed) VALUES (?, ?, ?, 0)",
+                     (sid, agent_id, utc_ago(started_min_ago)))
+    await add_spawn(db, agent_id, sid, "codex.exe", 9180, 33448, already_running=False, activity_spawn=False)
+    await add_spawn(db, agent_id, sid, r"\??\C:\Windows\system32\conhost.exe 0x4", 29340, 9180, already_running=False, activity_spawn=True)
+    await db.commit()
+    return sid
+
+
+@pytest.mark.asyncio
+async def test_an_agent_exe_with_only_its_console_host_is_not_real_activity_and_is_hidden(db):
+    agent = await make_agent(db)
+    sid = await started_only_session(db, agent)
+    assert await has_real_activity(db, sid) is False
+
+    result = await mcp_service._get_current_session({})
+    assert result["status"] == "none" and result["session_id"] is None
+
+    rows = {r["id"]: r for r in client().get("/sessions").json()["sessions"]}
+    assert rows[sid]["has_activity"] is False, "the row is still returned, flagged"
+    assert sid not in {r["id"] for r in client().get("/sessions", params={"status": "open"}).json()["sessions"]}
+
+
+@pytest.mark.asyncio
+async def test_other_console_and_os_helpers_are_ignored_but_tools_the_agent_runs_are_real_activity(db):
+    agent = await make_agent(db)
+    for helper in ("wslhost.exe", "werfault.exe", "conhost.exe"):
+        sid = await started_only_session(db, agent)
+        await add_spawn(db, agent, sid, helper, 7000, 9180, already_running=False, activity_spawn=True)
+        await db.commit()
+        assert await has_real_activity(db, sid) is False, helper
+
+    for tool in ("git.exe", "python.exe", "bash.exe", "cmd.exe", "powershell.exe", "node.exe"):
+        sid = await started_only_session(db, agent)
+        await add_spawn(db, agent, sid, tool, 7100, 9180, already_running=False, activity_spawn=True)
+        await db.commit()
+        assert await has_real_activity(db, sid) is True, tool
+
+
+@pytest.mark.asyncio
+async def test_a_file_write_is_real_activity_and_makes_the_session_the_current_one(db):
+    agent = await make_agent(db)
+    quiet = await started_only_session(db, agent, started_min_ago=4)
+    busy = await started_only_session(db, agent, started_min_ago=3)
+    await add_file_write(db, agent, busy, at=utc_ago(1))
+    assert await has_real_activity(db, quiet) is False and await has_real_activity(db, busy) is True
+    result = await mcp_service._get_current_session({})
+    assert result["session_id"] == busy and result["has_activity"] is True and result["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_mcp_session_history_returns_activity_resumed_idle_and_last_activity_without_dropping_rows(db):
+    agent = await make_agent(db)
+    started_only = await started_only_session(db, agent, started_min_ago=40)
+    marker_only = await resumed_session(db, agent, closed=False, started=utc_ago(35))
+    idle = await open_session(db, agent, started_min_ago=30, event_min_ago=10)
+    active = await open_session(db, agent, started_min_ago=5, event_min_ago=1)
+    closed = str(uuid.uuid4())
+    await db.execute("INSERT INTO sessions (id, agent_id, started_at, ended_at) VALUES (?, ?, ?, ?)", (closed, agent, utc_ago(90), utc_ago(80)))
+    await add_file_write(db, agent, closed, at=utc_ago(85))
+
+    history = {h["session_id"]: h for h in await mcp_service._get_session_history({"n": 20})}
+    assert set(history) == {started_only, marker_only, idle, active, closed}, "nothing is filtered out of this route"
+    assert history[started_only]["has_activity"] is False and history[started_only]["resumed"] is False
+    assert history[marker_only]["has_activity"] is False and history[marker_only]["resumed"] is True
+    assert history[idle]["has_activity"] is True and history[idle]["idle"] is True and history[idle]["last_activity_at"] <= utc_ago(9.9)
+    assert history[active]["has_activity"] is True and history[active]["idle"] is False
+    assert history[closed]["has_activity"] is True and history[closed]["idle"] is False and history[closed]["last_activity_at"] is None
+    for h in history.values():
+        assert {"has_activity", "resumed", "idle", "last_activity_at", "files_touched_count", "red_lines"} <= set(h)
+
+
+# ------------------------------------------------------------------ the session list keeps its per-session aggregates incrementally
+
+@pytest.mark.asyncio
+async def test_the_session_list_picks_up_new_events_between_polls_and_survives_removed_events(db):
+    agent = await make_agent(db)
+    sid = await started_only_session(db, agent)
+    c = client()
+
+    first = {r["id"]: r for r in c.get("/sessions").json()["sessions"]}[sid]
+    assert first["has_activity"] is False and first["net_connect_count"] == 0
+
+    # an event added after the first poll is folded in (only the new rows are read)
+    await add_file_write(db, agent, sid, at=utc_ago(0))
+    await db.execute("INSERT INTO events (agent_id, session_id, event_type, path, created_at) VALUES (?, ?, 'net_connect', 'example.com', ?)",
+                     (agent, sid, utc_ago(0)))
+    await db.commit()
+    second = {r["id"]: r for r in c.get("/sessions").json()["sessions"]}[sid]
+    assert second["has_activity"] is True and second["net_connect_count"] == 1
+    assert second["last_activity_at"] >= utc_ago(0.5)
+
+    # nothing new: the same answer
+    again = {r["id"]: r for r in c.get("/sessions").json()["sessions"]}[sid]
+    assert again["has_activity"] is True and again["net_connect_count"] == 1
+
+    # events removed behind its back (never done by Vigil itself): the aggregates are rebuilt, not trusted
+    await db.execute("DELETE FROM events WHERE session_id = ? AND event_type IN ('file_write', 'net_connect')", (sid,))
+    await db.commit()
+    rebuilt = {r["id"]: r for r in c.get("/sessions").json()["sessions"]}[sid]
+    assert rebuilt["has_activity"] is False and rebuilt["net_connect_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_aggregates_are_per_database_file(db, tmp_path, monkeypatch):
+    from core import sessions as sessions_core
+
+    agent = await make_agent(db)
+    sid = await started_only_session(db, agent)
+    assert (await sessions_core.session_event_aggregates(db)).get(sid, {}).get("has_activity") is False
+    key_before = sessions_core._aggregates["key"]
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "another.db")   # pretend a different database file
+    await sessions_core.session_event_aggregates(db)
+    assert sessions_core._aggregates["key"] != key_before, "a different database is not served from the old aggregates"

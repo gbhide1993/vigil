@@ -14,6 +14,7 @@ from core.digest import generate_summary
 from core.feature_flags import CORE_ONLY
 from core.layer2a import score_session_2a
 from core.layer2b import score_session_2b
+import db.database as _database
 from db.database import get_db
 
 logger = logging.getLogger("vlaw")
@@ -21,28 +22,117 @@ logger = logging.getLogger("vlaw")
 SESSION_IDLE_TIMEOUT_SECONDS = 300  # close a session after 5 minutes of no activity
 CLOSE_IDLE_SESSIONS_TIMEOUT_SECONDS = 8
 
-# "Real activity" of a session: at least one event of the session that is a file event, or a proc_spawn that
-# is not an already_running marker. A session opened only because Vigil found an agent process already
-# running at startup (resumed=1) has just those markers, so it has no real activity. This is the single
-# definition; every reader (current session, session list, reports) uses it through the helpers below.
+# "Real activity" of a session: at least one event of the session that is
+#   - a file event, or
+#   - a proc_spawn that is a new tool or shell process under the agent: not an already_running marker, not the
+#     agent's own exe (detail.activity_spawn is true only for a child process), and not one of the pure console
+#     or OS helpers in ACTIVITY_IGNORED_CHILD_PROCESSES.
+# A session opened only because an agent process started (or was found already running) with its console host
+# has no real activity. This is the single definition; every reader (current session, session lists, session
+# history, reports) uses it through the helpers below.
 REAL_ACTIVITY_FILE_EVENT_TYPES = ("file_write", "file_delete", "file_read", "file_create", "cred_access")
 _FILE_TYPES_SQL = ", ".join(f"'{t}'" for t in REAL_ACTIVITY_FILE_EVENT_TYPES)
+
+# Child processes that are plumbing: Windows or the runtime starts them next to the agent whether or not the
+# agent does anything. Deliberately NOT here: git, bash, sh, cmd, powershell, pwsh, python, node and other tools.
+# An agent running one of those is real activity.
+ACTIVITY_IGNORED_CHILD_PROCESSES = frozenset({
+    "conhost",    # the Windows console host: started for every console program, including an idle agent's own
+    "wslhost",    # WSL's console/host helper
+    "werfault",   # Windows Error Reporting, started when something crashes
+})
+_IGNORED_CHILDREN_SQL = ", ".join(
+    f"'{name}', '{name}.exe'" for name in sorted(ACTIVITY_IGNORED_CHILD_PROCESSES)
+)
+
+
+def activity_event_sql(event_alias: str = "ra") -> str:
+    """The test for one events row: true when that event is real activity. The one place the rule is written;
+    has_activity_exists_sql wraps it per session, and the session list uses it once over the events table."""
+    e = event_alias
+    return (
+        f"({e}.event_type IN ({_FILE_TYPES_SQL}) "
+        f"OR ({e}.event_type = 'proc_spawn' "
+        f"AND COALESCE(json_extract({e}.detail, '$.already_running'), 0) = 0 "
+        f"AND COALESCE(json_extract({e}.detail, '$.activity_spawn'), 0) = 1 "
+        f"AND lower(COALESCE(json_extract({e}.detail, '$.command'), {e}.path)) NOT IN ({_IGNORED_CHILDREN_SQL})))"
+    )
+
+
+# ---------------------------------------------------------------- per-session event aggregates, kept incrementally
+# The session list is polled every 3 seconds by the app shell and needs, for every session, whether it has real
+# activity, its newest event time and its net_connect count. Recomputing that scans the whole events table on every
+# poll (about 35 ms at 15,000 events and growing with it). The events table is append-only (nothing updates or
+# deletes an event; the hash chain depends on it), so the aggregates are kept in memory and only the events added
+# since the last call are folded in. If the table was changed in any other way (the row count does not match), or the
+# database file is a different one, they are rebuilt from scratch. Nothing is written.
+_aggregates: dict = {"key": None, "max_id": 0, "count": 0, "by_session": {}}
+_aggregates_lock = asyncio.Lock()
+
+
+async def _aggregate_rows(db, after_id: int, max_id: int):
+    cur = await db.execute(
+        f"""
+        SELECT e.session_id AS sid, COUNT(*) AS n,
+            SUM(CASE WHEN e.event_type = 'net_connect' THEN 1 ELSE 0 END) AS net,
+            MAX(CASE WHEN {activity_event_sql('e')} THEN 1 ELSE 0 END) AS act,
+            MAX(e.created_at) AS last_at
+        FROM events e WHERE e.id > ? AND e.id <= ? GROUP BY e.session_id
+        """,
+        (after_id, max_id),
+    )
+    return await cur.fetchall()
+
+
+async def session_event_aggregates(db) -> dict[str, dict]:
+    """{session_id: {"has_activity": bool, "last_event_at": str, "net_connect_count": int}} for sessions that have events."""
+    async with _aggregates_lock:
+        key = str(_database.DB_PATH)
+        cur = await db.execute("SELECT COALESCE(MAX(id), 0) AS m FROM events")
+        max_id = (await cur.fetchone())["m"]
+        state = _aggregates
+        same_db = state["key"] == key
+
+        if same_db and state["max_id"] == max_id and await _count_through(db, max_id) == state["count"]:
+            return state["by_session"]                       # nothing new
+
+        rows, base, by_session = None, 0, {}
+        if same_db and max_id > state["max_id"]:
+            new_rows = await _aggregate_rows(db, state["max_id"], max_id)
+            if state["count"] + sum(r["n"] for r in new_rows) == await _count_through(db, max_id):
+                rows, base, by_session = new_rows, state["count"], state["by_session"]   # only appends: fold them in
+        if rows is None:
+            rows = await _aggregate_rows(db, 0, max_id)       # first call, another database, or events were removed
+
+        for r in rows:
+            if r["sid"] is None:
+                continue
+            entry = by_session.get(r["sid"])
+            if entry is None:
+                by_session[r["sid"]] = {"has_activity": bool(r["act"]), "last_event_at": r["last_at"], "net_connect_count": r["net"] or 0}
+            else:
+                entry["has_activity"] = entry["has_activity"] or bool(r["act"])
+                entry["last_event_at"] = max(entry["last_event_at"], r["last_at"])
+                entry["net_connect_count"] += r["net"] or 0
+        state.update(key=key, max_id=max_id, count=base + sum(r["n"] for r in rows), by_session=by_session)
+        return by_session
+
+
+async def _count_through(db, max_id: int) -> int:
+    cur = await db.execute("SELECT COUNT(*) AS c FROM events WHERE id <= ?", (max_id,))
+    return (await cur.fetchone())["c"]
 
 
 def has_activity_exists_sql(session_alias: str = "s") -> str:
     """An EXISTS(...) expression for use in a SELECT or WHERE: true when the session whose id is
     {session_alias}.id has real activity."""
-    return (
-        f"EXISTS (SELECT 1 FROM events ra WHERE ra.session_id = {session_alias}.id AND ("
-        f"ra.event_type IN ({_FILE_TYPES_SQL}) "
-        "OR (ra.event_type = 'proc_spawn' AND COALESCE(json_extract(ra.detail, '$.already_running'), 0) = 0)))"
-    )
+    return f"EXISTS (SELECT 1 FROM events ra WHERE ra.session_id = {session_alias}.id AND {activity_event_sql('ra')})"
 
 
 def session_visible_sql(session_alias: str = "s") -> str:
-    """A session is shown unless it is a resumed one with no real activity. Only resumed sessions can lack
-    activity (any other session was opened by an event), so the events lookup runs for those alone."""
-    return f"(COALESCE({session_alias}.resumed, 0) = 0 OR {has_activity_exists_sql(session_alias)})"
+    """A session is shown only when it has real activity. (A session that starts because an agent process
+    started, resumed or not, and then does nothing is not a current session.)"""
+    return has_activity_exists_sql(session_alias)
 
 
 # The idle sweep that would close idle sessions is off (e821731), so an open session stays open. For display only,

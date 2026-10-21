@@ -169,8 +169,10 @@ async def _get_session_history(params: dict) -> list[dict]:
         n = max(1, min(n, 200))
 
         cur = await db.execute(
-            """
-            SELECT s.*, a.name as agent_name
+            f"""
+            SELECT s.*, a.name as agent_name,
+                {has_activity_exists_sql('s')} AS has_activity,
+                COALESCE((SELECT MAX(le.created_at) FROM events le WHERE le.session_id = s.id), s.started_at) AS last_activity
             FROM sessions s
             LEFT JOIN agents a ON a.id = s.agent_id
             ORDER BY s.started_at DESC
@@ -213,7 +215,10 @@ async def _get_session_history(params: dict) -> list[dict]:
         for row in rows:
             session_id = row["id"]
             duration_min = await _minutes_between(db, row["started_at"], row["ended_at"])
+            is_open = row["ended_at"] is None
 
+            # Every session is returned: the caller filters on has_activity. last_activity_at and idle are for
+            # open sessions only (display rule, see core.sessions.is_idle; the idle sweep is off).
             results.append({
                 "session_id": session_id,
                 "date": row["started_at"],
@@ -221,6 +226,10 @@ async def _get_session_history(params: dict) -> list[dict]:
                 "agent": row["agent_name"],
                 "files_touched_count": len(paths_by_session.get(session_id, set())),
                 "red_lines": red_lines_by_session.get(session_id, 0),
+                "has_activity": bool(row["has_activity"]),
+                "resumed": bool(row["resumed"]),
+                "last_activity_at": row["last_activity"] if is_open else None,
+                "idle": bool(is_open and is_idle(row["last_activity"])),
             })
 
         return results
