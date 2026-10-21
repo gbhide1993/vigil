@@ -4,7 +4,9 @@ columns (file_reads, file_writes, ...) are rolled up from the events
 table when a session closes, then handed to baseline.update_from_session()."""
 
 import asyncio
+import re
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -43,21 +45,54 @@ ACTIVITY_IGNORED_CHILD_PROCESSES = frozenset({
     "vigil",          # Vigil's own tray app: its processes are not the agent's activity
     "vigil-backend",  # Vigil's own backend
 })
-_IGNORED_CHILDREN_SQL = ", ".join(
-    f"'{name}', '{name}.exe'" for name in sorted(ACTIVITY_IGNORED_CHILD_PROCESSES)
-)
+
+
+def executable_of(command: str | None) -> str:
+    """The program of a command line, as written (case kept), without the NT "\\??\\" prefix, quotes or arguments:
+    '\\??\\C:\\Windows\\system32\\conhost.exe 0x4' -> 'C:\\Windows\\system32\\conhost.exe'."""
+    text = (command or "").strip()
+    if text.startswith("\\??\\"):
+        text = text[4:]
+    if text.startswith('"'):
+        end = text.find('"', 1)
+        return text[1:end] if end > 0 else text[1:]
+    # an unquoted path may contain spaces ("C:\\Program Files\\x\\a.exe arg"): the program ends at its ".exe"
+    match = re.search(r"\.exe(?=\s|$)", text, re.IGNORECASE)
+    return text[:match.end()] if match else text.split(" ", 1)[0]
+
+
+def executable_base_name(command: str | None) -> str:
+    """The executable's base name, lower-case, without folders, extension, arguments or the NT "\\??\\" prefix:
+    '\\??\\C:\\Windows\\system32\\conhost.exe 0x4' -> 'conhost'; '"C:\\Program Files\\Vigil\\tray\\Vigil.exe" --x' -> 'vigil'.
+    This is what ACTIVITY_IGNORED_CHILD_PROCESSES is compared against; activity_event_sql writes the same test in SQL."""
+    base = executable_of(command).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return base[:-4] if base.endswith(".exe") else base
+
+
+def _is_ignored_child_sql(expr: str) -> str:
+    """SQL true when the command line in `expr` (already lower-case) is one of ACTIVITY_IGNORED_CHILD_PROCESSES by
+    executable base name: the bare name, or a path (either slash, optionally quoted or with the \\??\\ prefix) ending
+    in name.exe, with or without arguments after it. Names are plain (letters and hyphens), so LIKE needs no escaping."""
+    tests = []
+    for name in sorted(ACTIVITY_IGNORED_CHILD_PROCESSES):
+        tests.append(f"{expr} IN ('{name}', '{name}.exe')")
+        tests.append(f"{expr} LIKE '{name}.exe %' OR {expr} LIKE '{name} %' OR {expr} LIKE '\"{name}.exe\"%'")
+        for sep in ("\\", "/"):
+            tests.append(f"{expr} LIKE '%{sep}{name}.exe' OR {expr} LIKE '%{sep}{name}.exe %' OR {expr} LIKE '%{sep}{name}.exe\"%'")
+    return "(" + " OR ".join(tests) + ")"
 
 
 def activity_event_sql(event_alias: str = "ra") -> str:
     """The test for one events row: true when that event is real activity. The one place the rule is written;
     has_activity_exists_sql wraps it per session, and the session list uses it once over the events table."""
     e = event_alias
+    command = f"lower(COALESCE(json_extract({e}.detail, '$.command'), {e}.path))"
     return (
         f"({e}.event_type IN ({_FILE_TYPES_SQL}) "
         f"OR ({e}.event_type = 'proc_spawn' "
         f"AND COALESCE(json_extract({e}.detail, '$.already_running'), 0) = 0 "
         f"AND COALESCE(json_extract({e}.detail, '$.activity_spawn'), 0) = 1 "
-        f"AND lower(COALESCE(json_extract({e}.detail, '$.command'), {e}.path)) NOT IN ({_IGNORED_CHILDREN_SQL})))"
+        f"AND NOT {_is_ignored_child_sql(command)}))"
     )
 
 

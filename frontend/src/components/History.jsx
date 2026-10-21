@@ -85,7 +85,7 @@ function FeedRow({ event }) {
         {(event.session_id || '').slice(0, 8)}
       </span>
       <span className="agent-pill" title={event.attribution_label || event.agent_name || undefined}>
-        {event.agent_name || '—'}{event.attribution === 'best_guess' ? ' (best guess)' : ''}
+        {event.agent_name || '—'}{event.attribution === 'best_guess' ? ' (best guess)' : event.attribution === 'unattributed' ? ` (${event.attribution_label})` : ''}
       </span>
       <TypeBadge type={event.event_type} />
       <span className="feed-path" title={path}>
@@ -425,7 +425,7 @@ export default function History() {
                   {netEvents.map((e) => (
                     <tr key={e.id}>
                       <td>{formatTime(e.created_at)}</td>
-                      <td title={e.attribution_label || undefined}>{e.agent_name}{e.attribution === 'best_guess' ? ' (best guess)' : ''}</td>
+                      <td title={e.attribution_label || undefined}>{e.agent_name}{e.attribution === 'best_guess' ? ' (best guess)' : e.attribution === 'unattributed' ? ` (${e.attribution_label})` : ''}</td>
                       <td className="cell-wrap" title={e.path}>
                         {isRawIp(e.path) && <GlobeIcon />} {e.path} <CopyButton text={e.path} />
                       </td>
@@ -455,7 +455,7 @@ export default function History() {
                   {credEvents.map((e) => (
                     <tr key={e.id}>
                       <td>{formatTime(e.created_at)}</td>
-                      <td title={e.attribution_label || undefined}>{e.agent_name}{e.attribution === 'best_guess' ? ' (best guess)' : ''}</td>
+                      <td title={e.attribution_label || undefined}>{e.agent_name}{e.attribution === 'best_guess' ? ' (best guess)' : e.attribution === 'unattributed' ? ` (${e.attribution_label})` : ''}</td>
                       <td className="cell-wrap" title={e.path}>{e.path} <CopyButton text={e.path} /></td>
                     </tr>
                   ))}

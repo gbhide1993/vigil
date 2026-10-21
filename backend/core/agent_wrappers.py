@@ -31,8 +31,11 @@ from dataclasses import dataclass
 # start of the wrapper. Matching the snapshot directory and file name (not
 # just "source") keeps an ordinary `bash -c "source ./env.sh && ..."` from
 # being treated as a wrapper.
+# The path may contain spaces (a home folder such as "C:\Users\Girish Bhide") and may be quoted, so it is matched up
+# to the snapshot folder rather than as one word; it cannot run across a command separator or a quote, so a
+# second command that merely mentions the folder is not taken for the wrapper.
 _WRAPPER_START = re.compile(
-    r"""(?:^|\s)-c\s+["']?source\s+\S*shell-snapshots[\\/]snapshot-[\w.-]*\.sh["']?""",
+    r"""(?:^|\s)-c\s+["']?source\s+["']?[^"'|&;<>]*?shell-snapshots[\\/]snapshot-[\w.-]*\.sh["']?""",
     re.IGNORECASE,
 )
 

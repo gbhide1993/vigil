@@ -428,6 +428,7 @@ class Aggregator:
         path = event["path"]
         confidence = event.get("attribution_confidence", "high")
         event_source = event.get("event_source", "poll")
+        agents_active = event.get("agents_active")   # set only for a write recorded as unattributed
 
         if _is_credential_path(path):
             await self._write_credential_event(event)
@@ -439,7 +440,8 @@ class Aggregator:
                 "session_id": event["session_id"],
                 "event_type": event["event_type"],
                 "path": path,
-                "detail": {"attribution_confidence": confidence, "change": event.get("change")},
+                "detail": {"attribution_confidence": confidence, "change": event.get("change"),
+                           **({"agents_active": agents_active} if agents_active else {})},
                 "severity": "low",
                 "pid": event.get("pid"),
                 "event_source": event_source,
@@ -460,6 +462,7 @@ class Aggregator:
                 "count": 1,
                 "paths": {path},
                 "confidence": confidence,
+                "agents_active": agents_active,
             }
             return
 
@@ -469,6 +472,8 @@ class Aggregator:
             buf["event_type"] = "file_write"  # mixed read/write escalates to write
         if confidence == "low":
             buf["confidence"] = "low"  # any low-confidence event taints the window
+        if agents_active:
+            buf["agents_active"] = max(buf.get("agents_active") or 0, agents_active)
 
     async def ingest_net_event(self, event: dict) -> None:
         """event: {agent_id, session_id, host, bytes_out}"""
@@ -689,6 +694,7 @@ class Aggregator:
                         json.dumps({
                             "paths": sorted(buf["paths"])[:50],
                             "attribution_confidence": buf["confidence"],
+                            **({"agents_active": buf["agents_active"]} if buf.get("agents_active") else {}),
                         }),
                         buf["count"],
                     ),
@@ -894,6 +900,7 @@ class Aggregator:
                         "event_type": event["event_type"],
                         "attribution_confidence": event.get("attribution_confidence", "high"),
                         "change": event.get("change"),
+                        **({"agents_active": event["agents_active"]} if event.get("agents_active") else {}),
                     }),
                     pid,
                     event_source,
@@ -941,6 +948,7 @@ class Aggregator:
                     json.dumps({
                         "attribution_confidence": event.get("attribution_confidence", "high"),
                         "change": event.get("change"),
+                        **({"agents_active": event["agents_active"]} if event.get("agents_active") else {}),
                     }),
                     event["pid"],
                     event["event_source"],

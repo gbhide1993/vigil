@@ -86,9 +86,11 @@ async def test_native_observer_confidence_is_never_high(monkeypatch):
     # one agent, several processes, the open-handle check names one: still not "high"
     refined["pid"] = 11
     assert await find(_Cache({10: "claude_code", 11: "claude_code"}), "C:/p/a.py") == (11, "medium")
-    # more than one agent running
+    # more than one agent running and nothing narrows it down: no agent is picked (the write is recorded as
+    # unattributed, see test_unattributed_writes.py)
     refined["pid"] = None
-    assert await find(_Cache({10: "claude_code", 20: "codex"}), "C:/p/a.py") == (10, "low")
+    assert await find(_Cache({10: "claude_code", 20: "codex"}), "C:/p/a.py") == (None, file_watcher.AMBIGUOUS)
+    assert await find(_Cache({10: "claude_code", 20: "codex"}), None) == (None, file_watcher.AMBIGUOUS)
     # polling tier (no path given)
     assert await find(_Cache({10: "claude_code"}), None) == (10, "medium")
 
@@ -634,3 +636,54 @@ def test_pdf_prints_checkpoint_and_attribution_notes_and_no_checkpoint_paths():
     assert "attributed to claude_code (best guess)" in drawn
     assert drawn.count("4 checkpoint writes in the agent's hidden cache, not listed") == 1
     assert not any("file-history" in t for t in drawn)
+
+
+# ------------------------------------------------------ unattributed writes in the reports
+
+async def _unattributed_session(db, agents_active=2):
+    cur = await db.execute("INSERT INTO agents (name, process_name, pid, approved) VALUES ('unattributed', 'unattributed', NULL, 1)")
+    await db.commit()
+    agent_id = cur.lastrowid
+    sid = await _session(db, agent_id)
+    detail = json.dumps({"attribution_confidence": "low", "change": "write", "agents_active": agents_active})
+    for path in ("C:/proj/a.py", "C:/proj/b.py"):
+        await db.execute(
+            "INSERT INTO events (agent_id, session_id, event_type, path, detail, event_source, created_at) "
+            "VALUES (?, ?, 'file_write', ?, ?, 'realtime_heuristic', ?)",
+            (agent_id, sid, path, detail, _now_sql()),
+        )
+    await db.commit()
+    return agent_id, sid
+
+
+@pytest.mark.asyncio
+async def test_session_report_and_pdf_say_two_agents_were_active_and_do_not_say_best_guess(db):
+    agent_id, sid = await _unattributed_session(db)
+    try:
+        report = await sessions_module._build_session_report_data(db, sid)
+        for row in report["file_changes"]:
+            assert row["attribution"] == "unattributed" and row["attribution_confidence"] == "low"
+            assert row["attribution_label"] == "2 agents active, cannot tell which wrote this"
+        drawn, cap = _capture_pdf_text(None)
+        with cap:
+            await sessions_module.get_session_report_pdf(sid)
+        text = "\n".join(drawn)
+        assert "2 agents active, cannot tell which wrote this" in text
+        change_lines = [line for line in drawn if line.startswith("2 agents active")]
+        assert len(change_lines) == 2 and not any("best guess" in line for line in change_lines)
+        events = await events_module.get_events(agent=agent_id, type=None, since=None, session=sid, q=None, offset=0, limit=50)
+        assert {e["attribution_label"] for e in events["events"]} == {"2 agents active, cannot tell which wrote this"}
+    finally:
+        await _cleanup(db, agent_id)
+
+
+@pytest.mark.asyncio
+async def test_daily_summary_note_for_an_unattributed_session_is_the_same_wording(db):
+    agent_id, sid = await _unattributed_session(db, agents_active=3)
+    try:
+        summary = await export_module._build_summary("today")
+        session = next(s for s in summary["sessions"] if s["id"] == sid)
+        assert session["files_changed"]["attribution_note"] == "3 agents active, cannot tell which wrote this"
+        assert "best_guess_attribution" not in session["files_changed"]
+    finally:
+        await _cleanup(db, agent_id)

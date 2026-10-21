@@ -38,7 +38,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 
-from core.attribution import agent_for_path
+from core.attribution import UNATTRIBUTED_AGENT, agent_for_path
 from core.attributor import Attributor
 from core.burst_detector import BurstDetector
 from core.correlation_engine import CorrelationEngine
@@ -262,6 +262,11 @@ class _AgentPidCache:
             logger.exception("agent pid cache refresh failed, keeping previous snapshot")
 
 
+# Returned by _find_owning_agent_pid in place of a confidence when two or more agents were running and nothing
+# narrows the write down to one of them.
+AMBIGUOUS = "ambiguous"
+
+
 async def _find_owning_agent_pid(pid_cache: _AgentPidCache, path: str | None = None) -> tuple[int | None, str]:
     """Best-effort: pick from the currently-cached known-agent processes
     (see _AgentPidCache) — refined, when `path` is given (tier 2 only, see
@@ -278,9 +283,8 @@ async def _find_owning_agent_pid(pid_cache: _AgentPidCache, path: str | None = N
     Returns (pid, confidence). If more than one distinct known agent is
     running concurrently and the open-handle refinement didn't narrow it
     down to exactly one (including on a subprocess timeout/failure -- see
-    _refine_pid_by_open_handle), we still pick the first match but flag
-    confidence as "low" so it's auditable rather than silently presented
-    as certain.
+    _refine_pid_by_open_handle), no agent is picked: it returns
+    (None, AMBIGUOUS) and the write is recorded as unattributed.
 
     Confidence is never "high" for this (native / polling observer) tier; see
     the comment where it is chosen below."""
@@ -300,8 +304,12 @@ async def _find_owning_agent_pid(pid_cache: _AgentPidCache, path: str | None = N
     # file, only which agents were running. "low" = more than one agent was
     # running; "medium" = one agent was running, but the writer was not
     # verified (a change you made yourself looks the same).
-    confidence = "low" if len(seen_agents) > 1 else "medium"
-    return matches[0], confidence
+    if len(seen_agents) > 1:
+        # Two or more agents and nothing to tell them apart: do not pick one (the first in the cache used to get the
+        # write, which is how Claude Code's changes ended up under an idle Codex). The caller records the write as
+        # unattributed (core/attribution.py).
+        return None, AMBIGUOUS
+    return matches[0], "medium"
 
 
 async def _refine_pid_by_open_handle(candidate_pids: list[int], path: str) -> int | None:
@@ -525,6 +533,11 @@ class VlawFileHandler(FileSystemEventHandler):
         guess_path = path if self.use_pid_heuristic else None
         pid, confidence = await _find_owning_agent_pid(self.pid_cache, guess_path)
         event_source = "realtime_heuristic" if self.use_pid_heuristic else "poll"
+        if confidence == AMBIGUOUS:
+            agents_active = max(2, len(set(self.pid_cache.snapshot().values())))
+            await self.handle_file_event(path, event_type, event_source, None, "low", time.time(), change=change,
+                                         agents_active=agents_active)
+            return
         await self.handle_file_event(path, event_type, event_source, pid, confidence, time.time(), change=change)
 
     async def handle_etw_event(self, pid: int, path: str, event_type: str, timestamp: float, change: str | None = None) -> None:
@@ -543,7 +556,10 @@ class VlawFileHandler(FileSystemEventHandler):
         confidence: str,
         timestamp: float | None = None,
         change: str | None = None,
+        agents_active: int | None = None,
     ) -> None:
+        """agents_active is set only for a write that cannot be told apart between that many running agents: it is
+        then recorded under the "unattributed" agent (pid None, confidence low)."""
         # Safety filter for every tier (native, polling and ETW): changes
         # inside Vigil's own install folder or data folder (its database,
         # logs, updates) are never recorded, however the watch list was
@@ -562,15 +578,19 @@ class VlawFileHandler(FileSystemEventHandler):
         # not just the ones this path already attributed.
         await self._burst_detector.record_event(path, event_type)
 
-        agent_name = self.attributor.get_agent_for_pid(pid) if pid else None
+        if agents_active:
+            agent_name = UNATTRIBUTED_AGENT
+            agent_id = await self.attributor.get_or_create_unattributed_agent()
+        else:
+            agent_name = self.attributor.get_agent_for_pid(pid) if pid else None
 
-        if agent_name is None:
-            return  # no known/suspected agent active — nothing to attribute this to
+            if agent_name is None:
+                return  # no known/suspected agent active — nothing to attribute this to
 
-        is_unidentified = agent_name == "unidentified_agent"
-        behaviour_confidence = self.attributor.get_behaviour_score_for_pid(pid) if is_unidentified else None
+            is_unidentified = agent_name == "unidentified_agent"
+            behaviour_confidence = self.attributor.get_behaviour_score_for_pid(pid) if is_unidentified else None
 
-        agent_id = await self.attributor.get_or_create_agent(agent_name, pid, confidence=behaviour_confidence)
+            agent_id = await self.attributor.get_or_create_agent(agent_name, pid, confidence=behaviour_confidence)
         session_id = await self.attributor.sessions.touch(agent_id)
 
         if not CORE_ONLY:
@@ -589,6 +609,8 @@ class VlawFileHandler(FileSystemEventHandler):
             "event_source": event_source,
             "timestamp": timestamp if timestamp is not None else time.time(),
         }
+        if agents_active:
+            event_dict["agents_active"] = agents_active
 
         if self.aggregator is not None:
             await self.aggregator.ingest_file_event(event_dict)

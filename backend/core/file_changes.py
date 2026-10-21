@@ -65,7 +65,7 @@ def rows_to_changes(rows, agent_name: str | None) -> list[dict]:
         event_type = row["event_type"]
         confidence = detail.get("attribution_confidence")
         change = change_type(event_type, detail)
-        attribution = attribution_for(agent_name, row["event_source"], confidence)
+        attribution = attribution_for(agent_name, row["event_source"], confidence, detail.get("agents_active"))
         paths = detail.get("paths")
         targets = paths if paths else ([row["path"]] if row["path"] else [])
         for path in targets:
@@ -149,5 +149,7 @@ def summarise(changes: list[dict], *, scope_dirs: list[str] | None = None,
             f"{checkpoint_writes} checkpoint writes in the agent's hidden cache, not listed" if checkpoint_writes else None
         ),
         "best_guess_attribution": any(c.get("attribution") == "best_guess" for c in changes),
+        # set when some change could not be told apart between running agents: the wording to show
+        "unattributed_label": next((c["attribution_label"] for c in changes if c.get("attribution") == "unattributed"), None),
         "note": "full list in the session report",
     }
