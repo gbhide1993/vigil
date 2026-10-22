@@ -185,3 +185,55 @@ def test_a_run_whose_basetemp_is_the_real_folder_fails_before_pytest_empties_it(
     result, real = _child_pytest(tmp_path, extra_args=("--basetemp={real}",))
     assert result.returncode != 0 and "--basetemp" in result.stdout + result.stderr
     assert (real / "data" / "vlaw.db").read_text() == "evidence", "pytest must not have emptied the folder"
+
+
+# ------------------------------------------------ pytest's own cache clean-up is allowed, nothing else is
+
+@pytest.fixture
+def fake_backend(tmp_path, monkeypatch):
+    """A stand-in backend directory that is NOT under an allowed root, so only the pytest-cache rule can allow it."""
+    backend = tmp_path / "backend"
+    (backend / "core").mkdir(parents=True)
+    monkeypatch.setattr(guard, "_BACKEND_DIR", str(backend))
+    monkeypatch.setattr(guard, "_allowed_roots", [])
+    return backend
+
+
+def test_pytest_cache_temp_dir_inside_backend_is_allowed(fake_backend):
+    for name in ("pytest-cache-files-isy0lybc", ".pytest_cache"):
+        folder = fake_backend / name
+        (folder / "v" / "cache").mkdir(parents=True)
+        (folder / "v" / "cache" / "lastfailed").write_text("{}")
+        shutil.rmtree(folder)
+        assert not folder.exists()
+    nested = fake_backend / ".pytest_cache" / "d" / "x"
+    nested.mkdir(parents=True)
+    os.rmdir(nested)                                    # under .pytest_cache
+
+
+def test_other_backend_folders_and_lookalikes_are_still_refused(fake_backend):
+    for target in (fake_backend / "core", fake_backend, fake_backend.parent / "pytest-cache-files-abc",
+                   fake_backend / "core" / "pytest-cache-files-abc", fake_backend / "my.pytest_cache"):
+        with pytest.raises(guard.SandboxViolation):
+            shutil.rmtree(target)
+    assert (fake_backend / "core").is_dir()
+
+
+def test_the_real_folder_its_parent_and_what_is_around_it_stay_refused_even_inside_the_cache_rule(stand_in, monkeypatch):
+    """The cache rule is checked after the real-folder rule, also when the stand-in sits under the 'backend' dir."""
+    monkeypatch.setattr(guard, "_BACKEND_DIR", str(stand_in.parent.parent))
+    nested_cache = stand_in / "pytest-cache-files-zzz"
+    nested_cache.mkdir()
+    for target in (stand_in, stand_in.parent, stand_in / "keys", nested_cache):
+        with pytest.raises(guard.SandboxViolation):
+            shutil.rmtree(target)
+    assert _intact(stand_in) and nested_cache.is_dir()
+
+
+def test_the_real_backend_core_folder_is_refused_in_this_run():
+    core = Path(guard._BACKEND_DIR) / "core"
+    assert core.is_dir() and not guard._dir_allowed(core)
+    with pytest.raises(guard.SandboxViolation):
+        shutil.rmtree(core)
+    assert core.is_dir()
+    assert guard._is_pytest_cache_path(Path(guard._BACKEND_DIR) / "pytest-cache-files-isy0lybc")

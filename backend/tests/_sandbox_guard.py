@@ -114,8 +114,23 @@ def bypass():
         _bypass -= 1
 
 
+# pytest's own cache provider makes "pytest-cache-files-*" temp dirs next to .pytest_cache and removes them again (a
+# fresh checkout has no .pytest_cache yet). Those, and anything under a ".pytest_cache" folder, may be deleted, but
+# only inside the backend directory: nothing else in the repo, and nothing near the real V-LAW folder.
+_BACKEND_DIR = str(Path(__file__).resolve().parents[1])
+PYTEST_CACHE_PREFIX = "pytest-cache-files-"
+PYTEST_CACHE_DIR = ".pytest_cache"
+
+
+def _is_pytest_cache_path(path) -> bool:
+    if not _inside(path, _BACKEND_DIR) or _norm(path) == _norm(_BACKEND_DIR):
+        return False
+    relative = os.path.relpath(_norm(path), _norm(_BACKEND_DIR)).split(os.sep)
+    return relative[0].startswith(PYTEST_CACHE_PREFIX) or relative[0] == PYTEST_CACHE_DIR
+
+
 def _dir_allowed(path) -> bool:
-    return any(_inside(path, root) for root in _allowed_roots)
+    return any(_inside(path, root) for root in _allowed_roots) or _is_pytest_cache_path(path)
 
 
 def _check_directory_delete(path, what: str) -> None:
