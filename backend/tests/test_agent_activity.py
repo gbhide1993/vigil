@@ -317,6 +317,21 @@ def test_tray_tooltip_says_why_kernel_tracing_is_off():
     assert out["on"] == "Vigil: watching" and out["long"] <= 127
 
 
+def test_tray_only_mentions_kernel_tracing_when_it_was_asked_for():
+    tray = (ROOT / "tray" / "main.js").read_text(encoding="utf-8")
+    assert "etw_requested === true" in tray and "etw_available === false" in tray
+    out = _node("""
+    import { createRequire } from 'node:module'
+    const { trayStatusText } = createRequire(import.meta.url)('./tray/status-text.js')
+    console.log(JSON.stringify({
+      native: trayStatusText({ agents: [], etwUnavailableReason: null }),
+      asked: trayStatusText({ agents: [], etwUnavailableReason: 'kernel tracing needs administrator' }),
+    }))
+    """)
+    assert out["native"] == "Vigil: watching" and "administrator" not in out["native"]
+    assert out["asked"] == "Vigil: watching (kernel tracing needs administrator)"
+
+
 def test_tray_and_sidebar_use_the_backend_definition():
     tray = (ROOT / "tray" / "main.js").read_text(encoding="utf-8")
     assert "trayStatusText" in tray and "session in progress" not in tray and "Live:" not in tray

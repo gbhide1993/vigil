@@ -106,7 +106,7 @@ from core.instance_lock import InstanceAlreadyRunning, acquire_instance_lock, re
 from core.log_setup import configure_logging
 from core.scope_store import get_scope_directories
 from core import watch_stats
-from core.monitoring_status import etw_available, etw_unavailable_reason, file_watcher_tier, mcp_monitoring, network_monitoring
+from core.monitoring_status import etw_available, etw_requested, etw_unavailable_reason, file_watcher_tier, mcp_monitoring, network_monitoring
 from core.red_lines import SESSION_LAUNCH_DIR
 from db.database import DB_PATH, close_db, get_db, get_read_db, init_db
 from license.license_service import LicenseService
@@ -439,7 +439,11 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(aggregator.flush_buffers, "interval", seconds=15, id="aggregator_flush", max_instances=1, coalesce=True)
     # Stage 1 burst+correlation (see watchers/file_watcher.py::check_burst) —
     # independent of any single file event's own pid-guess attribution.
-    scheduler.add_job(file_handler.check_burst, "interval", seconds=30, id="file_burst_check", max_instances=1, coalesce=True)
+    # Looks the handler up on each run: if ETW was chosen and falls back to the native watcher mid-run, the handler changes.
+    async def _file_burst_check():
+        await _state["file_handler"].check_burst()
+
+    scheduler.add_job(_file_burst_check, "interval", seconds=30, id="file_burst_check", max_instances=1, coalesce=True)
     scheduler.add_job(_baseline_tick, "interval", hours=1, id="baseline_update", args=[baseline], max_instances=1, coalesce=True)
     scheduler.add_job(
         _seal_evidence_chain, "interval", seconds=15, id="evidence_chain_seal",
@@ -477,6 +481,7 @@ async def lifespan(app: FastAPI):
 
     # shutdown
     scheduler.shutdown(wait=False)
+    observer = _state.get("observer") or observer     # the native watcher if ETW fell back during the run
     observer.stop()
     observer.join(timeout=5)
     await aggregator.stop_writer()
@@ -866,6 +871,7 @@ async def health():
         "file_watcher_tier": file_watcher_tier(),
         # Kernel tracing needs an elevated backend; a normal install runs false with the reason (null when running).
         "etw_available": etw_available(),
+        "etw_requested": etw_requested(),
         "etw_unavailable_reason": etw_unavailable_reason(),
         "file_events_not_recorded": watch_stats.summary(),
         # Read from the scheduler's real state ("off" while the watcher's

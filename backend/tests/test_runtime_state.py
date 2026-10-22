@@ -152,6 +152,7 @@ def _scope_roundtrip(tmp_path, launch, expect_tier):
         "VLAW_PORT": str(port),
         "VLAW_LOG_FILE": str(log_file),
         "LOCALAPPDATA": str(local),
+        **({"VLAW_FILE_WATCHER": "etw"} if expect_tier == "etw" else {}),    # ETW is off unless asked for
     }
     stdout = open(tmp_path / "stdout.txt", "wb")
     TIMINGS.clear()

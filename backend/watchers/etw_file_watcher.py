@@ -33,6 +33,8 @@ above.
 
 import asyncio
 import logging
+import os
+import subprocess
 import threading
 import time
 
@@ -118,6 +120,26 @@ MAX_FILEOBJECT_CACHE_ENTRIES = 4096
 MAX_INFLIGHT_EVENTS = 1000  # caps scheduled-but-not-yet-run callback coroutines
 EVENT_POLL_TIMEOUT_SECONDS = 1.0
 _UNRESOLVED_SCHEMA_LOG_INTERVAL_SECONDS = 300  # rate-limit the point-1 diagnostic
+# If this many reportable file events in a row (write, rename, delete, ...) have no file name, from the event itself or
+# from an earlier open of the same file, the trace is not usable and the watcher hands over to the native tier.
+UNRESOLVED_FALLBACK_AFTER = 500
+SESSION_NAME = "vlaw-kernel-file"
+
+
+def stop_stale_session(name: str = SESSION_NAME, run=subprocess.run) -> bool:
+    """Stops a trace session left running by a force-killed backend (it keeps the fixed name, and the next start
+    would fail with AlreadyExist). True if a session was stopped. Never raises; a missing session is the normal case."""
+    if os.name != "nt":
+        return False
+    try:
+        result = run(["logman", "stop", name, "-ets"], capture_output=True, text=True, timeout=15)
+    except Exception as e:
+        logger.info("ETW file watcher: could not look for a stale %s session (%s)", name, e)
+        return False
+    stopped = result.returncode == 0
+    if stopped:
+        logger.warning("ETW file watcher: stopped a stale %s session left by an earlier run", name)
+    return stopped
 
 
 class ETWFileWatcher:
@@ -141,10 +163,17 @@ class ETWFileWatcher:
         self._start_error: str | None = None
         # Plain-English reason start() returned False (None until then); read by file_watcher for /health.
         self.unavailable_reason: str | None = None
+        self._fallback = None                    # fn(reason: str): switch to the native tier (set by file_watcher)
+        self._unresolved_streak = 0
+        self._fell_back = False
         self._inflight = threading.Semaphore(MAX_INFLIGHT_EVENTS)
         self._dropped_count = 0
         self._file_object_cache: dict[int, str] = {}
         self._last_unresolved_schema_log = 0.0
+
+    def set_fallback(self, fn) -> None:
+        """fn(reason): called once, from the ETW thread, when the trace turns out not to give usable file names."""
+        self._fallback = fn
 
     def set_callback(self, fn) -> None:
         """fn: async def on_file_event(pid: int, path: str, event_type: str,
@@ -221,8 +250,9 @@ class ETWFileWatcher:
             # the event IDs themselves are valid.  The same filter is applied
             # in Python inside _process_event via _SUBSCRIBED_IDS_FAST, which
             # has identical effect with negligible overhead.
+            stop_stale_session()
             provider = pyetwkit.FileProvider.kernel()
-            self._listener = pyetwkit.EtwListener(providers=[provider], name="vlaw-kernel-file")
+            self._listener = pyetwkit.EtwListener(providers=[provider], name=SESSION_NAME)
             self._listener.start()
         except Exception as e:
             # Most commonly OSError ("administrator privileges required") --
@@ -279,7 +309,11 @@ class ETWFileWatcher:
             if path is None and file_object is not None:
                 path = self._file_object_cache.get(file_object)
             if not path:
-                return  # can't safely report a file event with no resolved path
+                # Not recorded and not silent: counted, and a long run of these means the trace gives no names.
+                watch_stats.add_unresolved()
+                self._note_unresolved(event_id)
+                return
+            self._unresolved_streak = 0
 
             # Generated / dependency folders are dropped here, before the
             # attribution lookup and any dispatch (core/ignore_rules.py).
@@ -310,6 +344,22 @@ class ETWFileWatcher:
             self._dispatch(pid, path, event_type, timestamp, EVENT_ID_TO_CHANGE.get(event_id))
         except Exception:
             logger.exception("ETW file watcher: failed to process one event, skipping it")
+
+    def _note_unresolved(self, event_id: int) -> None:
+        self._unresolved_streak += 1
+        if self._unresolved_streak < UNRESOLVED_FALLBACK_AFTER or self._fell_back:
+            return
+        self._fell_back = True
+        reason = (f"kernel tracing gave no file name for {UNRESOLVED_FALLBACK_AFTER} file events in a row "
+                  f"(last: event {event_id}), so the native watcher is used instead")
+        logger.warning("ETW file watcher: %s", reason)
+        self.unavailable_reason = reason
+        self._stop_event.set()          # the read loop ends and the session is stopped
+        if self._fallback is not None:
+            try:
+                self._fallback(reason)
+            except Exception:
+                logger.exception("ETW file watcher: switching to the native watcher failed")
 
     def _extract_path(self, event) -> str | None:
         for name in PATH_PROPERTY_CANDIDATES:

@@ -450,8 +450,9 @@ async function updateTrayTooltip() {
     tray.setToolTip(trayStatusText({
       agents: (agentsRes.body && agentsRes.body.agents) || [],
       needsReview: (statsRes.body && statsRes.body.needs_review) || 0,
-      // /api/health: why kernel tracing is not running (a normal, non-elevated install), shown after the status.
-      etwUnavailableReason: (healthRes.body && healthRes.body.etw_available === false && healthRes.body.etw_unavailable_reason) || null,
+      // /api/health: shown only when kernel tracing was asked for (VLAW_FILE_WATCHER=etw) and is not running; the default
+      // native watcher is just "watching".
+      etwUnavailableReason: (healthRes.body && healthRes.body.etw_requested === true && healthRes.body.etw_available === false && healthRes.body.etw_unavailable_reason) || null,
     }))
   } catch (err) {
     // non-fatal — tooltip just keeps its last known text until this succeeds again

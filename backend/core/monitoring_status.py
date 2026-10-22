@@ -48,7 +48,7 @@ def mcp_monitoring() -> str:
 # folders). Set from what start_file_watcher actually returned; "polling" is the safe default.
 FILE_WATCHER_TIERS = ("etw", "native", "polling")
 _file_tier = "polling"
-_etw_reason: str | None = "kernel tracing has not been started"
+_etw_reason: str | None = "kernel tracing is experimental and off by default (set VLAW_FILE_WATCHER=etw to try it)"
 
 
 def set_file_watcher_tier(tier: str) -> None:
@@ -69,6 +69,23 @@ def set_etw_unavailable_reason(reason: str | None) -> None:
     _etw_reason = reason
 
 
+# True only when VLAW_FILE_WATCHER=etw was set: kernel tracing is experimental and off by default, so the tray and
+# the reports only talk about it when someone asked for it.
+_etw_requested = False
+
+
+def set_etw_requested(requested: bool) -> None:
+    global _etw_requested
+    _etw_requested = bool(requested)
+
+
+def etw_requested() -> bool:
+    return _etw_requested
+
+
+ETW_OFF_BY_DEFAULT = "kernel tracing is experimental and off by default (set VLAW_FILE_WATCHER=etw to try it)"
+
+
 def etw_available() -> bool:
     return _file_tier == "etw"
 
@@ -82,6 +99,8 @@ def describe_etw_failure(error: str | None) -> str:
     """Turns an ETW start error into a short sentence for /health and the tray tooltip."""
     text = (error or "").strip()
     low = text.lower()
+    if "alreadyexist" in low.replace(" ", "") or "already exist" in low:
+        return "a kernel trace session named vlaw-kernel-file is still running and could not be stopped"
     if "access is denied" in low or "administrator" in low or "privilege" in low or "elevat" in low:
         return "kernel tracing needs administrator"
     if not text:
