@@ -24,7 +24,7 @@ from core import mcp_service, report_coverage, watch_stats
 from core.aggregator import Aggregator
 from core.attributor import AGENT_LAST_SEEN_WRITE_SECONDS, Attributor
 from core.device_paths import normalise_device_path
-from core.monitoring_status import etw_available, etw_unavailable_reason, file_watcher_tier, set_file_watcher_tier
+from core.monitoring_status import etw_available, etw_requested, etw_unavailable_reason, file_watcher_tier, set_file_watcher_tier
 from core.scope_filter import ScopeFilter
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -456,6 +456,9 @@ async def test_native_forces_the_native_observer_without_trying_etw(monkeypatch)
         def set_callback(self, fn):
             pass
 
+        def set_fallback(self, fn):
+            pass
+
         def start(self):
             return True
 
@@ -497,13 +500,15 @@ async def test_native_forces_the_native_observer_without_trying_etw(monkeypatch)
         watcher, _handler = file_watcher.start_file_watcher(None, None, [])
         return type(watcher).__name__, dict(built)
 
-    assert await start(None) == ("FakeETW", {"etw": 1, "native": 0, "polling": 0}), "auto: ETW first"
+    assert await start(None) == ("FakeObserver", {"etw": 0, "native": 1, "polling": 0}), "auto: native, ETW is never tried"
+    assert file_watcher_tier() == "native" and not etw_available() and not etw_requested()
+    assert "off by default" in etw_unavailable_reason()
     assert await start("native") == ("FakeObserver", {"etw": 0, "native": 1, "polling": 0}), "native: ETW is never tried"
     assert file_watcher_tier() == "native" and not etw_available() and "switched off" in etw_unavailable_reason()
     assert await start("polling") == ("FakePolling", {"etw": 0, "native": 0, "polling": 1})
     assert file_watcher_tier() == "polling" and not etw_available() and "switched off" in etw_unavailable_reason()
-    assert await start(None) == ("FakeETW", {"etw": 1, "native": 0, "polling": 0})
-    assert file_watcher_tier() == "etw" and etw_available() and etw_unavailable_reason() is None
+    assert await start("etw") == ("FakeETW", {"etw": 1, "native": 0, "polling": 0}), "ETW only when asked for"
+    assert file_watcher_tier() == "etw" and etw_available() and etw_requested() and etw_unavailable_reason() is None
 
 
 @pytest.mark.asyncio
@@ -551,16 +556,191 @@ async def test_health_says_etw_is_unavailable_and_why_when_the_kernel_session_is
     monkeypatch.setattr(etw, "pyetwkit", FakePyetwkit, raising=False)
     monkeypatch.setattr(file_watcher, "Observer", FakeObserver)
     monkeypatch.setattr(file_watcher, "_AgentPidCache", FakeCache)
-    monkeypatch.delenv(file_watcher.FILE_WATCHER_ENV, raising=False)
+    monkeypatch.setenv(file_watcher.FILE_WATCHER_ENV, "etw")
     monkeypatch.delenv("VLAW_HOST_ROOT", raising=False)
+    monkeypatch.setattr(etw, "stop_stale_session", lambda *a, **k: False)
 
     watcher, _handler = file_watcher.start_file_watcher(None, None, [])
     assert isinstance(watcher, FakeObserver), "ETW failed, so the folder observer took over"
     monkeypatch.setitem(main_module._state, "observer", watcher)
     health = await main_module.health()
-    assert health["etw_available"] is False
+    assert health["etw_available"] is False and health["etw_requested"] is True
     assert health["etw_unavailable_reason"] == "kernel tracing needs administrator"
     assert health["file_watcher_tier"] == "native"
+
+
+# ------------------------------------------------------------------ ETW opt-in: names, fallback, stale session
+
+class _Event:
+    """An ETW event as the watcher reads it: ids and numbers by property, and no name unless one is given."""
+
+    def __init__(self, event_id, file_object=1, name=None, pid=4242):
+        self.event_id, self.process_id, self.timestamp_unix = event_id, pid, 1.0
+        self._file_object, self._name = file_object, name
+        self.properties = {"FileObject": 1}
+
+    def get_u64(self, key):
+        return self._file_object if key == "FileObject" else None
+
+    def get_string(self, key):
+        return self._name if key in ("FileName", "OpenPath") else None
+
+
+class _AttributorStub:
+    def get_agent_for_pid(self, pid):
+        return "claude_code"
+
+
+def _watcher(monkeypatch, scope_allows=True):
+    class Scope:
+        def allows(self, path):
+            return scope_allows
+
+    watcher = etw.ETWFileWatcher(_AttributorStub(), scope=Scope())
+    seen = []
+    monkeypatch.setattr(watcher, "_dispatch", lambda *a, **k: seen.append(a))
+    return watcher, seen
+
+
+def test_a_write_event_with_no_name_is_counted_not_silently_dropped(monkeypatch):
+    watcher, seen = _watcher(monkeypatch)
+    watcher._process_event(_Event(etw.TASK_WRITE, file_object=77))
+    assert seen == [] and watch_stats.unresolved_total() == 1
+    assert watch_stats.summary()["no_file_name_not_recorded"] == 1
+
+
+def test_a_write_is_recorded_when_the_open_of_the_same_file_object_was_seen(monkeypatch):
+    watcher, seen = _watcher(monkeypatch)
+    watcher._process_event(_Event(etw.TASK_CREATE, file_object=9, name="\\??\\C:\\proj\\a.txt"))
+    watcher._process_event(_Event(etw.TASK_WRITE, file_object=9))
+    assert len(seen) == 1 and seen[0][1].lower().endswith("a.txt") and watch_stats.unresolved_total() == 0
+
+
+def test_etw_falls_back_to_native_after_n_events_in_a_row_with_no_name_and_says_why(monkeypatch):
+    watcher, _seen = _watcher(monkeypatch)
+    reasons = []
+    watcher.set_fallback(reasons.append)
+    for _ in range(etw.UNRESOLVED_FALLBACK_AFTER - 1):
+        watcher._process_event(_Event(etw.TASK_WRITE))
+    assert reasons == [] and not watcher._stop_event.is_set()
+    watcher._process_event(_Event(etw.TASK_WRITE))
+    watcher._process_event(_Event(etw.TASK_WRITE))             # past the limit: the switch happens once
+    assert len(reasons) == 1 and "no file name" in reasons[0] and "native watcher" in reasons[0]
+    assert watcher._stop_event.is_set() and watcher.unavailable_reason == reasons[0]
+
+
+def test_one_resolved_event_resets_the_run(monkeypatch):
+    watcher, _seen = _watcher(monkeypatch)
+    reasons = []
+    watcher.set_fallback(reasons.append)
+    for _ in range(etw.UNRESOLVED_FALLBACK_AFTER - 1):
+        watcher._process_event(_Event(etw.TASK_WRITE, file_object=5))
+    watcher._process_event(_Event(etw.TASK_NAME_CREATE, file_object=6, name="C:\\proj\\b.txt"))
+    watcher._process_event(_Event(etw.TASK_WRITE, file_object=6))        # resolved from the name just seen
+    for _ in range(etw.UNRESOLVED_FALLBACK_AFTER - 1):
+        watcher._process_event(_Event(etw.TASK_WRITE, file_object=5))
+    assert reasons == []
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_starts_native_and_health_reports_native_with_the_real_reason(db, monkeypatch):
+    import main as main_module
+    from core import runtime_state
+
+    class FakeObserver:
+        def __init__(self, *a, **kw):
+            pass
+
+        def schedule(self, *a, **kw):
+            return object()
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return True
+
+    class FakeCache:
+        def __init__(self, attributor):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(file_watcher, "Observer", FakeObserver)
+    monkeypatch.setattr(file_watcher, "_AgentPidCache", FakeCache)
+    monkeypatch.delenv("VLAW_HOST_ROOT", raising=False)
+    set_file_watcher_tier("etw")
+    reason = "kernel tracing gave no file name for 500 file events in a row (last: event 16), so the native watcher is used instead"
+    observer, handler = file_watcher._switch_to_native(reason, None, None, None, [], None, None, None)
+    monkeypatch.setitem(main_module._state, "observer", observer)
+    assert runtime_state.state["observer"] is observer and runtime_state.state["file_handler"] is handler
+    health = await main_module.health()
+    assert health["file_watcher_tier"] == "native" and health["etw_available"] is False
+    assert health["etw_unavailable_reason"] == reason
+
+
+def test_a_stale_session_is_stopped_before_etw_starts_and_the_run_is_clean_when_there_is_none():
+    calls = []
+
+    class Result:
+        def __init__(self, code):
+            self.returncode = code
+
+    def runner_found(cmd, **kw):
+        calls.append(cmd)
+        return Result(0)
+
+    def runner_missing(cmd, **kw):
+        return Result(1)
+
+    def runner_broken(cmd, **kw):
+        raise FileNotFoundError("logman")
+
+    if os.name == "nt":
+        assert etw.stop_stale_session("vlaw-kernel-file", run=runner_found) is True
+        assert calls == [["logman", "stop", "vlaw-kernel-file", "-ets"]]
+        assert etw.stop_stale_session("vlaw-kernel-file", run=runner_missing) is False
+        assert etw.stop_stale_session("vlaw-kernel-file", run=runner_broken) is False
+
+
+def test_run_stops_a_stale_session_first_and_reports_alreadyexist_as_a_real_reason(monkeypatch):
+    order = []
+
+    class Listener:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self):
+            order.append("start")
+            raise RuntimeError("AlreadyExist")
+
+    class Provider:
+        @staticmethod
+        def kernel():
+            return object()
+
+    class Pyetwkit:
+        FileProvider = Provider
+        EtwListener = Listener
+
+    monkeypatch.setattr(etw, "pyetwkit", Pyetwkit, raising=False)
+    monkeypatch.setattr(etw, "PYETWKIT_AVAILABLE", True)
+    monkeypatch.setattr(etw, "stop_stale_session", lambda *a, **k: order.append("stop") or False)
+    watcher = etw.ETWFileWatcher(_AttributorStub())
+    watcher.set_callback(lambda *a: None)
+
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        assert watcher.start() is False
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+    assert order == ["stop", "start"], "the stale session is stopped before the new one is started"
+    assert "AlreadyExist" not in watcher.unavailable_reason and "still running" in watcher.unavailable_reason
 
 
 # ------------------------------------------------------------------ installer

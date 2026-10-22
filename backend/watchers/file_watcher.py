@@ -1,10 +1,12 @@
 """Watches policy scope_directories and credential_paths for file activity.
 
-Three tiers, tried in priority order once at startup:
-  1. ETW (watchers.etw_file_watcher.ETWFileWatcher) — kernel-level, exact
-     PID, no polling delay. Requires Administrator privileges and the
-     pyetwkit package; see etw_file_watcher.py's module docstring for what
-     has and hasn't been verified about it.
+Three tiers. The default is tier 2 (then 3). Tier 1 is EXPERIMENTAL and used only when VLAW_FILE_WATCHER=etw is
+set explicitly; if it cannot start, or stops giving file names, the native observer is used instead.
+  1. ETW (watchers.etw_file_watcher.ETWFileWatcher) — kernel-level trace
+     with the PID the trace reports, no polling delay. Requires
+     Administrator privileges and the pyetwkit package; see
+     etw_file_watcher.py's module docstring for what has and hasn't been
+     verified about it (not verified end to end).
   2. Native watchdog Observer (ReadDirectoryChangesW-backed, the same
      backend `watchdog` already ships and used to be avoided here entirely
      — see point 3) — real-time delivery, no polling delay, but like ETW's
@@ -18,9 +20,9 @@ Three tiers, tried in priority order once at startup:
      this file used PollingObserver exclusively), and as the last-resort
      fallback if tier 2 also fails to start for any other reason.
 
-Whichever tier starts successfully is used for the life of the process —
-there's no dynamic re-promotion if a higher tier stops working mid-session,
-matching "use ETW if available, else fall back" from the feature spec.
+Whichever tier starts is used for the life of the process; there is no
+re-promotion. The only mid-run change is ETW -> native, when ETW was chosen
+but delivers no usable file names (_switch_to_native).
 """
 
 import asyncio
@@ -50,7 +52,7 @@ from core.ignore_rules import ignore_and_count
 from core.own_paths import is_own_path
 from core.red_lines import RedLines, is_agent_config_path, is_mcp_config_path, register_agent_workspace
 from db.database import get_db
-from core.monitoring_status import set_etw_unavailable_reason, set_file_watcher_tier
+from core.monitoring_status import ETW_OFF_BY_DEFAULT, set_etw_requested, set_etw_unavailable_reason, set_file_watcher_tier
 from watchers.etw_file_watcher import ETWFileWatcher
 
 _CONFIDENCE_BY_NAME = {
@@ -809,9 +811,9 @@ def _schedule_paths(observer, handler: VlawFileHandler, watch_paths: list[str], 
             observer.schedule(handler, expanded, recursive=False)
 
 
-# Forces which file-watching tier to use, for comparing them on one machine. "auto" (the default) is the order in the
-# module docstring: ETW, then the native observer, then polling. "native" skips ETW; "polling" skips ETW and the native
-# observer; "etw" is the same as auto (ETW is already tried first, and a tier that cannot start still falls back).
+# Forces which file-watching tier to use. "auto" (the default) is the native observer, then polling: ETW (kernel
+# tracing) is experimental and is tried ONLY when VLAW_FILE_WATCHER=etw is set. "native" and "polling" are the same as
+# auto for ETW (never tried); "polling" also skips the native observer.
 FILE_WATCHER_ENV = "VLAW_FILE_WATCHER"
 FILE_WATCHER_CHOICES = ("auto", "etw", "native", "polling")
 
@@ -824,44 +826,9 @@ def requested_file_watcher_tier() -> str:
     return value
 
 
-def start_file_watcher(
-    attributor: Attributor, aggregator, watch_paths: list[str], non_recursive_paths: list[str] | None = None,
-    process_watcher=None, network_watcher=None,
-):
-    """Starts the highest-priority file-watching tier that will come up
-    (see module docstring) and returns (watcher, handler). The watcher half
-    always exposes .stop() / .join(timeout) / .is_alive() regardless of
-    which tier it is — main.py's shutdown sequence and /health endpoint
-    treat it uniformly and need no changes for any of this. The handler
-    half is returned so main.py can schedule its check_burst() method
-    (Stage 1 burst+correlation) periodically, the same way it schedules the
-    other watchers' poll() — that scheduler doesn't exist yet at the point
-    in main.py's startup sequence where this function is called.
-
-    process_watcher/network_watcher are threaded through to the handler
-    (see VlawFileHandler.check_burst) purely so it can read their
-    get_snapshot()/get_recent_events() — nothing here calls into them."""
-    loop = asyncio.get_event_loop()
-    requested = requested_file_watcher_tier()
-    if requested != "auto":
-        logger.info("file watcher: %s=%s", FILE_WATCHER_ENV, requested)
-
-    if requested in ("native", "polling"):
-        set_etw_unavailable_reason(f"kernel tracing is switched off ({FILE_WATCHER_ENV}={requested})")
-
-    if requested in ("auto", "etw"):
-        etw_watcher = ETWFileWatcher(attributor)
-        etw_handler = VlawFileHandler(
-            attributor, aggregator, loop, pid_cache=None,
-            process_watcher=process_watcher, network_watcher=network_watcher,
-        )
-        etw_watcher.set_callback(etw_handler.handle_etw_event)
-        if etw_watcher.start():
-            set_file_watcher_tier("etw")
-            return etw_watcher, etw_handler
-        set_etw_unavailable_reason(getattr(etw_watcher, "unavailable_reason", None) or "kernel tracing did not start")
-
-    # Only built for tiers 2/3 (ETW never guesses a pid, so never needs
+def _start_folder_tiers(attributor, aggregator, loop, watch_paths, non_recursive_paths, process_watcher, network_watcher, requested):
+    """The native observer, else polling. Records the tier that came up and returns (observer, handler)."""
+    # Built for the folder tiers only (ETW never guesses a pid, so never needs
     # this) -- starts its own background refresh thread, see _AgentPidCache.
     pid_cache = _AgentPidCache(attributor)
     pid_cache.start()
@@ -871,7 +838,7 @@ def start_file_watcher(
     # notifications don't reliably cross that boundary (this is the
     # original, still-valid reason this file used PollingObserver
     # exclusively before ETW/native support existed), so Docker keeps using
-    # polling unconditionally rather than attempting tier 2 first.
+    # polling unconditionally rather than attempting the native observer first.
     use_native = not os.environ.get("VLAW_HOST_ROOT") and requested != "polling"
 
     if use_native:
@@ -898,4 +865,66 @@ def start_file_watcher(
     observer.start()
     logger.info("file watcher: using polling observer")
     set_file_watcher_tier("polling")
+    return observer, handler
+
+
+def start_file_watcher(
+    attributor: Attributor, aggregator, watch_paths: list[str], non_recursive_paths: list[str] | None = None,
+    process_watcher=None, network_watcher=None,
+):
+    """Starts the file-watching tier and returns (watcher, handler). The native observer is the default (polling if it
+    cannot start); ETW only when VLAW_FILE_WATCHER=etw is set explicitly, and then it falls back to the native
+    observer if it cannot start or stops giving file names (see _switch_to_native). The watcher half always exposes
+    .stop() / .join(timeout) / .is_alive(), so main.py's shutdown sequence and /health treat every tier uniformly. The
+    handler half is returned so main.py can schedule its check_burst() method (Stage 1 burst+correlation)
+    periodically, the same way it schedules the other watchers' poll().
+
+    process_watcher/network_watcher are threaded through to the handler
+    (see VlawFileHandler.check_burst) purely so it can read their
+    get_snapshot()/get_recent_events() — nothing here calls into them."""
+    loop = asyncio.get_event_loop()
+    requested = requested_file_watcher_tier()
+    if requested != "auto":
+        logger.info("file watcher: %s=%s", FILE_WATCHER_ENV, requested)
+    set_etw_requested(requested == "etw")
+
+    if requested == "etw":
+        etw_watcher = ETWFileWatcher(attributor)
+        etw_handler = VlawFileHandler(
+            attributor, aggregator, loop, pid_cache=None,
+            process_watcher=process_watcher, network_watcher=network_watcher,
+        )
+        etw_watcher.set_callback(etw_handler.handle_etw_event)
+        if etw_watcher.start():
+            set_file_watcher_tier("etw")
+            etw_watcher.set_fallback(lambda reason: _switch_to_native(
+                reason, attributor, aggregator, loop, watch_paths, non_recursive_paths, process_watcher, network_watcher,
+            ))
+            return etw_watcher, etw_handler
+        set_etw_unavailable_reason(getattr(etw_watcher, "unavailable_reason", None) or "kernel tracing did not start")
+    elif requested == "auto":
+        set_etw_unavailable_reason(ETW_OFF_BY_DEFAULT)
+    else:
+        set_etw_unavailable_reason(f"kernel tracing is switched off ({FILE_WATCHER_ENV}={requested})")
+
+    return _start_folder_tiers(
+        attributor, aggregator, loop, watch_paths, non_recursive_paths, process_watcher, network_watcher, requested,
+    )
+
+
+def _switch_to_native(reason, attributor, aggregator, loop, watch_paths, non_recursive_paths, process_watcher, network_watcher):
+    """ETW was chosen and started but is not usable: start the native observer on the same folders (including any
+    added since start-up, which only the ETW scope filter knew about) and publish it where the rest of the backend
+    looks (core/runtime_state.py). /health then says tier "native" and gives `reason` as etw_unavailable_reason."""
+    from core import runtime_state
+    from core.scope_filter import etw_scope
+
+    known = {_watch_key(os.path.expanduser(p)) for p in list(watch_paths) + list(non_recursive_paths or [])}
+    added = [p for p in etw_scope.roots() if _watch_key(os.path.expanduser(p)) not in known]
+    observer, handler = _start_folder_tiers(
+        attributor, aggregator, loop, list(watch_paths) + added, non_recursive_paths, process_watcher, network_watcher, "auto",
+    )
+    set_etw_unavailable_reason(reason)
+    runtime_state.state["observer"] = observer
+    runtime_state.state["file_handler"] = handler
     return observer, handler

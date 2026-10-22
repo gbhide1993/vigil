@@ -13,6 +13,7 @@ _lock = threading.Lock()
 _ignored: dict[str, int] = {}
 _dropped: dict[str, int] = {"overload": 0, "buffer_full": 0}
 _out_of_scope = 0
+_unresolved = 0
 _since = time.time()
 
 
@@ -56,6 +57,19 @@ def add_out_of_scope() -> None:
         _out_of_scope += 1
 
 
+def add_unresolved() -> None:
+    """An ETW file change seen but not recorded because the trace gave no file name for it and none could be
+    taken from an earlier open of the same file. Counted only."""
+    global _unresolved
+    with _lock:
+        _unresolved += 1
+
+
+def unresolved_total() -> int:
+    with _lock:
+        return _unresolved
+
+
 def out_of_scope_total() -> int:
     with _lock:
         return _out_of_scope
@@ -69,6 +83,7 @@ def summary() -> dict:
             "dropped_total": sum(_dropped.values()),
             "dropped_by_kind": dict(_dropped),
             "outside_scope_not_recorded": _out_of_scope,
+            "no_file_name_not_recorded": _unresolved,
             "ignored_generated_changes": sum(_ignored.values()),
         }
 
@@ -79,9 +94,10 @@ def since_iso() -> str:
 
 def reset() -> None:
     """For tests."""
-    global _since, _out_of_scope
+    global _since, _out_of_scope, _unresolved
     with _lock:
         _out_of_scope = 0
+        _unresolved = 0
         _ignored.clear()
         for k in _dropped:
             _dropped[k] = 0

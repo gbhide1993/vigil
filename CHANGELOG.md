@@ -13,12 +13,16 @@ Product versions follow the installer (Vigil-Setup.exe). The VS Code extension h
 
 ### Limits
 - Normal installs run the folder watcher; ETW needs an elevated backend and is not verified end to end.
+- ETW is experimental and off by default. On an elevated start with ETW active the backend stalled (write_batch 27.7 s for 2 events, scheduler jobs missed by up to 21 s, /health unresponsive) and recovered when ETW was off. The cause is not confirmed; likely Python processing of the high-volume event stream. ETW is therefore experimental and off by default.
 
 ### Added
 - `GET /health` reports `etw_available` and `etw_unavailable_reason` (for example "kernel tracing needs administrator"); the tray tooltip shows the reason while ETW is not running. `file_watcher_tier` is now `etw`, `native` or `polling` instead of `folders` for both fallbacks.
 - `VLAW_FILE_WATCHER` (`auto`, `etw`, `native`, `polling`) forces the file-watching tier, for comparing them on one machine.
 
 ### Changed
+- `auto` now selects the native watcher. ETW is tried only when `VLAW_FILE_WATCHER=etw` is set. If it is chosen and 500 file events in a row have no file name, the backend switches to the native watcher and `/health` gives the reason in `etw_unavailable_reason`; events with no file name are counted (`no_file_name_not_recorded`) instead of dropped silently.
+- A stale `vlaw-kernel-file` trace session left by a force-killed backend is stopped before ETW starts. A start that still fails with AlreadyExist reports that a session is still running instead of the raw error.
+- `/health` has `etw_requested`. The tray tooltip says "watching" with no kernel-tracing wording unless ETW was asked for and is not running.
 - The ETW tier no longer records every change a recognised agent makes anywhere on the computer; the report note and `docs/COVERAGE.md` say what it records now. Changes outside the watched places are counted, not stored, so an out-of-scope alert is no longer raised for them.
 
 ### Known limits
