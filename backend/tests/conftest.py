@@ -13,10 +13,33 @@ gets imported first.
 import os
 import tempfile
 
+import _sandbox_guard as guard
+
+# The real per-user folder, captured BEFORE anything below changes LOCALAPPDATA. Whatever a run would use for its
+# data, keys, policy or license, or for main.BASE_DIR, must not be this folder (or inside it): the run stops here,
+# before a single backend module is imported.
+guard.set_real_dirs([guard.real_vlaw_dir()])
+guard.check_session_paths(os.environ, guard.expected_base_dir(os.environ))
+
 os.environ.setdefault("VLAW_DATA_DIR", tempfile.mkdtemp(prefix="vlaw_test_data_"))
+# Code that builds %LOCALAPPDATA%\V-LAW itself (core/aggregator.py's crash_recovery.log, core/own_paths.py) must land in
+# this run's temp directory too, also for tests that forget to monkeypatch it. Forced, not setdefault.
+os.environ["LOCALAPPDATA"] = os.path.join(os.environ["VLAW_DATA_DIR"], "localappdata")
+os.makedirs(os.environ["LOCALAPPDATA"], exist_ok=True)
 # The evidence anchor counter lives outside the database (core/evidence_anchor.py). Keep it inside this run's
 # temp directory so a test run never reads another run's key directory.
 os.environ.setdefault("VLAW_KEY_DIR", os.path.join(os.environ["VLAW_DATA_DIR"], "keys"))
+guard.check_session_paths(os.environ, guard.expected_base_dir(os.environ))   # again, with every variable now set
+guard.allow_root(guard.system_temp())
+guard.allow_root(os.environ["VLAW_DATA_DIR"])
+guard.install()
+
+
+def pytest_configure(config):
+    """--basetemp is emptied by pytest itself at start-up; refuse it if it is (or contains) the real folder."""
+    basetemp = getattr(config.option, "basetemp", None)
+    guard.check_basetemp(basetemp)
+    guard.allow_root(basetemp)
 
 
 def pytest_sessionfinish(session, exitstatus):
