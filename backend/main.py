@@ -387,6 +387,14 @@ async def lifespan(app: FastAPI):
         max_instances=1, coalesce=True, replace_existing=True,
         next_run_time=_now + timedelta(seconds=5),
     )
+    # A 1 s Toolhelp snapshot between the 30 s detailed scans (watchers/fast_snapshot.py): catches processes that live a
+    # second or more, and asks for the detailed scan when one starts under an agent. VLAW_FAST_PROCESS_SNAPSHOT=0 turns it off.
+    if os.environ.get("VLAW_FAST_PROCESS_SNAPSHOT", "1") != "0" and sys.platform == "win32":
+        scheduler.add_job(
+            process_watcher.fast_tick, "interval", seconds=1, id="process_fast_snapshot",
+            max_instances=1, coalesce=True, replace_existing=True,
+            next_run_time=_now + timedelta(seconds=7),
+        )
     # NetworkWatcher is deliberately DISABLED (not forgotten). It was turned
     # off in e821731 together with the watcher-starvation deadlock fix: its
     # resolution phase does blocking I/O (reverse lookups, per-connection

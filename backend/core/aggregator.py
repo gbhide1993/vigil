@@ -28,7 +28,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from core import watch_stats
+from core import mass_delete, watch_stats
 from core.alerter import Alerter
 from core.evidence_store import evidence_store
 from db.database import get_db, get_read_db, replace_db, DB_PATH
@@ -461,6 +461,12 @@ class Aggregator:
         confidence = event.get("attribution_confidence", "high")
         event_source = event.get("event_source", "poll")
         agents_active = event.get("agents_active")   # set only for a write recorded as unattributed
+
+        # Ingress, before any buffering: every deletion (a summary row for the number it stands for) feeds the
+        # per-folder window of the mass_delete red line (core/mass_delete.py).
+        if mass_delete.detector.roots_stale():
+            await mass_delete.detector.refresh_roots()
+        mass_delete.detector.observe(event)
 
         if _is_credential_path(path):
             await self._write_credential_event(event)

@@ -13,6 +13,8 @@ from pathlib import Path
 from core.agent_wrappers import unwrap_agent_command
 from core.alerter import Alerter
 from core.attributor import KNOWN_AGENTS, Attributor
+from core import mass_delete
+from watchers import fast_snapshot
 from core.feature_flags import CORE_ONLY
 from core.red_lines import RedLines
 from core.redaction import redact_cmdline
@@ -22,6 +24,11 @@ from watchers._process_scan_worker import _filter_env
 logger = logging.getLogger("vlaw")
 
 POLL_INTERVAL_SECONDS = 3
+
+# The detailed scan (a subprocess, about 1.25 s of CPU) runs every 30 s from the scheduler. A 1 s Toolhelp snapshot
+# (fast_tick, about 13 ms) runs in between; when it sees a new process under an agent it asks for the detailed scan
+# at once, at most once per this many seconds.
+FAST_SCAN_MIN_INTERVAL_SECONDS = 5
 
 # psutil holds the GIL for the duration of the underlying Windows API call
 # (OpenProcess/ReadProcessMemory) during process_iter()/environ()/cmdline().
@@ -222,6 +229,12 @@ class ProcessWatcher:
         # anything is decided from recorded events (core/agent_activity.py).
         self.running_agents: dict[str, list[int]] = {}
         self.running_agents_at: float = 0.0
+        # One scan at a time: the 30 s scheduler job and a scan asked for by fast_tick must not interleave.
+        self._scan_lock = asyncio.Lock()
+        self._fast_known: set[int] | None = None
+        self._last_demand_scan = 0.0
+        self._demand_task: asyncio.Task | None = None
+        self.fast_new_agent_children = 0     # for measurement and tests
 
     def _update_running_agents(self) -> None:
         running: dict[str, list[int]] = {}
@@ -324,15 +337,60 @@ class ProcessWatcher:
         scan's tighter cadence."""
         from core.monitoring_coverage import record_coverage_tick
         await record_coverage_tick()
+        await self._scan_and_record()
 
+    async def _scan_and_record(self) -> None:
+        async with self._scan_lock:
+            try:
+                async with asyncio.timeout(45):
+                    current_pids = await self._snapshot_pids()
+            except TimeoutError:
+                logger.warning("ProcessWatcher.poll scan timed out after 45s -- skipping cycle")
+                return
+
+            await self._poll_write_phase(current_pids)
+
+    async def fast_tick(self) -> None:
+        """Every second: a Toolhelp snapshot (pid, parent pid, name). A new process whose ancestry includes an agent is
+        noted for the mass_delete red line (when it is a delete tool) and asks for the detailed scan, which records it.
+        Does nothing else, and never raises."""
         try:
-            async with asyncio.timeout(45):
-                current_pids = await self._snapshot_pids()
-        except TimeoutError:
-            logger.warning("ProcessWatcher.poll scan timed out after 45s -- skipping cycle")
-            return
+            snap = await asyncio.get_running_loop().run_in_executor(None, fast_snapshot.snapshot)
+            if not snap:
+                return
+            known, self._fast_known = self._fast_known, set(snap)
+            if known is None:
+                return                                   # the first snapshot is the baseline, not a spawn
+            now = time.time()
+            wanted = False
+            for pid in set(snap) - known:
+                agent = Attributor._walk_parent_chain_from_snapshot(pid, snap)
+                if agent is None:
+                    ancestor = snap[pid].get("ppid")
+                    hops = 0
+                    while ancestor and ancestor in snap and hops < 10 and agent is None:
+                        agent = "an agent" if ancestor in self._known_agent_pids else None
+                        ancestor = snap[ancestor].get("ppid")
+                        hops += 1
+                if agent is None:
+                    continue
+                wanted = True
+                self.fast_new_agent_children += 1
+                mass_delete.detector.note_spawn(snap[pid].get("name", ""), pid, agent, None, now)
+            if wanted:
+                self._request_detailed_scan()
+        except Exception:
+            logger.exception("ProcessWatcher.fast_tick failed")
 
-        await self._poll_write_phase(current_pids)
+    def _request_detailed_scan(self) -> None:
+        now = time.monotonic()
+        if now - self._last_demand_scan < FAST_SCAN_MIN_INTERVAL_SECONDS or self._scan_lock.locked():
+            return
+        if self._demand_task is not None and not self._demand_task.done():
+            return
+        self._last_demand_scan = now
+        self._demand_task = asyncio.ensure_future(self._scan_and_record())
+        self._demand_task.add_done_callback(lambda t: t.cancelled() or t.exception())
 
     async def _poll_write_phase(self, current_pids: set[int]) -> None:
         """Bounds _poll_write_body with its own generous, separate timeout
@@ -436,6 +494,8 @@ class ProcessWatcher:
 
             agent_id = await self.attributor.get_or_create_agent(agent_name, pid, confidence=confidence)
             session_id = await self.attributor.sessions.touch(agent_id, resumed=resumed)
+            if not resumed:
+                mass_delete.detector.note_spawn(exe_name, pid, agent_name, cmdline, info.get("started") or None)
 
             red_line_fired = False
             if not CORE_ONLY:

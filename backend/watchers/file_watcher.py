@@ -48,7 +48,7 @@ from core.correlation_engine import CorrelationEngine
 from core.evidence import AttributionChain, AttributionConfidence, VigilEvidence
 from core.evidence_store import evidence_store
 from core.feature_flags import CORE_ONLY
-from core import watch_stats
+from core import mass_delete, watch_stats
 from core.ignore_rules import ignore_and_count
 from core.own_paths import is_own_path
 from core.red_lines import RedLines, is_agent_config_path, is_mcp_config_path, register_agent_workspace
@@ -496,6 +496,8 @@ class VlawFileHandler(FileSystemEventHandler):
         """Tiers 2/3 entry point — native Observer and PollingObserver both
         emit this same watchdog FileSystemEvent shape."""
         if event.is_directory:
+            if event.event_type == "deleted":
+                mass_delete.detector.note_folder_event(event.src_path)   # counted apart from files
             return
 
         event_type = EVENT_TYPE_MAP.get(event.event_type, "file_read")
