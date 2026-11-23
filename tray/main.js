@@ -462,7 +462,9 @@ async function updateTrayTooltip() {
 async function pollAlerts() {
   if (!backendReady) return
   try {
-    const { status, body } = await httpRequest('GET', '/api/alerts?status=open')
+    // qualifying=true: the backend filters to the alerts this tray counts, so body.total is the real count. The default
+    // page is 50 rows; counting alerts.length here capped the number at 50 and could hide a red line behind older rows.
+    const { status, body } = await httpRequest('GET', '/api/alerts?status=open&qualifying=true&limit=500')
     if (status !== 200 || !body) {
       throw new Error(`unexpected response status ${status}`)
     }
@@ -478,7 +480,7 @@ async function pollAlerts() {
     }
     // API returns rows ordered by created_at DESC, so the first element is
     // the most recent qualifying alert
-    qualifyingCount = alerts.length
+    qualifyingCount = typeof body.total === 'number' ? body.total : alerts.length
     currentAlert = alerts[0]
     setTrayState('alert')
     applyFlyoutState('alert', currentAlert)

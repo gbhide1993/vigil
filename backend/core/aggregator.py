@@ -38,6 +38,12 @@ logger = logging.getLogger("vlaw")
 FILE_WINDOW_SECONDS = 5
 NET_WINDOW_SECONDS = 60
 FILE_EVENT_BUFFER_MAX = 1000
+# Flush at 80% full instead of waiting for the 15 s timer. If the buffer still overflows, the oldest and newest
+# individual events are kept and the middle is collapsed into summary rows (see _collapse_overflow); nothing is dropped.
+FILE_EVENT_EARLY_FLUSH_AT = 800
+FILE_EVENT_KEEP_OLDEST = 300
+FILE_EVENT_KEEP_NEWEST = 300
+_CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
 
 # Write watchdog (see start_writer): how long a single queued write is
 # allowed to run before we try conn.interrupt() on it, and how much
@@ -103,6 +109,28 @@ def _format_created_at(timestamp) -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _buffered_event_row(e: dict) -> tuple:
+    """One INSERT row for a buffered real-time event, or for a summary row made by Aggregator._collapse_overflow
+    (file_count = how many events it stands for; detail.summary marks it so reports can count them)."""
+    s = e.get("summary")
+    if s:
+        detail = {
+            "summary": True, "operation": e["event_type"], "count": s["count"],
+            "first_ts": _format_created_at(s["first_ts"]), "last_ts": _format_created_at(s["last_ts"]),
+            "attribution_confidence": s["confidence"],
+            **({"agents_active": s["agents_active"]} if s.get("agents_active") else {}),
+        }
+        return (
+            e["agent_id"], e["session_id"], e["event_type"], e["path"], json.dumps(detail), s["count"],
+            "low", None, e.get("event_source"), _format_created_at(s["last_ts"]),
+        )
+    return (
+        e["agent_id"], e["session_id"], e["event_type"], e["path"],
+        json.dumps(e.get("detail") or {}), 1, e.get("severity", "low"),
+        e.get("pid"), e.get("event_source"), _format_created_at(e.get("timestamp")),
+    )
+
+
 class Aggregator:
     def __init__(self):
         # (agent_id, dir) -> {"count": int, "window_start": float, "event_type": str, "paths": set}
@@ -119,6 +147,10 @@ class Aggregator:
         # event as its own row, just batches the INSERTs.
         self.file_event_buffer: list[dict] = []
         self._buffer_lock = asyncio.Lock()
+        # Length of the buffer prefix a write is in flight for. That prefix is never reordered or collapsed, because
+        # _flush_file_event_buffer deletes exactly that many items once the write commits. Also makes a flush single-flight.
+        self._flushing = 0
+        self._early_flush_task: asyncio.Task | None = None
         # Kept open across calls (see _append_crash_recovery_line) rather
         # than opened and closed per event -- that per-event open+close was
         # running synchronously on the event loop's own thread and, under
@@ -434,8 +466,10 @@ class Aggregator:
             await self._write_credential_event(event)
             return
 
+        summary = event.get("summary")
         if event_source != "poll":
             await self.buffer_file_event({
+                **({"summary": summary} if summary else {}),
                 "agent_id": event["agent_id"],
                 "session_id": event["session_id"],
                 "event_type": event["event_type"],
@@ -459,14 +493,14 @@ class Aggregator:
                 "session_id": event["session_id"],
                 "event_type": event["event_type"],
                 "window_start": now,
-                "count": 1,
+                "count": summary["count"] if summary else 1,
                 "paths": {path},
                 "confidence": confidence,
                 "agents_active": agents_active,
             }
             return
 
-        buf["count"] += 1
+        buf["count"] += summary["count"] if summary else 1
         buf["paths"].add(path)
         if event["event_type"] != buf["event_type"]:
             buf["event_type"] = "file_write"  # mixed read/write escalates to write
@@ -509,17 +543,72 @@ class Aggregator:
         etw_file_watcher.py/file_watcher.py, which already do this to
         reach VlawFileHandler in the first place)."""
         async with self._buffer_lock:
-            if len(self.file_event_buffer) >= FILE_EVENT_BUFFER_MAX:
-                dropped = self.file_event_buffer.pop(0)
-                watch_stats.add_dropped("buffer_full")
-                logger.warning(
-                    "file_event_buffer full (%d events) -- dropping oldest buffered event "
-                    "(path=%s) to make room",
-                    FILE_EVENT_BUFFER_MAX, dropped.get("path"),
-                )
             self.file_event_buffer.append(event)
+            if len(self.file_event_buffer) - self._flushing > FILE_EVENT_BUFFER_MAX:
+                self._collapse_overflow()
+            early = len(self.file_event_buffer) - self._flushing >= FILE_EVENT_EARLY_FLUSH_AT
 
+        if early:
+            self._start_early_flush()
         self._append_crash_recovery_line(event)
+
+    def _start_early_flush(self) -> None:
+        task = self._early_flush_task
+        if task is not None and not task.done():
+            return
+        task = asyncio.ensure_future(self._flush_file_event_buffer())
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())   # retrieved, so it is never "never retrieved"
+        self._early_flush_task = task
+
+    def _collapse_overflow(self) -> None:
+        """Called with _buffer_lock held when more than FILE_EVENT_BUFFER_MAX events wait to be written. Keeps the
+        oldest and the newest individual events and replaces the middle with one summary row per (agent, session,
+        directory, operation): count, first and last time. Earlier summary rows in the middle are merged, so the
+        total count is preserved exactly. Nothing is discarded."""
+        buf = self.file_event_buffer
+        start = self._flushing + FILE_EVENT_KEEP_OLDEST
+        end = len(buf) - FILE_EVENT_KEEP_NEWEST
+        if end <= start:
+            return
+        groups: dict[tuple, dict] = {}
+        newly_summarised = 0
+        for e in buf[start:end]:
+            s = e.get("summary")
+            if s:
+                directory, n, first, last, conf = e["path"], s["count"], s["first_ts"], s["last_ts"], s["confidence"]
+                active = s.get("agents_active")
+            else:
+                directory, n = str(Path(e["path"]).parent), 1
+                first = last = e.get("timestamp") if e.get("timestamp") is not None else time.time()
+                conf = (e.get("detail") or {}).get("attribution_confidence", "high")
+                active = (e.get("detail") or {}).get("agents_active")
+                newly_summarised += 1
+            key = (e.get("agent_id"), e.get("session_id"), directory, e.get("event_type"), e.get("event_source"))
+            g = groups.get(key)
+            if g is None:
+                groups[key] = {
+                    "agent_id": e.get("agent_id"), "session_id": e.get("session_id"), "event_type": e.get("event_type"),
+                    "path": directory, "severity": "low", "pid": None, "event_source": e.get("event_source"),
+                    "timestamp": last,
+                    "summary": {"count": n, "first_ts": first, "last_ts": last, "confidence": conf, "agents_active": active},
+                }
+                continue
+            gs = g["summary"]
+            gs["count"] += n
+            gs["first_ts"] = min(gs["first_ts"], first)
+            gs["last_ts"] = max(gs["last_ts"], last)
+            g["timestamp"] = gs["last_ts"]
+            if active and active > (gs.get("agents_active") or 0):
+                gs["agents_active"] = active
+            if _CONFIDENCE_RANK.get(conf, 2) < _CONFIDENCE_RANK.get(gs["confidence"], 2):
+                gs["confidence"] = conf
+        buf[start:end] = list(groups.values())
+        if newly_summarised:
+            watch_stats.add_summarised(newly_summarised)
+            logger.warning(
+                "file_event_buffer over %d events: %d events collapsed into %d summary rows (nothing dropped)",
+                FILE_EVENT_BUFFER_MAX, newly_summarised, len(groups),
+            )
 
     def _append_crash_recovery_line(self, event: dict) -> None:
         """Best-effort durability for the in-memory buffer: if the process
@@ -825,9 +914,10 @@ class Aggregator:
         exactly as they were — nothing is lost, it's just retried on the
         next flush_buffers cycle."""
         async with self._buffer_lock:
-            if not self.file_event_buffer:
-                return
+            if self._flushing or not self.file_event_buffer:
+                return   # a write is already in flight; its events (and any later ones) go in the next flush
             batch = list(self.file_event_buffer)
+            self._flushing = len(batch)
 
         async def _write_batch(batch=batch):
             start = time.monotonic()
@@ -836,18 +926,10 @@ class Aggregator:
                 await db.executemany(
                     """
                     INSERT INTO events
-                        (agent_id, session_id, event_type, path, detail, severity, pid, event_source, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (agent_id, session_id, event_type, path, detail, file_count, severity, pid, event_source, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    [
-                        (
-                            e["agent_id"], e["session_id"], e["event_type"], e["path"],
-                            json.dumps(e.get("detail") or {}), e.get("severity", "low"),
-                            e.get("pid"), e.get("event_source"),
-                            _format_created_at(e.get("timestamp")),
-                        )
-                        for e in batch
-                    ],
+                    [_buffered_event_row(e) for e in batch],
                 )
                 await db.commit()
             finally:
@@ -856,7 +938,10 @@ class Aggregator:
 
         try:
             await self.enqueue(_write_batch)
-        except Exception as e:
+        except BaseException as e:
+            self._flushing = 0
+            if not isinstance(e, Exception):
+                raise
             logger.error(
                 "file_event_buffer flush failed, keeping %d buffered events for retry: %s",
                 len(batch), e,
@@ -865,6 +950,7 @@ class Aggregator:
 
         async with self._buffer_lock:
             del self.file_event_buffer[: len(batch)]
+            self._flushing = 0
 
         # Per spec: unconditional on any successful flush. Narrow race,
         # disclosed in _append_crash_recovery_line's docstring: an event

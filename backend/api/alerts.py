@@ -59,17 +59,25 @@ async def get_alerts(
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     since_hours: float | None = Query(default=None, gt=0),
+    qualifying: bool = Query(default=False),
 ):
     db = await get_read_db()
     try:
-        return await _get_alerts_data(db, status, severity, agent, session_id, limit, offset, since_hours)
+        return await _get_alerts_data(db, status, severity, agent, session_id, limit, offset, since_hours, qualifying)
     finally:
         await db.close()
 
 
-async def _get_alerts_data(db, status, severity, agent, session_id, limit, offset, since_hours=None):
+# The alerts the tray counts and notifies on (tray/main.js isQualifyingAlert): every critical alert, and a red line
+# of high severity. Filtered here so the response's `total` is the exact count, not the length of one page.
+QUALIFYING_SQL = "(al.severity = 'critical' OR (al.rule_type LIKE '%red_line%' AND al.severity = 'high'))"
+
+
+async def _get_alerts_data(db, status, severity, agent, session_id, limit, offset, since_hours=None, qualifying=False):
     clauses = []
     params: list = []
+    if qualifying:
+        clauses.append(QUALIFYING_SQL)
     if since_hours is not None:
         # Only alerts detected within the last N hours (the Status page's 24h view).
         clauses.append("al.created_at >= datetime('now', ?)")

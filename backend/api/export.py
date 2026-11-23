@@ -230,6 +230,10 @@ def dropped_changes_note(count: int) -> str:
     return f"{count} file changes were not recorded because too many arrived at once."
 
 
+def summarised_changes_note(count: int) -> str:
+    return f"{count} events recorded as summaries (directory, count, first and last time) because too many arrived at once."
+
+
 def outside_scope_note(count: int) -> str:
     return f"{count} file events outside the watched folders were seen and not recorded (counted only)."
 
@@ -247,6 +251,9 @@ def current_report_notes() -> list[str]:
     ignored = watch_stats.ignored_total()
     if ignore_rules.is_enabled() and ignored > 0:
         notes.append(ignored_changes_note(ignored))
+    summarised = watch_stats.summarised_total()
+    if summarised > 0:
+        notes.append(summarised_changes_note(summarised))
     dropped = watch_stats.dropped_total()
     if dropped > 0:
         notes.append(dropped_changes_note(dropped))
@@ -657,6 +664,7 @@ async def _build_summary(date: str, tz=None) -> dict:
     coverage["ignored_generated_changes"] = watch_stats.ignored_total() if ignore_rules.is_enabled() else 0
     coverage["ignored_by_folder"] = watch_stats.ignored_by_folder() if ignore_rules.is_enabled() else {}
     coverage["dropped_file_changes"] = watch_stats.dropped_total()
+    coverage["summarised_file_changes"] = watch_stats.summarised_total()
     coverage["outside_scope_not_recorded"] = watch_stats.out_of_scope_total()
     coverage["ignore_counts_since"] = watch_stats.since_iso()
 

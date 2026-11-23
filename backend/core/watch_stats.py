@@ -12,8 +12,10 @@ from datetime import datetime, timezone
 _lock = threading.Lock()
 _ignored: dict[str, int] = {}
 _dropped: dict[str, int] = {"overload": 0, "buffer_full": 0}
+_dropped_by_session: dict[str, int] = {}
 _out_of_scope = 0
 _unresolved = 0
+_summarised = 0
 _since = time.time()
 
 
@@ -32,14 +34,43 @@ def ignored_total() -> int:
         return sum(_ignored.values())
 
 
-def add_dropped(kind: str) -> None:
+def add_dropped(kind: str, session_id: str | None = None) -> None:
     with _lock:
         _dropped[kind] = _dropped.get(kind, 0) + 1
+        if session_id:
+            _dropped_by_session[session_id] = _dropped_by_session.get(session_id, 0) + 1
+
+
+def dropped_by_session() -> dict[str, int]:
+    """One copy for a whole list of sessions (one lock acquire instead of one per session)."""
+    with _lock:
+        return dict(_dropped_by_session)
+
+
+def dropped_for_session(session_id: str) -> int:
+    """Changes of one session lost with no record, when the session was known at the point of loss (counted since the
+    backend started). Overload drops happen before a change is attributed, so they have no session: see dropped_total."""
+    with _lock:
+        return _dropped_by_session.get(session_id, 0)
 
 
 def dropped_total() -> int:
+    """Changes lost with no record at all. Target 0. A change folded into a summary row is not lost: see add_summarised."""
     with _lock:
         return sum(_dropped.values())
+
+
+def add_summarised(n: int = 1) -> None:
+    """Changes recorded as part of a summary row (directory, operation, count, first and last time) because too many
+    arrived at once for individual rows. They are in the database; only their per-file detail is not."""
+    global _summarised
+    with _lock:
+        _summarised += n
+
+
+def summarised_total() -> int:
+    with _lock:
+        return _summarised
 
 
 def dropped_by_kind() -> dict[str, int]:
@@ -81,6 +112,7 @@ def summary() -> dict:
         return {
             "since": since_iso(),
             "dropped_total": sum(_dropped.values()),
+            "summarised_total": _summarised,
             "dropped_by_kind": dict(_dropped),
             "outside_scope_not_recorded": _out_of_scope,
             "no_file_name_not_recorded": _unresolved,
@@ -94,11 +126,13 @@ def since_iso() -> str:
 
 def reset() -> None:
     """For tests."""
-    global _since, _out_of_scope, _unresolved
+    global _since, _out_of_scope, _unresolved, _summarised
     with _lock:
+        _summarised = 0
         _out_of_scope = 0
         _unresolved = 0
         _ignored.clear()
         for k in _dropped:
             _dropped[k] = 0
+        _dropped_by_session.clear()
         _since = time.time()

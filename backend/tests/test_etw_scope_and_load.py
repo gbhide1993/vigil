@@ -903,8 +903,8 @@ async def test_5000_etw_events_a_second_from_a_claude_desktop_like_pid_while_the
     cur = await db.execute("SELECT COUNT(*) AS c FROM events WHERE path LIKE '%Claude-Data%' OR path LIKE '%sentry%' OR path LIKE '%npm-cache%'")
     assert (await cur.fetchone())["c"] == 0
 
-    # every in-scope write is either stored or counted as dropped: an evidence tool says when it dropped events
-    cur = await db.execute("SELECT COUNT(*) AS c FROM events WHERE event_type = 'file_write'")
+    # every in-scope write is either stored (as its own row or inside a summary row's file_count) or counted as dropped
+    cur = await db.execute("SELECT COALESCE(SUM(file_count), 0) AS c FROM events WHERE event_type = 'file_write'")
     stored = (await cur.fetchone())["c"]
     assert stored + watch_stats.dropped_total() == sent["inside"], (stored, watch_stats.dropped_total(), sent["inside"])
 

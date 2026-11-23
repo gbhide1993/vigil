@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 
 from collections import Counter
 
-from core import report_coverage
+from core import report_coverage, watch_stats
 from core.alerter import Alerter
 from core.digest import display_summary
 from core.file_changes import scope_label, session_changes
@@ -72,6 +72,7 @@ async def get_sessions(status: str | None = Query(default=None)):
             """
         )
         sessions = []
+        dropped = watch_stats.dropped_by_session()
         for r in await cur.fetchall():
             s = dict(r)
             agg = aggregates.get(s["id"])
@@ -79,6 +80,13 @@ async def get_sessions(status: str | None = Query(default=None)):
             if status == "open" and not s["has_activity"]:
                 continue   # only a session with real activity is a current one
             s["net_connect_count"] = agg["net_connect_count"] if agg else 0
+            # Live counts from the events (the stored columns are only rolled up when a session closes, and have no
+            # delete count). file_deletes is separate from file_writes; both count one per change.
+            s["file_reads"] = agg["file_reads"] if agg else 0
+            s["file_writes"] = agg["file_writes"] if agg else 0
+            s["file_deletes"] = agg["file_deletes"] if agg else 0
+            s["events_summarised"] = agg["events_summarised"] if agg else 0
+            s["events_dropped"] = dropped.get(s["id"], 0)
             s["summary"] = display_summary(s.get("summary"))
             # Display only: the idle sweep is off, so an open session whose newest event is older than the idle
             # timeout is flagged idle here; nothing is written.
@@ -259,7 +267,11 @@ async def _build_session_report_data(db, session_id: str) -> dict:
     for change in changes:
         change["scope"] = scope_label(change["path"], scope_dirs)
         change["is_credential"] = touches_credential_path(change["path"])
-    by_change = dict(Counter(c["change"] for c in changes))
+    by_change: Counter = Counter()
+    for c in changes:
+        by_change[c["change"]] += c.get("count", 1)    # a summary row stands for `count` changes
+    by_change = dict(by_change)
+    events_summarised = sum(c["count"] for c in changes if c.get("summary"))
     shown_changes = changes[:MAX_FILE_CHANGE_ROWS]
     net_destinations = await _get_unique_network_destinations(db, session_id)
     approved_destinations = set(await _get_policy_list(db, "approved_network_destinations"))
@@ -303,6 +315,8 @@ async def _build_session_report_data(db, session_id: str) -> dict:
     # Unique paths (a file changed ten times is one entry here, ten in file_changes).
     unique: dict[str, dict] = {}
     for change in changes:
+        if change.get("summary"):
+            continue   # a directory with a count, not a file
         unique.setdefault(change["path"], {
             "path": change["path"],
             # Under a watched folder? None when no folder is watched: then no label is shown.
@@ -330,7 +344,9 @@ async def _build_session_report_data(db, session_id: str) -> dict:
         "files_touched": files_touched,
         "files_touched_count": len(files_touched),
         "file_changes": shown_changes,
-        "file_changes_total": len(changes),
+        "file_changes_total": sum(c.get("count", 1) for c in changes),
+        "events_summarised": events_summarised,
+        "events_dropped": watch_stats.dropped_for_session(session_id),
         "file_changes_not_shown": len(changes) - len(shown_changes),
         "file_changes_by_type": by_change,
         "watched_folders": scope_dirs,
@@ -368,6 +384,8 @@ async def get_session_report_preview(session_id: str):
         "last_activity_at": report["last_activity_at"],
         "files_touched": report["files_touched_count"],
         "file_changes_total": report["file_changes_total"],
+        "events_summarised": report["events_summarised"],
+        "events_dropped": report["events_dropped"],
         "file_changes_not_shown": report["file_changes_not_shown"],
         "file_changes_by_type": report["file_changes_by_type"],
         "watched_folders": report["watched_folders"],
@@ -497,6 +515,12 @@ async def get_session_report_pdf(session_id: str):
         by_type = ", ".join(f"{name} {count}" for name, count in sorted(report["file_changes_by_type"].items()))
         c.drawString(margin, y, f"By change: {by_type}")
         y -= 0.2 * inch
+    if report["events_summarised"]:
+        c.drawString(margin, y, f"{report['events_summarised']} events recorded as summaries (one row per directory: count, first and last time).")
+        y -= 0.2 * inch
+    if report["events_dropped"]:
+        c.drawString(margin, y, f"{report['events_dropped']} events were lost with no record.")
+        y -= 0.2 * inch
     if not report["watched_folders"]:
         c.drawString(margin, y, "No project folder is watched, so no scope label is shown.")
         y -= 0.2 * inch
@@ -518,7 +542,8 @@ async def get_session_report_pdf(session_id: str):
         else:
             marker = ""
         c.setFont("Helvetica", 8)
-        c.drawString(margin, y, f"{marker}{f['time']}  {f['change']}  {f['path']}"[:150])
+        shown = f"{f['path']}  ({f['count']} changes, summarised)" if f.get("summary") else f["path"]
+        c.drawString(margin, y, f"{marker}{f['time']}  {f['change']}  {shown}"[:150])
         y -= 0.15 * inch
         c.setFillColor(colors.black)
         confidence = f" ({f['attribution_confidence']})" if f["attribution_confidence"] and f["attribution"] != "exact" else ""
