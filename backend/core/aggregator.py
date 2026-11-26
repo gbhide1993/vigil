@@ -464,8 +464,7 @@ class Aggregator:
 
         # Ingress, before any buffering: every deletion (a summary row for the number it stands for) feeds the
         # per-folder window of the mass_delete red line (core/mass_delete.py).
-        if mass_delete.detector.roots_stale():
-            await mass_delete.detector.refresh_roots()
+        await mass_delete.detector.ensure_roots()
         mass_delete.detector.observe(event)
 
         if _is_credential_path(path):

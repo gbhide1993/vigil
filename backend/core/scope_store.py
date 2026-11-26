@@ -109,6 +109,9 @@ async def save_scope(db, paths: list[str], meta: dict) -> None:
     await _upsert(db, SCOPE_KEY, paths)
     await _upsert(db, META_KEY, {p: meta[p] for p in paths if p in meta})
     await db.commit()
+    from core import mass_delete
+
+    mass_delete.detector.invalidate_roots()      # a folder added a moment ago must count at once, not after the next refresh
 
 
 async def get_meta(db) -> dict:

@@ -120,7 +120,7 @@ LOG_PATH = os.environ.get("VLAW_LOG_FILE") or os.path.join(BASE_DIR, "vlaw-backe
 logger = configure_logging(LOG_PATH)
 logger.info("V-LAW backend starting. BASE_DIR=%s", BASE_DIR)
 
-VERSION = "0.9.3"
+VERSION = "0.9.4"
 PORT = int(os.environ.get("VLAW_PORT", 7422))
 
 # Shared with the API routes through core/runtime_state.py (NOT through `import main`,
@@ -382,14 +382,18 @@ async def lifespan(app: FastAPI):
     # mcp_watcher below already have been, Monitoring coverage in the
     # export silently stops advancing along with it.
     _now = datetime.now(scheduler.timezone)
+    _fast_process_snapshot = os.environ.get("VLAW_FAST_PROCESS_SNAPSHOT", "1") != "0" and sys.platform == "win32"
+    process_watcher.fast_heartbeat = _fast_process_snapshot
     scheduler.add_job(
-        process_watcher.poll, "interval", seconds=30, id="process_watcher",
+        process_watcher.poll, "interval", seconds=120 if _fast_process_snapshot else 30, id="process_watcher",
         max_instances=1, coalesce=True, replace_existing=True,
         next_run_time=_now + timedelta(seconds=5),
     )
-    # A 1 s Toolhelp snapshot between the 30 s detailed scans (watchers/fast_snapshot.py): catches processes that live a
-    # second or more, and asks for the detailed scan when one starts under an agent. VLAW_FAST_PROCESS_SNAPSHOT=0 turns it off.
-    if os.environ.get("VLAW_FAST_PROCESS_SNAPSHOT", "1") != "0" and sys.platform == "win32":
+    # A 1 s Toolhelp snapshot (watchers/fast_snapshot.py) finds new processes and records the ones under an agent, reading
+    # their command line in-process. The subprocess scan above then runs only every 120 s as a safety net (agent environment
+    # for RL7, cold-start baseline). The snapshot also carries the 30 s coverage heartbeat.
+    # VLAW_FAST_PROCESS_SNAPSHOT=0 turns it off and puts the scan back to 30 s.
+    if _fast_process_snapshot:
         scheduler.add_job(
             process_watcher.fast_tick, "interval", seconds=1, id="process_fast_snapshot",
             max_instances=1, coalesce=True, replace_existing=True,

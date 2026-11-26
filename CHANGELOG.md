@@ -1,7 +1,33 @@
 # Changelog
 
 Product versions follow the installer (Vigil-Setup.exe). The VS Code extension has its own changelog in vigil-vscode/CHANGELOG.md.
-## 0.9.3 (unreleased)
+## 0.9.4 (unreleased)
+
+### Added
+- `mass_delete` red line (core/mass_delete.py): a sliding 10 s count of deleted files per watched folder, fed at ingress (summary rows count in full). It raises one critical alert per folder per 60 s when the count reaches the threshold (default 150, set with `VLAW_MASS_DELETE_THRESHOLD`). Folder events are counted apart and ignored folders are not counted. If a delete tool was seen under an agent, it is named as a possible link (confidence medium); otherwise the alert says "No process observed". A folder added in Settings counts at once, and events that arrive while the folder list is being read wait for it instead of going uncounted.
+- A 1 s process snapshot (watchers/fast_snapshot.py, Toolhelp, no administrator rights) finds new processes. For a new process under an agent, the command line, executable and start time are read in-process, and the process is recorded by the same code as before (proc_spawn event, dangerous-command red lines). `VLAW_FAST_PROCESS_SNAPSHOT=0` turns it off.
+- Sessions carry live `file_writes`, `file_deletes`, `events_summarised` and `events_dropped`. The session report and PDF show "N events recorded as summaries" when it is not zero.
+- Alerts accept `qualifying=true`, so the tray count is the real total. Status and Incidents request up to 500.
+
+### Fixed
+- Events were lost with no record when a burst filled the native-tier buffer (cap 1,000). The aggregator now flushes at 80% full. On overflow it keeps the oldest and newest events and collapses the middle into summary rows (directory, operation, count, first and last time). The watcher's in-flight limit counts overflow per directory and records it as summary rows instead of dropping it.
+- `dropped_total` now means events lost with no record; `summarised_total` counts events kept as summaries.
+- Session counters were stored only at session close and counted writes only; they are now live, with deletes counted separately.
+- The `mass_delete` alert no longer counts a deleted folder as a file when the folder event arrives before the summary row for the files in it. Such entries move out of the file count and are reported as "folder events seen and not counted".
+
+### Changed
+- With the fast snapshot on, the subprocess process scan runs every 120 s instead of 30 s, as a safety net (agent environment for Red Line 7, cold-start baseline). The snapshot carries the 30 s coverage heartbeat.
+
+### Known limits
+- The mass-delete default of 150 is a starting point. The peak in a real project folder on the one machine it was measured on was 6, so tune it with `VLAW_MASS_DELETE_THRESHOLD`.
+- A process that lives for less than about a second can still be missed by the 1 s snapshot, so a short delete tool may not be named in the alert.
+- Mass-delete counts files deleted under watched folders only. The alert appears about 2 to 7 s after the deletes start.
+- Still unchanged: network connections, MCP calls and file reads are not recorded; the idle session sweep is off (main.py), so sessions close lazily and volumetric checks at session close do not run; writes are recorded as "unattributed" when 2 or more agents are active.
+- The final retest on a development backend (200, 3,000 and 10,000 files) showed no events lost without a record. The alert count was corrected afterwards (folder entries are no longer counted as files), and only the 200-file case was re-run after that.
+- The session list's worst-case rebuild query is about 25% slower than 0.9.3 (259 to 324 ms on 150,000 events), because of the live session counters.
+- On a fresh install the default policy has no approved agents, so the first time each agent is seen it raises a critical "Unapproved agent" alert.
+
+## 0.9.3 (released 2026-10-22)
 
 ### Fixed
 - ETW tier: events outside the watched folders, the credential paths and the agents' own folders (`~/.claude`, `~/.codex`) are now decided from memory, before the agent lookup and before anything reaches the database, and are only counted. A recognised agent's desktop app writing its own cache, crash-report and log files produced thousands of events a second, each costing a SELECT, an UPDATE and a commit, and delayed the aggregator's writes (a batch of 19 events took 168 s on one machine). `GET /health` returns `file_watcher_tier` and `file_events_not_recorded` (dropped by reason, and outside-scope counts, since start), and the per-session PDF prints them when they are not zero.

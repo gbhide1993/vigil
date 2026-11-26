@@ -26,10 +26,11 @@ COOLDOWN_SECONDS = 60
 # After the threshold is crossed, wait this long before writing the alert so a delete tool that started a moment earlier
 # (seen by the 1 s process snapshot) can be named in it.
 GRACE_SECONDS = 2.0
-THRESHOLD_FLOOR = 150
-# Largest count of file deletions in one 10 s window under one watched folder over this machine's history (read from a
-# copy of the live database on 2026-11-23); the default threshold is three times it.
-BASELINE_MAX = 301
+# Files deleted in one 10 s window under one watched folder. The peak in a real project folder on the one machine this was
+# measured on (a copy of the live database, 2026-11-23) was 6. The larger peaks in that history were a synthetic test
+# folder (301) and folders outside every watched root (855), which are not real working folders. That is a small sample
+# from one machine, so 150 is a starting point to tune with VLAW_MASS_DELETE_THRESHOLD, not a measured limit.
+DEFAULT_THRESHOLD = 150
 ROOTS_REFRESH_SECONDS = 10
 
 # A delete tool in a command line: rm, rmdir, rd, del, erase, Remove-Item (with or without .exe), as a word.
@@ -43,7 +44,7 @@ def threshold() -> int:
             return max(1, int(raw))
         except ValueError:
             logger.warning("VLAW_MASS_DELETE_THRESHOLD=%r is not a number; using the default", raw)
-    return max(THRESHOLD_FLOOR, 3 * BASELINE_MAX)
+    return DEFAULT_THRESHOLD
 
 
 def _norm(path: str) -> str:
@@ -57,7 +58,7 @@ def _iso(ts: float) -> str:
 class _Root:
     def __init__(self, display: str):
         self.display = display
-        self.window: deque = deque()      # (ts, count, top-level folder)
+        self.window: deque = deque()      # (ts, count, top-level folder, normalised path, is a summary row)
         self.total = 0
         self.folder_events: deque = deque()   # ts of each folder event
         self.dirs_seen: dict[str, float] = {}  # directory -> ts of the last file deleted in it
@@ -66,6 +67,27 @@ class _Root:
         self.agent_id = None
         self.session_id = None
         self.agents_active = None
+
+    def reclassify_folders(self, key: str) -> None:
+        """A folder event can arrive before the summary row that says files were deleted in it, so it was first counted as
+        a file. When the alert is written dirs_seen is complete: move every entry that is a directory (or an ancestor of
+        one) out of the file count and into the folder events."""
+        dirs = set(self.dirs_seen)
+        dirs.add(key)
+        for d in list(self.dirs_seen):
+            p = d
+            while len(p) > len(key) and "/" in p:
+                p = p.rsplit("/", 1)[0]
+                dirs.add(p)
+        kept: deque = deque()
+        for entry in self.window:
+            ts, n, _top, path, is_summary = entry
+            if not is_summary and path in dirs:
+                self.total -= n
+                self.folder_events.append(ts)
+            else:
+                kept.append(entry)
+        self.window = kept
 
     def purge(self, now: float) -> None:
         cutoff = now - WINDOW_SECONDS
@@ -85,6 +107,8 @@ class MassDeleteDetector:
         self._state: dict[str, _Root] = {}
         self._spawns: deque = deque(maxlen=300)       # (ts, pid, name, agent)
         self._tasks: set = set()
+        self._refresh_lock = None
+        self._refresh_loop = None
         self.grace = GRACE_SECONDS
 
     # ------------------------------------------------------------------ roots
@@ -93,11 +117,25 @@ class MassDeleteDetector:
             self._roots = sorted(((_norm(r), r) for r in roots if r), key=lambda x: -len(x[0]))
             self._roots_at = time.time()
 
+    def invalidate_roots(self) -> None:
+        self._roots_at = 0.0
+
     def roots_stale(self) -> bool:
         return time.time() - self._roots_at > ROOTS_REFRESH_SECONDS
 
+    async def ensure_roots(self) -> None:
+        """Every caller waits for the read in progress: an event that arrives while the list is being read must not be
+        checked against the old (possibly empty) list and so go uncounted."""
+        if not self.roots_stale():
+            return
+        loop = asyncio.get_running_loop()
+        if self._refresh_lock is None or self._refresh_loop is not loop:
+            self._refresh_lock, self._refresh_loop = asyncio.Lock(), loop
+        async with self._refresh_lock:
+            if self.roots_stale():
+                await self.refresh_roots()
+
     async def refresh_roots(self) -> None:
-        self._roots_at = time.time()      # first, so a slow read is not repeated by every event meanwhile
         try:
             from core.scope_store import get_scope_directories
             from db.database import get_read_db
@@ -109,6 +147,7 @@ class MassDeleteDetector:
                 await db.close()
             self.set_roots(roots)
         except Exception:
+            self._roots_at = time.time()      # do not retry on every event
             logger.exception("mass_delete: could not read the watched folders; keeping the last list")
 
     def _root_for(self, norm_path: str):
@@ -168,7 +207,7 @@ class MassDeleteDetector:
                 st.dirs_seen[rel_dir] = now
             rel = rel_dir[len(key) + 1:] if len(rel_dir) > len(key) else ""
             top = rel.split("/")[0] if rel else "(the folder itself)"
-            st.window.append((now, n, top))
+            st.window.append((now, n, top, norm, bool(summary)))
             st.total += n
             if event.get("agent_id") is not None:
                 st.agent_id, st.session_id = event.get("agent_id"), event.get("session_id")
@@ -202,13 +241,14 @@ class MassDeleteDetector:
             with self._lock:
                 st = self._state[key]
                 st.purge(now)
+                st.reclassify_folders(key)
                 count = st.total
                 if count < threshold():
                     st.pending = False
                     return
                 first_ts, last_ts = st.window[0][0], st.window[-1][0]
                 tops = Counter()
-                for _ts, n, top in st.window:
+                for _ts, n, top, _path, _summary in st.window:
                     tops[top] += n
                 folders_seen = len(st.folder_events)
                 agent_id, session_id, agents_active, display = st.agent_id, st.session_id, st.agents_active, st.display

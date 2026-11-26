@@ -58,3 +58,26 @@ def snapshot() -> dict[int, dict]:
             k.CloseHandle(handle)
     except Exception:
         return {}
+
+
+def process_details(pids) -> dict[int, tuple[list[str], str, int]]:
+    """{pid: (argv, exe path, creation time as epoch seconds)} for the processes that can still be read. A process that
+    has already exited, or that this user may not open, is left out. psutil is already a dependency; for one process this
+    is an NtQueryInformationProcess call and a read of its command line, a few milliseconds, with no subprocess."""
+    import psutil
+
+    out: dict[int, tuple[list[str], str, int]] = {}
+    for pid in pids:
+        try:
+            proc = psutil.Process(pid)
+            with proc.oneshot():
+                args = proc.cmdline()
+                try:
+                    exe = proc.exe()
+                except (psutil.Error, OSError):
+                    exe = ""
+                started = int(proc.create_time())
+            out[pid] = (args, exe or (args[0] if args else ""), started)
+        except (psutil.Error, OSError):
+            continue
+    return out
