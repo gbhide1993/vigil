@@ -232,7 +232,7 @@ def test_etw_tier_drops_ignored_events_before_attribution(monkeypatch):
 
 # ----------------------------------------------------------- the bound
 
-def test_raw_event_dispatch_is_bounded_and_drops_are_counted(monkeypatch):
+def test_raw_event_dispatch_is_bounded_and_the_overflow_is_counted_not_dropped(monkeypatch):
     futures = []
 
     def fake_submit(coro, loop):
@@ -247,26 +247,30 @@ def test_raw_event_dispatch_is_bounded_and_drops_are_counted(monkeypatch):
 
     for i in range(8):
         handler.on_any_event(_fs_event(f"C:/proj/src/f{i}.py"))
-    assert len(futures) == 5 and watch_stats.dropped_total() == 3
+    assert len(futures) == 5 and watch_stats.dropped_total() == 0
+    assert sum(g["count"] for g in handler._overflow.values()) == 3 and watch_stats.summarised_total() == 3
 
     for f in futures[:2]:                      # two handled: room for two more
         for cb in f.callbacks:
             cb(f)
     for i in range(8, 12):
         handler.on_any_event(_fs_event(f"C:/proj/src/f{i}.py"))
-    assert len(futures) == 7 and watch_stats.dropped_total() == 3 + 2
+    assert len(futures) == 7 and watch_stats.dropped_total() == 0
+    assert sum(g["count"] for g in handler._overflow.values()) == 3 + 2 and watch_stats.summarised_total() == 5
 
 
 @pytest.mark.asyncio
-async def test_a_full_event_buffer_counts_what_it_drops(db, tmp_path):
+async def test_a_full_event_buffer_summarises_instead_of_dropping(db, tmp_path):
     from core import aggregator as aggregator_module
 
     agg = aggregator_module.Aggregator()
     agg._append_crash_recovery_line = lambda event: None
+    agg._start_early_flush = lambda: None
     for i in range(aggregator_module.FILE_EVENT_BUFFER_MAX + 3):
         await agg.buffer_file_event({"path": f"p{i}"})
-    assert len(agg.file_event_buffer) == aggregator_module.FILE_EVENT_BUFFER_MAX
-    assert watch_stats.dropped_total() == 3
+    assert len(agg.file_event_buffer) <= aggregator_module.FILE_EVENT_BUFFER_MAX
+    assert watch_stats.dropped_total() == 0
+    assert watch_stats.summarised_total() > 0
 
 
 # ---------------------------------------------------------------- report

@@ -32,7 +32,7 @@ export default function Status({ onNavigate }) {
         // disagree. Only alerts detected in the last 24 hours drive it;
         // older open alerts are shown as a separate quiet line.
         const [recentData, agentsData, sessionsData, statsData, scopeData] = await Promise.all([
-          api.getAlerts({ status: 'open', severity: 'high,critical', since_hours: WINDOW_HOURS }),
+          api.getAlerts({ status: 'open', severity: 'high,critical', since_hours: WINDOW_HOURS, limit: 500 }),
           api.getAgents(),
           api.getSessions(),
           api.getStats(),
@@ -125,7 +125,7 @@ export default function Status({ onNavigate }) {
       {orbState === 'red' && (
         <div id="incident-list">
           <IncidentList alerts={criticalAlerts} onNavigate={onNavigate} onResolved={() => {
-            api.getAlerts({ status: 'open', severity: 'high,critical', since_hours: WINDOW_HOURS }).then((d) => {
+            api.getAlerts({ status: 'open', severity: 'high,critical', since_hours: WINDOW_HOURS, limit: 500 }).then((d) => {
               setCriticalAlerts(d.alerts)
             }).catch(() => {})
           }} />

@@ -118,6 +118,11 @@ async def _aggregate_rows(db, after_id: int, max_id: int):
         f"""
         SELECT e.session_id AS sid, COUNT(*) AS n,
             SUM(CASE WHEN e.event_type = 'net_connect' THEN 1 ELSE 0 END) AS net,
+            SUM(CASE WHEN e.event_type = 'file_read' THEN COALESCE(e.file_count, 1) ELSE 0 END) AS reads,
+            SUM(CASE WHEN e.event_type = 'file_write' THEN COALESCE(e.file_count, 1) ELSE 0 END) AS writes,
+            SUM(CASE WHEN e.event_type = 'file_delete' THEN COALESCE(e.file_count, 1) ELSE 0 END) AS deletes,
+            SUM(CASE WHEN e.event_type IN ('file_write', 'file_delete', 'file_read')
+                      AND e.detail LIKE '%"summary": true%' THEN COALESCE(e.file_count, 1) ELSE 0 END) AS summarised,
             MAX(CASE WHEN {activity_event_sql('e')} THEN 1 ELSE 0 END) AS act,
             MAX(e.created_at) AS last_at
         FROM events e WHERE e.id > ? AND e.id <= ? GROUP BY e.session_id
@@ -128,7 +133,10 @@ async def _aggregate_rows(db, after_id: int, max_id: int):
 
 
 async def session_event_aggregates(db) -> dict[str, dict]:
-    """{session_id: {"has_activity": bool, "last_event_at": str, "net_connect_count": int}} for sessions that have events."""
+    """{session_id: {"has_activity": bool, "last_event_at": str, "net_connect_count": int, "file_reads": int,
+    "file_writes": int, "file_deletes": int, "events_summarised": int}} for sessions that have events. The file counts
+    are live (the sessions table columns are only rolled up when a session closes) and count one per file change:
+    a summary row counts as the number of changes it stands for."""
     async with _aggregates_lock:
         key = str(_database.DB_PATH)
         cur = await db.execute("SELECT COALESCE(MAX(id), 0) AS m FROM events")
@@ -152,11 +160,19 @@ async def session_event_aggregates(db) -> dict[str, dict]:
                 continue
             entry = by_session.get(r["sid"])
             if entry is None:
-                by_session[r["sid"]] = {"has_activity": bool(r["act"]), "last_event_at": r["last_at"], "net_connect_count": r["net"] or 0}
+                by_session[r["sid"]] = {
+                    "has_activity": bool(r["act"]), "last_event_at": r["last_at"], "net_connect_count": r["net"] or 0,
+                    "file_reads": r["reads"] or 0, "file_writes": r["writes"] or 0, "file_deletes": r["deletes"] or 0,
+                    "events_summarised": r["summarised"] or 0,
+                }
             else:
                 entry["has_activity"] = entry["has_activity"] or bool(r["act"])
                 entry["last_event_at"] = max(entry["last_event_at"], r["last_at"])
                 entry["net_connect_count"] += r["net"] or 0
+                entry["file_reads"] += r["reads"] or 0
+                entry["file_writes"] += r["writes"] or 0
+                entry["file_deletes"] += r["deletes"] or 0
+                entry["events_summarised"] += r["summarised"] or 0
         state.update(key=key, max_id=max_id, count=base + sum(r["n"] for r in rows), by_session=by_session)
         return by_session
 

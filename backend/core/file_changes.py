@@ -66,6 +66,15 @@ def rows_to_changes(rows, agent_name: str | None) -> list[dict]:
         confidence = detail.get("attribution_confidence")
         change = change_type(event_type, detail)
         attribution = attribution_for(agent_name, row["event_source"], confidence, detail.get("agents_active"))
+        if detail.get("summary"):
+            # one row standing for `count` changes in a directory (core/aggregator.py _collapse_overflow)
+            changes.append({
+                "path": row["path"], "time": utc_iso(row["created_at"]), "change": change,
+                "attribution": attribution["attribution"], "attribution_label": attribution["attribution_label"],
+                "attribution_confidence": confidence, "summary": True, "count": detail.get("count", 1),
+                "first_time": detail.get("first_ts"), "last_time": detail.get("last_ts"),
+            })
+            continue
         paths = detail.get("paths")
         targets = paths if paths else ([row["path"]] if row["path"] else [])
         for path in targets:
@@ -121,14 +130,21 @@ def summarise(changes: list[dict], *, scope_dirs: list[str] | None = None,
     total) cover every change. The listed paths exclude the checkpoint cache
     (reported as one count instead) and put paths under a watched folder first,
     then other paths. All paths use forward slashes."""
-    by_change = Counter(c["change"] for c in changes)
-    directories = Counter(os.path.dirname(normalise_path(c["path"])) or "." for c in changes)
+    by_change: Counter = Counter()
+    directories: Counter = Counter()
+    for c in changes:
+        n = c.get("count", 1)
+        by_change[c["change"]] += n
+        # a summary row's path is already the directory
+        directories[normalise_path(c["path"]) if c.get("summary") else (os.path.dirname(normalise_path(c["path"])) or ".")] += n
     checkpoint_writes = 0
     watched_paths: list[str] = []
     other_paths: list[str] = []
     seen: set[str] = set()
     for c in changes:
         path = normalise_path(c["path"])
+        if c.get("summary"):
+            continue   # a directory with a count, not a file: counted above, not listed as a path
         if is_checkpoint_path(path):
             checkpoint_writes += 1
             continue
@@ -140,7 +156,8 @@ def summarise(changes: list[dict], *, scope_dirs: list[str] | None = None,
         else:
             other_paths.append(path)
     return {
-        "total": len(changes),
+        "total": sum(c.get("count", 1) for c in changes),
+        "events_summarised": sum(c["count"] for c in changes if c.get("summary")),
         "by_change": dict(by_change),
         "top_directories": [{"directory": d, "count": n} for d, n in directories.most_common(max_directories)],
         "first_paths": (watched_paths + other_paths)[:max_paths],

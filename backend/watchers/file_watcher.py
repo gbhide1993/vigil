@@ -41,13 +41,14 @@ from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 
 from core.attribution import UNATTRIBUTED_AGENT, agent_for_path
+from core.aggregator import _is_credential_path
 from core.attributor import Attributor
 from core.burst_detector import BurstDetector
 from core.correlation_engine import CorrelationEngine
 from core.evidence import AttributionChain, AttributionConfidence, VigilEvidence
 from core.evidence_store import evidence_store
 from core.feature_flags import CORE_ONLY
-from core import watch_stats
+from core import mass_delete, watch_stats
 from core.ignore_rules import ignore_and_count
 from core.own_paths import is_own_path
 from core.red_lines import RedLines, is_agent_config_path, is_mcp_config_path, register_agent_workspace
@@ -486,11 +487,17 @@ class VlawFileHandler(FileSystemEventHandler):
         # Raw events submitted to the loop and not yet handled; see MAX_PENDING_FILE_DISPATCH.
         self._pending_dispatch = 0
         self._pending_lock = threading.Lock()
+        # Raw events over MAX_PENDING_FILE_DISPATCH are not dropped: they are counted here per (directory, operation) from the
+        # watcher thread, and recorded as summary rows by drain_overflow once the loop has caught up.
+        self._overflow: dict[tuple, dict] = {}
+        self._draining = False
 
     def on_any_event(self, event):
         """Tiers 2/3 entry point — native Observer and PollingObserver both
         emit this same watchdog FileSystemEvent shape."""
         if event.is_directory:
+            if event.event_type == "deleted":
+                mass_delete.detector.note_folder_event(event.src_path)   # counted apart from files
             return
 
         event_type = EVENT_TYPE_MAP.get(event.event_type, "file_read")
@@ -499,12 +506,14 @@ class VlawFileHandler(FileSystemEventHandler):
             return   # Vigil's own install / data folder: never an agent's activity
         if ignore_and_count(path):
             return   # generated / dependency folder: dropped before any other work (core/ignore_rules.py)
+        # A credential-looking path always goes through, over the bound if need be: it is never folded into a count.
+        credential = _is_credential_path(path)
         with self._pending_lock:
-            over_limit = self._pending_dispatch >= MAX_PENDING_FILE_DISPATCH
+            over_limit = self._pending_dispatch >= MAX_PENDING_FILE_DISPATCH and not credential
             if not over_limit:
                 self._pending_dispatch += 1
         if over_limit:
-            watch_stats.add_dropped("overload")
+            self._count_overflow(path, event_type, CHANGE_MAP.get(event.event_type))
             return
 
         future = asyncio.run_coroutine_threadsafe(
@@ -515,7 +524,72 @@ class VlawFileHandler(FileSystemEventHandler):
     def _dispatch_done(self, future, path: str) -> None:
         with self._pending_lock:
             self._pending_dispatch -= 1
+            catching_up = bool(self._overflow) and self._pending_dispatch < MAX_PENDING_FILE_DISPATCH // 2
         _log_dispatch_exception(future, path)
+        if catching_up and not self._draining:
+            try:
+                asyncio.run_coroutine_threadsafe(self.drain_overflow(), self.loop)
+            except RuntimeError:
+                pass   # the loop is closed (shutdown); the counts stay in memory
+
+    def _count_overflow(self, path: str, event_type: str, change: str | None) -> None:
+        """Watcher thread: one dict update under the lock, no loop work. Nothing is lost: see drain_overflow."""
+        key = (str(Path(path).parent), event_type, change)
+        now = time.time()
+        with self._pending_lock:
+            group = self._overflow.get(key)
+            if group is None:
+                self._overflow[key] = {"count": 1, "first": now, "last": now}
+            else:
+                group["count"] += 1
+                group["last"] = now
+        watch_stats.add_summarised(1)
+
+    async def drain_overflow(self) -> None:
+        """Records the counted overflow as summary rows (directory, operation, count, first and last time), attributed once
+        per group by the same rule as a single event, without the per-file open-handle check."""
+        if self._draining:
+            return
+        self._draining = True
+        try:
+            while True:
+                with self._pending_lock:
+                    groups, self._overflow = self._overflow, {}
+                if not groups:
+                    return
+                for (directory, event_type, change), g in groups.items():
+                    try:
+                        await self._record_overflow_group(directory, event_type, change, g)
+                    except Exception:
+                        logger.exception("could not record %d overflowed changes in %s; they stay counted and are retried", g["count"], directory)
+                        with self._pending_lock:
+                            back = self._overflow.setdefault((directory, event_type, change), {"count": 0, "first": g["first"], "last": g["last"]})
+                            back["count"] += g["count"]
+                            back["first"] = min(back["first"], g["first"])
+                            back["last"] = max(back["last"], g["last"])
+                        return
+        finally:
+            self._draining = False
+
+    async def _record_overflow_group(self, directory: str, event_type: str, change: str | None, group: dict) -> None:
+        summary = {"count": group["count"], "first_ts": group["first"], "last_ts": group["last"]}
+        event_source = "realtime_heuristic" if self.use_pid_heuristic else "poll"
+        path_agent = agent_for_path(directory)
+        if path_agent and self.pid_cache is not None:
+            owner_pid = next((p for p, name in self.pid_cache.snapshot().items() if name == path_agent), None)
+            if owner_pid is not None:
+                summary["confidence"] = "medium"
+                await self.handle_file_event(directory, event_type, "path", owner_pid, "medium", group["last"], change=change, summary=summary)
+                return
+        pid, confidence = await _find_owning_agent_pid(self.pid_cache, None)
+        if confidence == AMBIGUOUS:
+            agents_active = max(2, len(set(self.pid_cache.snapshot().values())))
+            summary.update(confidence="low", agents_active=agents_active)
+            await self.handle_file_event(directory, event_type, event_source, None, "low", group["last"], change=change,
+                                         agents_active=agents_active, summary=summary)
+            return
+        summary["confidence"] = confidence
+        await self.handle_file_event(directory, event_type, event_source, pid, confidence, group["last"], change=change, summary=summary)
 
     async def _handle_polled_event(self, path: str, event_type: str, change: str | None = None) -> None:
         # _find_owning_agent_pid itself is now just a cache read (see
@@ -560,9 +634,11 @@ class VlawFileHandler(FileSystemEventHandler):
         timestamp: float | None = None,
         change: str | None = None,
         agents_active: int | None = None,
+        summary: dict | None = None,
     ) -> None:
         """agents_active is set only for a write that cannot be told apart between that many running agents: it is
-        then recorded under the "unattributed" agent (pid None, confidence low)."""
+        then recorded under the "unattributed" agent (pid None, confidence low). summary is set only by drain_overflow:
+        then `path` is a directory and the event stands for summary["count"] changes in it."""
         # Safety filter for every tier (native, polling and ETW): changes
         # inside Vigil's own install folder or data folder (its database,
         # logs, updates) are never recorded, however the watch list was
@@ -614,6 +690,8 @@ class VlawFileHandler(FileSystemEventHandler):
         }
         if agents_active:
             event_dict["agents_active"] = agents_active
+        if summary:
+            event_dict["summary"] = summary
 
         if self.aggregator is not None:
             await self.aggregator.ingest_file_event(event_dict)

@@ -39,6 +39,7 @@ SEVERITIES = ("low", "medium", "high", "critical")
 # each call site passes, e.g. "unapproved_destination", "suspicious_command"
 # "red_line_ssh_access"), not `rule_type` (which is just "policy"/"red_line").
 DEDUP_WINDOWS = {
+    "red_line_mass_delete":      60,    # one per watched folder per minute (core/mass_delete.py)
     "credential_access":         300,   # 5 min
     "out_of_scope_access":       300,   # 5 min
     "suspicious_command":        600,   # 10 min — curl/wget/ssh in loops

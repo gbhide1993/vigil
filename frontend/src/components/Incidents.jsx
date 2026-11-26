@@ -16,7 +16,7 @@ export default function Incidents({ onNavigate }) {
     let cancelled = false
     async function load() {
       try {
-        const params = { severity: 'high,critical' }
+        const params = { severity: 'high,critical', limit: 500 }
         if (statusFilter) params.status = statusFilter
         const data = await api.getAlerts(params)
         if (cancelled) return
